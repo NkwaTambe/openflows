@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DEV_BINARIES_DIR="${PROJECT_ROOT}/.dev-binaries"
 RELEASE_BIN="${PROJECT_ROOT}/target/release/openflows"
+HARNESS_BIN="${PROJECT_ROOT}/target/release/openflows-harness"
 
 echo "═══════════════════════════════════════"
 echo "  OpenFlows Dev Binary Sync"
@@ -19,26 +20,29 @@ echo "════════════════════════�
 echo ""
 
 # Step 1: Build if needed
-if [ ! -f "$RELEASE_BIN" ]; then
-    echo "Step 1: Building openflows binary (release mode)..."
+if [ ! -f "$RELEASE_BIN" ] || [ ! -f "$HARNESS_BIN" ]; then
+    echo "Step 1: Building openflows binaries (release mode)..."
     cd "$PROJECT_ROOT"
-    cargo build --release -p openflows
+    cargo build --release -p openflows -p openflows-harness
     echo "✓ Build complete"
     echo ""
 else
-    echo "Step 1: Release binary already built"
-    echo "  File: $RELEASE_BIN"
-    echo "  Size: $(du -h "$RELEASE_BIN" | cut -f1)"
+    echo "Step 1: Release binaries already built"
+    echo "  openflows:        $(du -h "$RELEASE_BIN" | cut -f1)"
+    echo "  openflows-harness: $(du -h "$HARNESS_BIN" | cut -f1)"
     echo ""
 fi
 
 # Step 2: Sync to .dev-binaries
-echo "Step 2: Syncing binary to .dev-binaries/..."
+echo "Step 2: Syncing binaries to .dev-binaries/..."
 mkdir -p "$DEV_BINARIES_DIR"
 cp -v "$RELEASE_BIN" "$DEV_BINARIES_DIR/openflows"
 chmod +x "$DEV_BINARIES_DIR/openflows"
-echo "✓ Binary synced"
-echo "  File: $DEV_BINARIES_DIR/openflows"
+cp -v "$HARNESS_BIN" "$DEV_BINARIES_DIR/openflows-harness"
+chmod +x "$DEV_BINARIES_DIR/openflows-harness"
+echo "✓ Binaries synced"
+echo "  openflows:        $DEV_BINARIES_DIR/openflows"
+echo "  openflows-harness: $DEV_BINARIES_DIR/openflows-harness"
 echo ""
 
 # Step 3: Optional hot-deploy to running workspace
