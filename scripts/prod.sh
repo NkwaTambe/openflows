@@ -133,6 +133,15 @@ case "$CMD" in
         echo "  OpenFlows Bootstrap"
         echo "═══════════════════════════════════════"
         echo ""
+        echo "Step 1: Syncing dev binary..."
+        if [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
+            "${SCRIPT_DIR}/dev-sync.sh"
+        else
+            echo "⚠ dev-sync.sh not found, skipping..."
+        fi
+        echo ""
+        echo "Step 2: Running Coder bootstrap..."
+        echo ""
         echo "This will:"
         echo "  ✓ Create admin user in Coder"
         echo "  ✓ Push workspace templates (nexus, forge, etc.)"
