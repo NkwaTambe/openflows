@@ -33,7 +33,7 @@ cp .env.example .env
 ```
 
 This:
-1. **Builds and syncs the dev binary** — Compiles `openflows` (if needed) and copies it to `.dev-binaries/` for Docker mounting into Coder workspaces
+1. **Builds and syncs dev binaries** — Compiles `openflows` (controller) and `openflows-harness` (worker coordination), copies both to `.dev-binaries/` for Docker mounting into Coder workspaces
 2. **Creates admin user in Coder** — Sets up the initial admin account
 3. **Pushes workspace templates** — Deploys nexus, forge, sentinel, vessel, and lore templates
 4. **Verifies LLM/GitHub auth** — Ensures GitHub token and LLM models are configured
