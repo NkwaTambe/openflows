@@ -9,7 +9,8 @@ use config::{
     state::{
         full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord, KEY_COMMAND_GATE,
         KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
-        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REVIEW, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE,
+        KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -358,7 +359,16 @@ Before significant work, read the relevant skill file to understand the workflow
             }
 
             let ticket_id = format!("T-{:03}", issue.number);
-            if tickets.iter().any(|t| t.id == ticket_id) {
+            if let Some(existing) = tickets.iter_mut().find(|t| t.id == ticket_id) {
+                // Reset AwaitingHuman tickets back to Open so they can be retried
+                if matches!(existing.status, TicketStatus::AwaitingHuman { .. }) {
+                    info!(
+                        ticket_id = %existing.id,
+                        "Resetting AwaitingHuman ticket to Open for retry"
+                    );
+                    existing.status = TicketStatus::Open;
+                    existing.attempts = 0;
+                }
                 continue;
             }
 
@@ -827,6 +837,8 @@ Before significant work, read the relevant skill file to understand the workflow
             ticket_id, template_name, cli = %cli_name, "Provisioning Coder workspace for worker"
         );
 
+        let coder_url: Option<String> = store.get_typed("coder_url").await;
+
         let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
                 template_name,
@@ -838,7 +850,8 @@ Before significant work, read the relevant skill file to understand the workflow
                     "redis_url": "redis://redis:6379",
                     "tenant": std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
                     "host_cli_binary": host_cli_binary,
-                    "cli_binary_name": cli_name
+                    "cli_binary_name": cli_name,
+                    "coder_url": coder_url.unwrap_or_else(|| std::env::var("CODER_URL").unwrap_or_default()),
                 }),
             })
             .await?;
@@ -1290,6 +1303,295 @@ Use `openflows-harness` for all coordination:
                 worker_id,
                 ticket_id, "Cannot create chat: ticket not found in store"
             );
+        }
+    }
+
+    /// Poll harness-written status keys for in-progress tickets.
+    /// When a ticket reaches `review_ready` phase, spawn a Sentinel chat to review the PR.
+    async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(c) => c,
+            None => return,
+        };
+
+        let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
+            Some(s) => s,
+            None => return,
+        };
+
+        for ticket in tickets {
+            // Only check tickets that are currently being worked on
+            let is_in_progress = matches!(
+                &ticket.status,
+                TicketStatus::InProgress { .. }
+            );
+            if !is_in_progress {
+                continue;
+            }
+
+            // Read the harness-written status for this ticket
+            let status_key = full_ticket_key_flat(&ticket.id, KEY_TICKET_STATUS);
+            let status_json: Option<Value> = store.get_typed(&status_key).await;
+
+            let phase = status_json
+                .as_ref()
+                .and_then(|v| v.get("phase"))
+                .and_then(|v| v.as_str());
+
+            if phase != Some("review_ready") {
+                continue;
+            }
+
+            // Check if Sentinel chat already exists for this ticket
+            let sentinel_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+            let existing_sentinel_chat: Option<String> = store.get_typed(&sentinel_chat_key).await;
+            if existing_sentinel_chat.is_some() {
+                debug!(ticket_id = %ticket.id, "Sentinel chat already exists, skipping spawn");
+                continue;
+            }
+
+            // Check if Sentinel already reviewed (approved or rejected)
+            let review_key = full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
+            let existing_review: Option<Value> = store.get_typed(&review_key).await;
+            if existing_review.is_some() {
+                debug!(ticket_id = %ticket.id, "Sentinel review already exists, skipping spawn");
+                continue;
+            }
+
+            // Find an idle sentinel worker slot
+            let sentinel_slot = slots.iter().find(|(id, slot)| {
+                Self::worker_role(id) == "sentinel" && matches!(slot.status, WorkerStatus::Idle)
+            });
+
+            let (sentinel_worker_id, sentinel_slot) = match sentinel_slot {
+                Some((id, slot)) => (id.clone(), slot.clone()),
+                None => {
+                    info!(
+                        ticket_id = %ticket.id,
+                        "No idle sentinel worker available for review_ready ticket"
+                    );
+                    continue;
+                }
+            };
+
+            let workspace_id = match &sentinel_slot.workspace_id {
+                Some(ws) => ws.clone(),
+                None => {
+                    // Provision a sentinel workspace
+                    match self
+                        .provision_coder_workspace(store, &sentinel_worker_id, &ticket.id)
+                        .await
+                    {
+                        Ok(Some(ws_id)) => ws_id,
+                        Ok(None) | Err(_) => {
+                            warn!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                "Failed to provision sentinel workspace"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Build dispatch payload for Sentinel with PR info
+            let pr_key = full_ticket_key_flat(&ticket.id, "pr");
+            let pr_info: Option<Value> = store.get_typed(&pr_key).await;
+            let handoff_key = full_ticket_key_flat(&ticket.id, "handoff");
+            let handoff_info: Option<Value> = store.get_typed(&handoff_key).await;
+
+            let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "sentinel");
+            let dispatch_payload = json!({
+                "ticket_id": ticket.id,
+                "title": ticket.title,
+                "body": ticket.body,
+                "branch": ticket.branch,
+                "pr_info": pr_info,
+                "handoff": handoff_info,
+            });
+            store.set(&dispatch_key, dispatch_payload).await;
+
+            // Update sentinel slot to Assigned
+            let mut updated_slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+            if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
+                slot.status = WorkerStatus::Assigned {
+                    ticket_id: ticket.id.clone(),
+                    issue_url: ticket.issue_url.clone(),
+                };
+                slot.workspace_id = Some(workspace_id.clone());
+            }
+            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
+
+            // Create sentinel chat
+            let mut labels = serde_json::Map::new();
+            labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
+            labels.insert(CHAT_LABEL_ROLE.to_string(), json!("sentinel"));
+            labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
+
+            let chat_req = coder_client::types::CreateChatRequest {
+                organization_id: None,
+                workspace_id: workspace_id.clone(),
+                model_config_id: None,
+                content: vec![],
+                labels: Some(labels),
+            };
+
+            let chat_result = client.create_chat(&chat_req).await;
+
+            match chat_result {
+                Ok(chat) => {
+                    store.set(&sentinel_chat_key, json!(chat.id)).await;
+                    info!(
+                        ticket_id = %ticket.id,
+                        sentinel_worker_id,
+                        chat_id = %chat.id,
+                        "Spawned Sentinel chat for review_ready ticket"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        ticket_id = %ticket.id,
+                        sentinel_worker_id,
+                        error = %e,
+                        "Failed to create Sentinel chat"
+                    );
+                }
+            }
+        }
+
+        // Check for merged tickets that need Lore documentation
+        self.spawn_lore_for_merged_tickets(store, tickets, &client, &slots)
+            .await;
+    }
+
+    /// Spawn Lore agent for merged tickets to generate documentation.
+    async fn spawn_lore_for_merged_tickets(
+        &self,
+        store: &SharedStore,
+        tickets: &[Ticket],
+        client: &CoderClient,
+        slots: &HashMap<String, WorkerSlot>,
+    ) {
+        for ticket in tickets {
+            // Only process merged tickets
+            let is_merged = matches!(&ticket.status, TicketStatus::Merged { .. });
+            if !is_merged {
+                continue;
+            }
+
+            // Check if Lore chat already exists for this ticket
+            let lore_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "lore");
+            let existing_lore_chat: Option<String> = store.get_typed(&lore_chat_key).await;
+            if existing_lore_chat.is_some() {
+                debug!(ticket_id = %ticket.id, "Lore chat already exists, skipping spawn");
+                continue;
+            }
+
+            // Check if Lore already completed documentation
+            let lore_done_key = full_ticket_key_flat(&ticket.id, "lore_done");
+            let lore_done: Option<bool> = store.get_typed(&lore_done_key).await;
+            if lore_done == Some(true) {
+                debug!(ticket_id = %ticket.id, "Lore already completed documentation");
+                continue;
+            }
+
+            // Find an idle lore worker slot
+            let lore_slot = slots.iter().find(|(id, slot)| {
+                Self::worker_role(id) == "lore" && matches!(slot.status, WorkerStatus::Idle)
+            });
+
+            let (lore_worker_id, lore_slot) = match lore_slot {
+                Some((id, slot)) => (id.clone(), slot.clone()),
+                None => {
+                    debug!(
+                        ticket_id = %ticket.id,
+                        "No idle lore worker available for merged ticket"
+                    );
+                    continue;
+                }
+            };
+
+            let workspace_id = match &lore_slot.workspace_id {
+                Some(ws) => ws.clone(),
+                None => {
+                    // Provision a lore workspace
+                    match self
+                        .provision_coder_workspace(store, &lore_worker_id, &ticket.id)
+                        .await
+                    {
+                        Ok(Some(ws_id)) => ws_id,
+                        Ok(None) | Err(_) => {
+                            warn!(
+                                ticket_id = %ticket.id,
+                                lore_worker_id,
+                                "Failed to provision lore workspace"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Build dispatch payload for Lore
+            let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "lore");
+            let dispatch_payload = json!({
+                "ticket_id": ticket.id,
+                "title": ticket.title,
+                "body": ticket.body,
+                "branch": ticket.branch,
+                "action": "generate_documentation",
+            });
+            store.set(&dispatch_key, dispatch_payload).await;
+
+            // Update lore slot to Assigned
+            let mut updated_slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+            if let Some(slot) = updated_slots.get_mut(&lore_worker_id) {
+                slot.status = WorkerStatus::Assigned {
+                    ticket_id: ticket.id.clone(),
+                    issue_url: ticket.issue_url.clone(),
+                };
+                slot.workspace_id = Some(workspace_id.clone());
+            }
+            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
+
+            // Create lore chat
+            let mut labels = serde_json::Map::new();
+            labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
+            labels.insert(CHAT_LABEL_ROLE.to_string(), json!("lore"));
+            labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
+
+            let chat_req = coder_client::types::CreateChatRequest {
+                organization_id: None,
+                workspace_id: workspace_id.clone(),
+                model_config_id: None,
+                content: vec![],
+                labels: Some(labels),
+            };
+
+            let chat_result = client.create_chat(&chat_req).await;
+
+            match chat_result {
+                Ok(chat) => {
+                    store.set(&lore_chat_key, json!(chat.id)).await;
+                    info!(
+                        ticket_id = %ticket.id,
+                        lore_worker_id,
+                        chat_id = %chat.id,
+                        "Spawned Lore chat for merged ticket documentation"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        ticket_id = %ticket.id,
+                        lore_worker_id,
+                        error = %e,
+                        "Failed to create Lore chat"
+                    );
+                }
+            }
         }
     }
 
@@ -2542,6 +2844,11 @@ impl Node for NexusNode {
                     .await;
             }
         }
+
+        // Poll harness-written status for in-progress tickets and spawn
+        // Sentinel agents when tickets reach review_ready phase.
+        self.poll_harness_status_and_spawn_agents(store, &tickets)
+            .await;
 
         if recovery.needs_recovery {
             info!(
