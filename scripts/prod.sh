@@ -123,7 +123,30 @@ case "$CMD" in
             echo "⚠ reset-controller-state.sh not found, skipping..."
         fi
         echo ""
-        echo "Step 2: Starting OpenFlows controller..."
+        echo "Step 2: Confirming controller start..."
+        echo ""
+        if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+            echo "Open issues in ${GITHUB_REPOSITORY}:"
+            ISSUE_COUNT=$(curl -s "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+                -H "Authorization: token ${GITHUB_PERSONAL_ACCESS_TOKEN:-}" \
+                -H "Accept: application/vnd.github.v3+json" | jq 'length' 2>/dev/null || echo "0")
+            echo "  • $ISSUE_COUNT open issues will be synced as tickets"
+            echo "  • Each ticket will provision a forge workspace agent when started"
+            echo ""
+        fi
+        echo "This will start the OpenFlows controller which will:"
+        echo "  • Sync open GitHub issues as tickets"
+        echo "  • Assign tickets to available forge workers"
+        echo "  • Provision workspace agents to work on tickets"
+        echo ""
+        echo -n "Start the controller? [y/N] "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        echo ""
+        echo "Step 3: Starting OpenFlows controller..."
         echo ""
         run_openflows run "$@"
         ;;
