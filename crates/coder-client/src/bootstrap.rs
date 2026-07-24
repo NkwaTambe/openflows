@@ -293,6 +293,8 @@ impl CoderBootstrapper {
                         "github_repository": repository,
                         "registry_json": registry_json,
                         "github_pat": github_pat,
+                        "start_controller": false, // Bootstrap only sets up the workspace
+                                                 // Controller is started via 'openflows run'
                     }),
                 })
                 .await
