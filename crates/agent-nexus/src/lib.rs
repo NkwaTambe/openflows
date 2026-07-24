@@ -2467,7 +2467,12 @@ Use `openflows-harness` for all coordination:
                         WorkspaceStatus::Deleting => Some("workspace is deleting".to_string()),
                         WorkspaceStatus::Deleted => Some("workspace is deleted".to_string()),
                         WorkspaceStatus::Unknown(raw) => {
-                            Some(format!("workspace status is {}", raw))
+                            // If status is unknown but agent is connected and ready, consider it healthy
+                            if workspace.is_agent_ready() {
+                                None
+                            } else {
+                                Some(format!("workspace status is {} (agent not ready)", raw))
+                            }
                         }
                     }
                 }
@@ -2613,12 +2618,72 @@ Use `openflows-harness` for all coordination:
                             }
                         }
                     }
+                    WorkspaceStatus::Unknown(_) => {
+                        // If the workspace status is unknown but the agent is ready, just restart it
+                        if workspace.is_agent_ready() {
+                            info!(
+                                workspace_id = %crashed_workspace.workspace_id,
+                                ticket_id = %crashed_workspace.ticket_id,
+                                "Workspace status unknown but agent ready - restarting to refresh status"
+                            );
+                            let _ = client.stop_workspace(&crashed_workspace.workspace_id).await;
+                            if let Err(e) = client
+                                .start_workspace(&crashed_workspace.workspace_id)
+                                .await
+                            {
+                                warn!(
+                                    workspace_id = %crashed_workspace.workspace_id,
+                                    ticket_id = %crashed_workspace.ticket_id,
+                                    error = %e,
+                                    "Failed to restart workspace with unknown status"
+                                );
+                            }
+                        } else {
+                            // Agent not ready and status unknown - recreate the workspace
+                            info!(
+                                workspace_id = %crashed_workspace.workspace_id,
+                                ticket_id = %crashed_workspace.ticket_id,
+                                status = ?workspace.workspace_status(),
+                                "Recreating Coder workspace after crash (unknown status, agent not ready)"
+                            );
+
+                            let mut slots: HashMap<String, WorkerSlot> =
+                                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                            if let Some(slot) = slots.get_mut(&crashed_workspace.worker_id) {
+                                slot.workspace_id = None;
+                                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                            }
+
+                            if let Err(e) = self
+                                .provision_coder_workspace(
+                                    store,
+                                    &crashed_workspace.worker_id,
+                                    &crashed_workspace.ticket_id,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    worker_id = %crashed_workspace.worker_id,
+                                    ticket_id = %crashed_workspace.ticket_id,
+                                    error = %e,
+                                    "Failed to recreate Coder workspace"
+                                );
+                                continue;
+                            }
+
+                            self.create_chat_for_ticket_id(
+                                store,
+                                &crashed_workspace.worker_id,
+                                &crashed_workspace.ticket_id,
+                            )
+                            .await;
+                        }
+                    }
                     WorkspaceStatus::Pending
                     | WorkspaceStatus::Starting
                     | WorkspaceStatus::Failed
                     | WorkspaceStatus::Deleting
-                    | WorkspaceStatus::Deleted
-                    | WorkspaceStatus::Unknown(_) => {
+                    | WorkspaceStatus::Deleted => {
                         info!(
                             workspace_id = %crashed_workspace.workspace_id,
                             ticket_id = %crashed_workspace.ticket_id,
