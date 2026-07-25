@@ -68,6 +68,12 @@ enum Commands {
         #[command(subcommand)]
         action: HeartbeatAction,
     },
+    /// Manage phase gates (SENTINEL approval for phase transitions)
+    #[command(name = "gate")]
+    Gate {
+        #[command(subcommand)]
+        action: GateAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,6 +149,25 @@ enum HeartbeatAction {
     Start,
     /// Stop heartbeat writing
     Stop,
+}
+
+#[derive(Subcommand)]
+enum GateAction {
+    /// Approve a gated phase transition (SENTINEL → FORGE)
+    Approve {
+        /// Phase to approve (e.g., "planning")
+        #[arg(long)]
+        phase: String,
+        /// Optional notes about the approval
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// Check gate approval status
+    Status {
+        /// Phase to check
+        #[arg(long)]
+        phase: String,
+    },
 }
 
 fn require_env(name: &str) -> Result<String> {
@@ -228,6 +253,16 @@ async fn main() -> Result<()> {
             action: HeartbeatAction::Stop,
         } => {
             store.heartbeat_stop(&ticket, &role).await?;
+        }
+        Commands::Gate {
+            action: GateAction::Approve { phase, notes },
+        } => {
+            store.gate_approve(&ticket, &role, &phase, notes.as_deref()).await?;
+        }
+        Commands::Gate {
+            action: GateAction::Status { phase },
+        } => {
+            store.gate_status(&ticket, &phase).await?;
         }
     }
 

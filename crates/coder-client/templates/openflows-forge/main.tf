@@ -56,6 +56,13 @@ data "coder_parameter" "tenant" {
   type        = "string"
 }
 
+data "coder_parameter" "coder_url" {
+  name        = "coder_url"
+  description  = "Coder server URL for API calls"
+  default     = ""
+  type        = "string"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -158,7 +165,33 @@ resource "coder_agent" "main" {
     print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
     PYEOF
 
-    # git pull or clone (creds via Coder external auth)
+    # Setup git credentials: get token from workspace owner via Coder API
+    # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
+    CODER_URL="${data.coder_parameter.coder_url.value}"
+    OWNER_ID="${data.coder_workspace_owner.me.id}"
+    
+    # Fetch GitHub token via Coder API (uses the agent's own token)
+    if [ -n "$CODER_AGENT_TOKEN" ]; then
+      GITHUB_TOKEN=$(curl -s \
+        -H "Coder-Session-Token: $CODER_AGENT_TOKEN" \
+        "$CODER_URL/api/v2/users/$OWNER_ID/gitauths/github" 2>/dev/null \
+        | jq -r '.access_token // empty')
+    fi
+    
+    # Fallback to env var if API call fails
+    GITHUB_TOKEN="$${GITHUB_TOKEN:-$GITHUB_PERSONAL_ACCESS_TOKEN}"
+    
+    # Configure git with token for HTTPS push auth
+    if [ -n "$GITHUB_TOKEN" ]; then
+      git config --global credential.helper store
+      echo "https://git:$GITHUB_TOKEN@github.com" > /home/coder/.git-credentials
+      chmod 600 /home/coder/.git-credentials
+      log "Configured git credentials for GitHub push auth"
+    else
+      log "WARNING: No GitHub token available — git push may fail"
+    fi
+
+    # git pull or clone (creds via Coder external auth or configured above)
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then

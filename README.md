@@ -98,6 +98,39 @@ You create a GitHub issue → NEXUS picks it up → FORGE writes code → SENTIN
 
 You stay in the loop only when needed — security concerns, ambiguous specs, or major decisions. Otherwise, the team runs autonomously, with NEXUS's `reconcile()` detecting orphans, stale workers, and unmerged PRs and recovering automatically.
 
+### Gated Planning Approval
+
+OpenFlows enforces a critical checkpoint before FORGE begins implementation:
+
+```
+FORGE writes plan (PLAN.md) → Sets status to 'planning' → HALTS
+                             ↓
+                    SENTINEL reviews plan
+                             ↓
+           SENTINEL approves: openflows gate approve --phase planning
+                             ↓
+        Gate unlock recorded in Redis → FORGE receives approval
+                             ↓
+        FORGE transitions status to 'building' → Implementation begins
+```
+
+**Key behaviors:**
+- When FORGE attempts to transition from `planning` to `building`, the system checks for gate approval
+- Without SENTINEL's explicit approval, FORGE receives error: `"Cannot transition from 'planning' to 'building' without SENTINEL approval"`
+- Gate approval is stored with timestamp and approver role, enabling audit trails
+- Only the `planning` → `building` transition is gated; subsequent phases are unconstrained
+
+**For administrators:**
+```bash
+# Approve FORGE to proceed (run from control plane or within nexus workspace)
+openflows gate approve --tenant my-team --ticket T-42 --phase planning --approver SENTINEL
+
+# Check gate status
+openflows gate status --tenant my-team --ticket T-42 --phase planning
+```
+
+This ensures every issue is carefully planned before coding begins, catching scope creep and spec mismatches early.
+
 ### Coder governs *where* agents run — OpenFlows governs *how* they coordinate
 
 The integration is deliberate and asymmetrical:
