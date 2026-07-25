@@ -1258,6 +1258,44 @@ impl CoderClient {
         }
     }
 
+    /// Get recent messages from a Chat.
+    /// GET /api/experimental/chats/{chat_id}/messages?after_id={id}&limit={n}
+    pub async fn get_chat_messages(
+        &self,
+        chat_id: &str,
+        limit: u64,
+    ) -> Result<Vec<crate::types::ChatMessage>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/experimental/chats/{}/messages?limit={}",
+                    chat_id, limit
+                ),
+            )
+            .send()
+            .await
+            .context("Failed to get chat messages")?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let messages = body
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(messages)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get chat messages ({}): {}", status, body)
+        }
+    }
+
     /// Archive a Chat (soft delete).
     /// PATCH /api/experimental/chats/{chat_id}
     pub async fn archive_chat(&self, chat_id: &str) -> Result<()> {

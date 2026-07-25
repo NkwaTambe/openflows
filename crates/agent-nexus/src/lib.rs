@@ -1255,12 +1255,32 @@ Use `openflows-harness` for all coordination:
 
         match client.create_chat(&chat_req).await {
             Ok(chat) => {
+                // Also check the initial chat status for diagnostics
+                let chat_status = chat.status();
+                let workspace_id_str = &chat.workspace_id;
+                let owner_id = &chat.owner_id;
+                
                 info!(
                     chat_id = %chat.id,
                     worker_id,
                     ticket_id,
+                    workspace_id = %workspace_id_str,
+                    owner_id = %owner_id,
+                    initial_status = ?chat_status,
                     "Created Chat for ticket assignment"
                 );
+                
+                // If chat immediately enters error state, log additional diagnostic info
+                if matches!(chat_status, ChatStatus::Error) {
+                    warn!(
+                        chat_id = %chat.id,
+                        ticket_id,
+                        workspace_id = %workspace_id_str,
+                        owner_id = %owner_id,
+                        status_raw = %chat.status_raw,
+                        "Chat immediately entered error status - check Coder Agents configuration"
+                    );
+                }
 
                 // Store chat ID in SharedStore
                 store.set(&chat_key, json!(chat.id)).await;
