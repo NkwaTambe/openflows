@@ -418,7 +418,7 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     let recovery_keys: Vec<String> = store.keys(&recovery_pattern).await;
     let recovery_count = recovery_keys.len();
     for key in &recovery_keys {
-        store.del(&key).await;
+        store.del(key).await;
     }
     if recovery_count > 0 {
         println!("  ✓ Cleared {} recovery counters", recovery_count);
