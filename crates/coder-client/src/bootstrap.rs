@@ -549,6 +549,7 @@ impl CoderBootstrapper {
                         "tenant": tenant_name,
                         "github_repository": github_repo,
                         "github_pat": github_pat,
+                        "start_controller": false,
                     }),
                 },
             )
