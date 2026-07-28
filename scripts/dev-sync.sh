@@ -19,19 +19,18 @@ echo "  OpenFlows Dev Binary Sync"
 echo "═══════════════════════════════════════"
 echo ""
 
-# Step 1: Build if needed
-if [ ! -f "$RELEASE_BIN" ] || [ ! -f "$HARNESS_BIN" ]; then
-    echo "Step 1: Building openflows binaries (release mode)..."
-    cd "$PROJECT_ROOT"
-    cargo build --release -p openflows -p openflows-harness
-    echo "✓ Build complete"
-    echo ""
-else
-    echo "Step 1: Release binaries already built"
-    echo "  openflows:        $(du -h "$RELEASE_BIN" | cut -f1)"
-    echo "  openflows-harness: $(du -h "$HARNESS_BIN" | cut -f1)"
-    echo ""
-fi
+# Step 1: Always rebuild from current source. `cargo build` is incremental,
+# so this is a fast no-op when nothing changed, but it guarantees we never
+# sync a stale binary into .dev-binaries/ (and from there into workspaces)
+# just because a binary happened to already exist on disk from a previous
+# build predating a recent code fix.
+echo "Step 1: Building openflows binaries (release mode)..."
+cd "$PROJECT_ROOT"
+cargo build --release -p openflows -p openflows-harness
+echo "✓ Build complete"
+echo "  openflows:        $(du -h "$RELEASE_BIN" | cut -f1)"
+echo "  openflows-harness: $(du -h "$HARNESS_BIN" | cut -f1)"
+echo ""
 
 # Step 2: Sync to .dev-binaries
 echo "Step 2: Syncing binaries to .dev-binaries/..."

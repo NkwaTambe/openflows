@@ -1100,7 +1100,9 @@ Before significant work, read the relevant skill file to understand the workflow
         if let Some(existing_chat_id) = existing_chat_id {
             match client.get_chat(&existing_chat_id).await {
                 Ok(chat) => {
-                    if chat.status() == ChatStatus::Waiting {
+                    let status = chat.status();
+
+                    if status == ChatStatus::Waiting {
                         let last_action: Option<String> = store.get_typed(&action_key).await;
                         if matches!(last_action.as_deref(), None | Some("completed")) {
                             // Send a minimal follow-up that leverages harness state
@@ -1134,14 +1136,44 @@ Before significant work, read the relevant skill file to understand the workflow
                         }
                     }
 
-                    debug!(
-                        chat_id = %chat.id,
-                        worker_id,
-                        ticket_id,
-                        status = ?chat.status(),
-                        "Existing Coder chat is already active; no new message needed"
-                    );
-                    return;
+                    // If the chat is in an error state, it is stale — clear it so the
+                    // code below falls through and provisions a fresh chat bound to the
+                    // current workspace. Without this, a dead chat ID can persist in Redis
+                    // across workspace re-provisioning and retry cycles, silently starving
+                    // the ticket of an active chat while the LLM continues re-polling it.
+                    if status == ChatStatus::Error {
+                        debug!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            status = ?status,
+                            "Stored chat is in error state — clearing stale chat_id to create replacement"
+                        );
+                        store.set(&chat_key, json!(String::default())).await;
+                        // Also clear the chat_id from the dispatch payload so mid-flight
+                        // dispatch retains context but not a dead chat reference.
+                        let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
+                        let mut dispatch: serde_json::Value =
+                            store.get_typed(&dispatch_key).await.unwrap_or(serde_json::Value::Object(
+                                serde_json::Map::new(),
+                            ));
+                        if let Some(obj) = dispatch.as_object_mut() {
+                            obj.remove("chat_id");
+                            store.set(&dispatch_key, serde_json::Value::Object(obj.clone())).await;
+                        }
+                        // Clear action too so recovery logic treats this as a fresh start.
+                        store.set(&action_key, json!(String::default())).await;
+                        // Fall through to create a new chat below.
+                    } else {
+                        debug!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            status = ?status,
+                            "Existing Coder chat is active; no new message needed"
+                        );
+                        return;
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1149,8 +1181,11 @@ Before significant work, read the relevant skill file to understand the workflow
                         worker_id,
                         ticket_id,
                         error = %e,
-                        "Existing chat lookup failed; recreating assignment chat"
+                        "Existing chat lookup failed; clearing stale chat_id to create replacement"
                     );
+                    // Treat API failure the same as Error — clear the stale ID and retry.
+                    store.set(&chat_key, json!(String::default())).await;
+                    store.set(&action_key, json!(String::default())).await;
                 }
             }
         }

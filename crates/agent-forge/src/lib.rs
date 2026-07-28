@@ -268,7 +268,7 @@ impl BatchNode for ForgePairNode {
     async fn exec_one(&self, item: Value) -> Result<Value> {
         let ticket_id = item["ticket_id"].as_str().unwrap_or("");
         let worker_id = item["worker_id"].as_str().unwrap_or("");
-        info!(
+        debug!(
             ticket_id,
             worker_id, "ForgePairNode monitoring forge worker"
         );
@@ -301,8 +301,11 @@ impl BatchNode for ForgePairNode {
             let role = "forge";
 
             // === NEW: Read harness-written status ===
+            // NOTE: Only log at info level for significant state transitions.
+            // Normal in-progress phases (planning/building/testing) are debug-only
+            // to avoid filling logs with per-poll routine output.
             if let Some(harness_status) = Self::read_harness_status(store, ticket_id).await {
-                info!(
+                debug!(
                     ticket_id,
                     worker_id,
                     phase = %harness_status.phase,
@@ -356,20 +359,37 @@ impl BatchNode for ForgePairNode {
                 match client.get_chat(&chat_id).await {
                     Ok(chat) => {
                         let status = chat.status();
-                        
-                        // Enhanced diagnostics: log full chat details when in error state
+
+                        // Only emit a full diagnostic warn when this is the first time we
+                        // are seeing this chat in error state. Once chat_action is already
+                        // set to "interrupted", we have already processed it and every
+                        // subsequent poll would re-log the same stale data — degrade to
+                        // debug to keep logs actionable.
                         if matches!(status, ChatStatus::Error) {
-                            // Try to get additional error context from the chat
-                            if let Ok(messages) = client.get_chat_messages(&chat_id, 1).await {
-                                if let Some(last_msg) = messages.first() {
+                            let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+                            let last_action: Option<String> = store.get_typed(&action_key).await;
+                            let first_sighting = last_action
+                                .as_deref()
+                                .map(|a| !matches!(a, "interrupted" | "first_error_logged"))
+                                .unwrap_or(true);
+
+                            if first_sighting {
+                                // Log extra context on the initial emergency
+                                let last_msg = client
+                                    .get_chat_messages(&chat_id, 1)
+                                    .await
+                                    .ok()
+                                    .and_then(|m| m.first().cloned());
+                                store.set(&action_key, json!("first_error_logged")).await;
+                                if let Some(msg) = last_msg {
                                     warn!(
                                         chat_id = %chat_id,
                                         ticket_id,
                                         workspace_id = %chat.workspace_id,
                                         status = ?status,
-                                        last_message = ?last_msg.content_raw,
                                         owner_id = %chat.owner_id,
-                                        "Forge chat in ERROR state - details above"
+                                        last_message = ?msg.content_raw,
+                                        "Forge chat entered error state — will be re-provisioned automatically"
                                     );
                                 } else {
                                     warn!(
@@ -378,30 +398,28 @@ impl BatchNode for ForgePairNode {
                                         workspace_id = %chat.workspace_id,
                                         status = ?status,
                                         owner_id = %chat.owner_id,
-                                        "Forge chat entered error status"
+                                        "Forge chat entered error state — will be re-provisioned automatically"
                                     );
                                 }
                             } else {
-                                warn!(
+                                debug!(
                                     chat_id = %chat_id,
                                     ticket_id,
-                                    workspace_id = %chat.workspace_id,
                                     status = ?status,
-                                    owner_id = %chat.owner_id,
-                                    "Forge chat entered error status"
+                                    "Forge chat still in error; already reported"
                                 );
                             }
                         }
-                        
+
                         Self::sync_chat_status_to_store(store, ticket_id, role, status)
                             .await;
                     }
                     Err(e) => {
-                        warn!(
+                        debug!(
                             chat_id = %chat_id,
                             ticket_id,
                             error = %e,
-                            "Failed to get forge chat status"
+                            "Failed to get forge chat status (will skip sync for this poll)"
                         );
                     }
                 }

@@ -725,9 +725,9 @@ impl CoderClient {
             "rich_parameter_values": rich_parameter_values,
         });
 
-        info!(
-            "Creating workspace with payload: {}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        debug!(
+            workspace_name = %req.name,
+            "Creating workspace with payload"
         );
 
         let resp = self
