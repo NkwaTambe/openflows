@@ -257,7 +257,9 @@ async fn main() -> Result<()> {
         Commands::Gate {
             action: GateAction::Approve { phase, notes },
         } => {
-            store.gate_approve(&ticket, &role, &phase, notes.as_deref()).await?;
+            store
+                .gate_approve(&ticket, &role, &phase, notes.as_deref())
+                .await?;
         }
         Commands::Gate {
             action: GateAction::Status { phase },

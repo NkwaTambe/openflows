@@ -5,7 +5,10 @@
 
 pub mod store;
 
-pub use store::{HarnessStore, GateApproval, DispatchPayload, PrInfo, HandoffPayload, ReviewPayload, MergePayload};
+pub use store::{
+    DispatchPayload, GateApproval, HandoffPayload, HarnessStore, MergePayload, PrInfo,
+    ReviewPayload,
+};
 
 // Type alias for convenience
 pub type Harness = HarnessStore;
