@@ -154,7 +154,7 @@ impl ForgePairNode {
     async fn read_harness_status(store: &SharedStore, ticket_id: &str) -> Option<HarnessStatus> {
         let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
         let status_json: Option<String> = store.get_typed(&status_key).await;
-        
+
         if let Some(json_str) = status_json {
             // Try parsing as HarnessStatus struct first
             if let Ok(status) = serde_json::from_str::<HarnessStatus>(&json_str) {
@@ -165,7 +165,11 @@ impl ForgePairNode {
                 if let Some(phase) = obj.get("phase").and_then(|v| v.as_str()) {
                     return Some(HarnessStatus {
                         phase: phase.to_string(),
-                        role: obj.get("role").and_then(|v| v.as_str()).unwrap_or("forge").to_string(),
+                        role: obj
+                            .get("role")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("forge")
+                            .to_string(),
                         ts: obj.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
                     });
                 }
@@ -179,7 +183,7 @@ impl ForgePairNode {
     async fn read_harness_pr_info(store: &SharedStore, ticket_id: &str) -> Option<HarnessPrInfo> {
         let pr_key = full_ticket_key_flat(ticket_id, "pr");
         let pr_json: Option<String> = store.get_typed(&pr_key).await;
-        
+
         if let Some(json_str) = pr_json {
             if let Ok(pr_info) = serde_json::from_str::<HarnessPrInfo>(&json_str) {
                 return Some(pr_info);
@@ -316,10 +320,9 @@ impl BatchNode for ForgePairNode {
                     "review_ready" => {
                         info!(
                             ticket_id,
-                            worker_id,
-                            "Harness reports review_ready — checking for PR info"
+                            worker_id, "Harness reports review_ready — checking for PR info"
                         );
-                        
+
                         // Check if harness wrote PR info
                         if let Some(pr_info) = Self::read_harness_pr_info(store, ticket_id).await {
                             info!(
@@ -327,7 +330,8 @@ impl BatchNode for ForgePairNode {
                                 pr_number = pr_info.pr_number,
                                 "Found harness PR info — syncing to pending_prs"
                             );
-                            Self::sync_harness_pr_to_pending(store, ticket_id, worker_id, &pr_info).await;
+                            Self::sync_harness_pr_to_pending(store, ticket_id, worker_id, &pr_info)
+                                .await;
                             has_pr_opened = true;
                         } else {
                             // No PR info but review_ready — signal for Sentinel spawn
@@ -366,7 +370,8 @@ impl BatchNode for ForgePairNode {
                         // subsequent poll would re-log the same stale data — degrade to
                         // debug to keep logs actionable.
                         if matches!(status, ChatStatus::Error) {
-                            let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+                            let action_key =
+                                full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
                             let last_action: Option<String> = store.get_typed(&action_key).await;
                             let first_sighting = last_action
                                 .as_deref()
@@ -374,33 +379,38 @@ impl BatchNode for ForgePairNode {
                                 .unwrap_or(true);
 
                             if first_sighting {
-                                // Log extra context on the initial emergency
+                                // Log enough context to identify and debug the dead chat, but
+                                // NOT the message body itself. Coder chat messages can carry
+                                // private ticket data, source code, tool output, or credentials;
+                                // emitting `content_raw` verbatim would leak all of that into the
+                                // controller log surface and any downstream log retention system.
+                                // Operators who need the full message can fetch it from the Coder
+                                // API via the message id reported here.
                                 let last_msg = client
                                     .get_chat_messages(&chat_id, 1)
                                     .await
                                     .ok()
                                     .and_then(|m| m.first().cloned());
                                 store.set(&action_key, json!("first_error_logged")).await;
-                                if let Some(msg) = last_msg {
-                                    warn!(
-                                        chat_id = %chat_id,
-                                        ticket_id,
-                                        workspace_id = %chat.workspace_id,
-                                        status = ?status,
-                                        owner_id = %chat.owner_id,
-                                        last_message = ?msg.content_raw,
-                                        "Forge chat entered error state — will be re-provisioned automatically"
-                                    );
-                                } else {
-                                    warn!(
-                                        chat_id = %chat_id,
-                                        ticket_id,
-                                        workspace_id = %chat.workspace_id,
-                                        status = ?status,
-                                        owner_id = %chat.owner_id,
-                                        "Forge chat entered error state — will be re-provisioned automatically"
-                                    );
-                                }
+                                let last_message_id =
+                                    last_msg.as_ref().map(|m| m.id.as_str()).unwrap_or("");
+                                let last_message_role =
+                                    last_msg.as_ref().map(|m| m.role.as_str()).unwrap_or("");
+                                let last_message_bytes = last_msg
+                                    .as_ref()
+                                    .map(|m| m.content_raw.to_string().len())
+                                    .unwrap_or(0);
+                                warn!(
+                                    chat_id = %chat_id,
+                                    ticket_id,
+                                    workspace_id = %chat.workspace_id,
+                                    status = ?status,
+                                    owner_id = %chat.owner_id,
+                                    last_message_id = last_message_id,
+                                    last_message_role = last_message_role,
+                                    last_message_bytes = last_message_bytes,
+                                    "Forge chat entered error state — will be re-provisioned automatically"
+                                );
                             } else {
                                 debug!(
                                     chat_id = %chat_id,
@@ -411,8 +421,7 @@ impl BatchNode for ForgePairNode {
                             }
                         }
 
-                        Self::sync_chat_status_to_store(store, ticket_id, role, status)
-                            .await;
+                        Self::sync_chat_status_to_store(store, ticket_id, role, status).await;
                     }
                     Err(e) => {
                         debug!(
@@ -474,7 +483,10 @@ impl BatchNode for ForgePairNode {
 
         info!(
             monitored = results.len(),
-            has_pr_opened, has_review_ready, has_failed, has_in_progress, 
+            has_pr_opened,
+            has_review_ready,
+            has_failed,
+            has_in_progress,
             "ForgePairNode post_batch summary"
         );
 
