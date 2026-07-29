@@ -843,22 +843,28 @@ Before significant work, read the relevant skill file to understand the workflow
 
         let coder_url: Option<String> = store.get_typed("coder_url").await;
 
-        let workspace = client
-            .create_workspace(&CreateWorkspaceRequest {
-                template_name,
-                name: workspace_name,
-                parameters: json!({
-                    "repo_url": repo_url,
-                    "role": worker_id,
-                    "ticket_id": ticket_id,
-                    "redis_url": "redis://redis:6379",
-                    "tenant": std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
-                    "host_cli_binary": host_cli_binary,
-                    "cli_binary_name": cli_name,
-                    "coder_url": coder_url.unwrap_or_else(|| std::env::var("CODER_URL").unwrap_or_default()),
-                }),
-            })
-            .await?;
+        // Note: The openflows-forge template expects the dev binaries via the
+        // Terraform variable `TF_VAR_dev_binary_host_path` (not workspace parameters). Providing it this
+        // variable allows the template's SessionStart script to mount and copy the correct CLI
+        // binaries from the host machine. Avoid passing misaligned workspace parameters.
+        let request = CreateWorkspaceRequest {
+            template_name,
+            name: workspace_name,
+            parameters: json!({
+                "repo_url": repo_url,
+                "role": worker_id,
+                "ticket_id": ticket_id,
+                "redis_url": "redis://redis:6379",
+                "tenant": std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
+                "coder_url": coder_url.unwrap_or_else(|| std::env::var("CODER_URL").unwrap_or_default()),
+            }),
+        };
+        // Inject the Terraform variable the template reads.
+        if !host_cli_binary.is_empty() {
+            std::env::set_var("TF_VAR_dev_binary_host_path", &host_cli_binary);
+        }
+
+        let workspace = client.create_workspace(&request).await?;
 
         // Persist the workspace ID immediately so that even if readiness
         // polling times out, retries can reuse the same workspace rather
@@ -1397,7 +1403,9 @@ Use `openflows-harness` for all coordination:
     }
 
     /// Poll harness-written status keys for in-progress tickets.
-    /// When a ticket reaches `review_ready` phase, spawn a Sentinel chat to review the PR.
+    /// Spawns a Sentinel chat when:
+    /// - A ticket reaches `planning` phase (SENTINEL reviews the plan and approves the gate)
+    /// - A ticket reaches `review_ready` phase (SENTINEL reviews the PR)
     async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
@@ -1425,125 +1433,295 @@ Use `openflows-harness` for all coordination:
                 .and_then(|v| v.get("phase"))
                 .and_then(|v| v.as_str());
 
-            if phase != Some("review_ready") {
-                continue;
-            }
+            match phase {
+                Some("planning") => {
+                    // ── Planning Gate: SENTINEL must review the plan and approve the gate ──
+                    // FORGE halts at planning and waits for SENTINEL to run
+                    // `openflows-harness gate approve --phase planning`. If no SENTINEL
+                    // chat exists for this ticket, spawn one so it can review the plan.
 
-            // Check if Sentinel chat already exists for this ticket
-            let sentinel_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
-            let existing_sentinel_chat: Option<String> = store.get_typed(&sentinel_chat_key).await;
-            if existing_sentinel_chat.is_some() {
-                debug!(ticket_id = %ticket.id, "Sentinel chat already exists, skipping spawn");
-                continue;
-            }
+                    // Check if gate already approved — if so, FORGE will transition on its own
+                    let gate_key = format!("ns:{}:ticket:{}:gate:planning",
+                        std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
+                        ticket.id);
+                    let gate_approval: Option<Value> = store.get_typed(&gate_key).await;
+                    if gate_approval.is_some() {
+                        debug!(
+                            ticket_id = %ticket.id,
+                            "Planning gate already approved — SENTINEL review not needed"
+                        );
+                        continue;
+                    }
 
-            // Check if Sentinel already reviewed (approved or rejected)
-            let review_key = full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
-            let existing_review: Option<Value> = store.get_typed(&review_key).await;
-            if existing_review.is_some() {
-                debug!(ticket_id = %ticket.id, "Sentinel review already exists, skipping spawn");
-                continue;
-            }
+                    // Check if SENTINEL chat already exists for plan review
+                    let sentinel_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    let existing_sentinel_chat: Option<String> =
+                        store.get_typed(&sentinel_chat_key).await;
+                    if existing_sentinel_chat.is_some() {
+                        debug!(
+                            ticket_id = %ticket.id,
+                            "Sentinel chat already exists for planning ticket — review in progress"
+                        );
+                        continue;
+                    }
 
-            // Find an idle sentinel worker slot
-            let sentinel_slot = slots.iter().find(|(id, slot)| {
-                Self::worker_role(id) == "sentinel" && matches!(slot.status, WorkerStatus::Idle)
-            });
+                    // Find an idle sentinel worker slot
+                    let sentinel_slot = slots.iter().find(|(id, slot)| {
+                        Self::worker_role(id) == "sentinel"
+                            && matches!(slot.status, WorkerStatus::Idle)
+                    });
 
-            let (sentinel_worker_id, sentinel_slot) = match sentinel_slot {
-                Some((id, slot)) => (id.clone(), slot.clone()),
-                None => {
-                    info!(
-                        ticket_id = %ticket.id,
-                        "No idle sentinel worker available for review_ready ticket"
-                    );
-                    continue;
-                }
-            };
-
-            let workspace_id = match &sentinel_slot.workspace_id {
-                Some(ws) => ws.clone(),
-                None => {
-                    // Provision a sentinel workspace
-                    match self
-                        .provision_coder_workspace(store, &sentinel_worker_id, &ticket.id)
-                        .await
-                    {
-                        Ok(Some(ws_id)) => ws_id,
-                        Ok(None) | Err(_) => {
-                            warn!(
+                    let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
+                        Some((id, slot)) => (id.clone(), slot.clone()),
+                        None => {
+                            info!(
                                 ticket_id = %ticket.id,
-                                sentinel_worker_id,
-                                "Failed to provision sentinel workspace"
+                                "No idle sentinel worker available for planning gate review"
                             );
                             continue;
                         }
+                    };
+
+                    let workspace_id = match &sentinel_slot_data.workspace_id {
+                        Some(ws) => ws.clone(),
+                        None => {
+                            match self
+                                .provision_coder_workspace(store, &sentinel_worker_id, &ticket.id)
+                                .await
+                            {
+                                Ok(Some(ws_id)) => ws_id,
+                                Ok(None) | Err(_) => {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        sentinel_worker_id,
+                                        "Failed to provision sentinel workspace for planning review"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+
+                    // Build dispatch payload for Sentinel plan review.
+                    // Include the PLAN.md content hint so SENTINEL knows this is a
+                    // planning-gate review, not a PR review.
+                    let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "sentinel");
+                    let dispatch_payload = json!({
+                        "ticket_id": ticket.id,
+                        "title": ticket.title,
+                        "body": ticket.body,
+                        "branch": ticket.branch,
+                        "review_type": "planning_gate",
+                        "instructions": format!(
+                            "Review the plan for ticket {}. Read PLAN.md and evaluate whether it \
+                             correctly addresses the ticket requirements. If the plan is sound, \
+                             approve the planning gate by running: \
+                             openflows-harness gate approve --phase planning --notes \"Plan approved\". \
+                             If the plan has issues, provide feedback and do NOT approve the gate.",
+                            ticket.id
+                        ),
+                    });
+                    store.set(&dispatch_key, dispatch_payload).await;
+
+                    // Update sentinel slot to Assigned
+                    let mut updated_slots: HashMap<String, WorkerSlot> =
+                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                    if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
+                        slot.status = WorkerStatus::Assigned {
+                            ticket_id: ticket.id.clone(),
+                            issue_url: ticket.issue_url.clone(),
+                        };
+                        slot.workspace_id = Some(workspace_id.clone());
+                    }
+                    store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
+
+                    // Create sentinel chat with plan review context
+                    let mut labels = serde_json::Map::new();
+                    labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
+                    labels.insert(CHAT_LABEL_ROLE.to_string(), json!("sentinel"));
+                    labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
+                    labels.insert("review_type".to_string(), json!("planning_gate"));
+
+                    // Build a prompt that instructs SENTINEL to review the plan
+                    let plan_review_prompt = format!(
+                        "## Planning Gate Review — Ticket {}\n\n\
+                         FORGE has written a plan and is waiting for your approval before \
+                         proceeding to implementation.\n\n\
+                         **Your task:**\n\
+                         1. Read `PLAN.md` in the workspace\n\
+                         2. Evaluate whether the plan correctly addresses the ticket requirements\n\
+                         3. If the plan is sound, approve the planning gate:\n\
+                            `openflows-harness gate approve --phase planning --notes \"Plan approved. \
+                         Proceed with implementation.\"`\n\
+                         4. If the plan has issues, provide specific actionable feedback and do NOT \
+                         approve the gate\n\n\
+                         Use `openflows-harness dispatch read` for ticket context.\n\n\
+                         **Ticket:** {} — {}\n",
+                        ticket.id,
+                        ticket.id,
+                        ticket.title,
+                    );
+
+                    let chat_req = coder_client::types::CreateChatRequest {
+                        organization_id: None,
+                        workspace_id: workspace_id.clone(),
+                        model_config_id: None,
+                        content: vec![coder_client::types::ChatInputPart::text(
+                            &plan_review_prompt,
+                        )],
+                        labels: Some(labels),
+                    };
+
+                    let chat_result = client.create_chat(&chat_req).await;
+
+                    match chat_result {
+                        Ok(chat) => {
+                            store.set(&sentinel_chat_key, json!(chat.id)).await;
+                            info!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                chat_id = %chat.id,
+                                "Spawned Sentinel chat for planning gate review"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                error = %e,
+                                "Failed to create Sentinel chat for planning review"
+                            );
+                        }
                     }
                 }
-            };
+                Some("review_ready") => {
+                    // ── PR Review: SENTINEL reviews completed work ──
 
-            // Build dispatch payload for Sentinel with PR info
-            let pr_key = full_ticket_key_flat(&ticket.id, "pr");
-            let pr_info: Option<Value> = store.get_typed(&pr_key).await;
-            let handoff_key = full_ticket_key_flat(&ticket.id, "handoff");
-            let handoff_info: Option<Value> = store.get_typed(&handoff_key).await;
+                    // Check if Sentinel chat already exists for this ticket
+                    let sentinel_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    let existing_sentinel_chat: Option<String> =
+                        store.get_typed(&sentinel_chat_key).await;
+                    if existing_sentinel_chat.is_some() {
+                        debug!(ticket_id = %ticket.id, "Sentinel chat already exists, skipping spawn");
+                        continue;
+                    }
 
-            let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "sentinel");
-            let dispatch_payload = json!({
-                "ticket_id": ticket.id,
-                "title": ticket.title,
-                "body": ticket.body,
-                "branch": ticket.branch,
-                "pr_info": pr_info,
-                "handoff": handoff_info,
-            });
-            store.set(&dispatch_key, dispatch_payload).await;
+                    // Check if Sentinel already reviewed (approved or rejected)
+                    let review_key = full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
+                    let existing_review: Option<Value> = store.get_typed(&review_key).await;
+                    if existing_review.is_some() {
+                        debug!(ticket_id = %ticket.id, "Sentinel review already exists, skipping spawn");
+                        continue;
+                    }
 
-            // Update sentinel slot to Assigned
-            let mut updated_slots: HashMap<String, WorkerSlot> =
-                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-            if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
-                slot.status = WorkerStatus::Assigned {
-                    ticket_id: ticket.id.clone(),
-                    issue_url: ticket.issue_url.clone(),
-                };
-                slot.workspace_id = Some(workspace_id.clone());
-            }
-            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
+                    // Find an idle sentinel worker slot
+                    let sentinel_slot = slots.iter().find(|(id, slot)| {
+                        Self::worker_role(id) == "sentinel"
+                            && matches!(slot.status, WorkerStatus::Idle)
+                    });
 
-            // Create sentinel chat
-            let mut labels = serde_json::Map::new();
-            labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
-            labels.insert(CHAT_LABEL_ROLE.to_string(), json!("sentinel"));
-            labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
+                    let (sentinel_worker_id, sentinel_slot_data) = match sentinel_slot {
+                        Some((id, slot)) => (id.clone(), slot.clone()),
+                        None => {
+                            info!(
+                                ticket_id = %ticket.id,
+                                "No idle sentinel worker available for review_ready ticket"
+                            );
+                            continue;
+                        }
+                    };
 
-            let chat_req = coder_client::types::CreateChatRequest {
-                organization_id: None,
-                workspace_id: workspace_id.clone(),
-                model_config_id: None,
-                content: vec![],
-                labels: Some(labels),
-            };
+                    let workspace_id = match &sentinel_slot_data.workspace_id {
+                        Some(ws) => ws.clone(),
+                        None => {
+                            // Provision a sentinel workspace
+                            match self
+                                .provision_coder_workspace(store, &sentinel_worker_id, &ticket.id)
+                                .await
+                            {
+                                Ok(Some(ws_id)) => ws_id,
+                                Ok(None) | Err(_) => {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        sentinel_worker_id,
+                                        "Failed to provision sentinel workspace"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    };
 
-            let chat_result = client.create_chat(&chat_req).await;
+                    // Build dispatch payload for Sentinel with PR info
+                    let pr_key = full_ticket_key_flat(&ticket.id, "pr");
+                    let pr_info: Option<Value> = store.get_typed(&pr_key).await;
+                    let handoff_key = full_ticket_key_flat(&ticket.id, "handoff");
+                    let handoff_info: Option<Value> = store.get_typed(&handoff_key).await;
 
-            match chat_result {
-                Ok(chat) => {
-                    store.set(&sentinel_chat_key, json!(chat.id)).await;
-                    info!(
-                        ticket_id = %ticket.id,
-                        sentinel_worker_id,
-                        chat_id = %chat.id,
-                        "Spawned Sentinel chat for review_ready ticket"
-                    );
+                    let dispatch_key = full_ticket_key(&ticket.id, KEY_TICKET_DISPATCH, "sentinel");
+                    let dispatch_payload = json!({
+                        "ticket_id": ticket.id,
+                        "title": ticket.title,
+                        "body": ticket.body,
+                        "branch": ticket.branch,
+                        "review_type": "pr_review",
+                        "pr_info": pr_info,
+                        "handoff": handoff_info,
+                    });
+                    store.set(&dispatch_key, dispatch_payload).await;
+
+                    // Update sentinel slot to Assigned
+                    let mut updated_slots: HashMap<String, WorkerSlot> =
+                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                    if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
+                        slot.status = WorkerStatus::Assigned {
+                            ticket_id: ticket.id.clone(),
+                            issue_url: ticket.issue_url.clone(),
+                        };
+                        slot.workspace_id = Some(workspace_id.clone());
+                    }
+                    store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
+
+                    // Create sentinel chat
+                    let mut labels = serde_json::Map::new();
+                    labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
+                    labels.insert(CHAT_LABEL_ROLE.to_string(), json!("sentinel"));
+                    labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
+                    labels.insert("review_type".to_string(), json!("pr_review"));
+
+                    let chat_req = coder_client::types::CreateChatRequest {
+                        organization_id: None,
+                        workspace_id: workspace_id.clone(),
+                        model_config_id: None,
+                        content: vec![],
+                        labels: Some(labels),
+                    };
+
+                    let chat_result = client.create_chat(&chat_req).await;
+
+                    match chat_result {
+                        Ok(chat) => {
+                            store.set(&sentinel_chat_key, json!(chat.id)).await;
+                            info!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                chat_id = %chat.id,
+                                "Spawned Sentinel chat for review_ready ticket"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                error = %e,
+                                "Failed to create Sentinel chat"
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        ticket_id = %ticket.id,
-                        sentinel_worker_id,
-                        error = %e,
-                        "Failed to create Sentinel chat"
-                    );
+                _ => {
+                    // Not in a phase that requires SENTINEL spawn (building, testing, etc.)
+                    continue;
                 }
             }
         }
@@ -1845,35 +2023,13 @@ Use `openflows-harness` for all coordination:
         #[allow(clippy::needless_borrow)]
         let worker_entry = registry.get(&base_id);
 
-        let has_dedicated_token = worker_entry
-            .as_ref()
-            .map(|e| e.github_token_env.is_some())
-            .unwrap_or(false);
-
-        if !has_dedicated_token {
-            warn!(
-                worker_id,
-                "Worker has no dedicated github_token_env — cannot safely determine its GitHub identity"
-            );
-            let comment = format!(
-                "<!-- openflows-assignment-failure -->\n\
-                 ⚠️ **Could not assign this issue to `{}`** — the agent does not have a dedicated \
-                 GitHub token configured. Please add a `github_token_env` field for this agent in \
-                 `registry.json` so its identity can be resolved dynamically.",
-                worker_id
-            );
-            Self::post_comment_once(
-                &nexus_client,
-                owner,
-                repo,
-                issue_number,
-                ASSIGNMENT_FAILURE_MARKER,
-                &comment,
-            )
-            .await;
-            return Ok(());
-        }
-
+        // Resolve the worker's GitHub token. resolve_github_token() falls back
+        // to GITHUB_PERSONAL_ACCESS_TOKEN when no dedicated github_token_env is
+        // configured on the registry entry, so agents without a per-agent token
+        // still work as long as the fallback env var is set. We do NOT hard-fail
+        // on a missing github_token_env field — that would block all v2-style
+        // registry entries (which omit the deprecated v1 field) even when the
+        // shared PAT is perfectly valid for assignment.
         let worker_token_result = identity_manager.resolve_github_token(worker_id);
         if let Err(e) = &worker_token_result {
             warn!(
@@ -1884,11 +2040,12 @@ Use `openflows-harness` for all coordination:
             let env_var_name = worker_entry
                 .as_ref()
                 .and_then(|e| e.github_token_env.as_deref())
-                .unwrap_or("<missing>");
+                .unwrap_or("GITHUB_PERSONAL_ACCESS_TOKEN");
             let comment = format!(
                 "<!-- openflows-assignment-failure -->\n\
-                 ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token environment \
-                 variable is not set. Please check that `{}` is configured in the environment.",
+                 ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token could not \
+                 be resolved. Please check that `{}` is configured in the environment (or set a \
+                 `github_token_env` field for this agent in `registry.json`).",
                 worker_id, env_var_name
             );
             Self::post_comment_once(
@@ -2706,25 +2863,25 @@ Use `openflows-harness` for all coordination:
                         }
                     }
                     WorkspaceStatus::Unknown(_) => {
-                        // If the workspace status is unknown but the agent is ready, just restart it
+                        // If the workspace status is unknown but the agent is connected
+                        // and ready, the workspace is healthy — the unknown top-level
+                        // status is cosmetic/transient. Do NOT stop+start (the stop can
+                        // delete the workspace and the subsequent start 404s), and do NOT
+                        // burn a recovery attempt. Just reset the counter and move on.
                         if workspace.is_agent_ready() {
                             info!(
                                 workspace_id = %crashed_workspace.workspace_id,
                                 ticket_id = %crashed_workspace.ticket_id,
-                                "Workspace status unknown but agent ready - restarting to refresh status"
+                                "Workspace status unknown but agent ready — no restart needed (healthy)"
                             );
-                            let _ = client.stop_workspace(&crashed_workspace.workspace_id).await;
-                            if let Err(e) = client
-                                .start_workspace(&crashed_workspace.workspace_id)
-                                .await
-                            {
-                                warn!(
-                                    workspace_id = %crashed_workspace.workspace_id,
-                                    ticket_id = %crashed_workspace.ticket_id,
-                                    error = %e,
-                                    "Failed to restart workspace with unknown status"
-                                );
-                            }
+                            // The workspace is actually healthy; clear the recovery
+                            // counter so a later, genuinely-unrelated crash gets a full
+                            // retry budget instead of inheriting this false positive's bill.
+                            self.reset_recovery_attempts(
+                                store,
+                                &crashed_workspace.ticket_id,
+                            )
+                            .await;
                         } else {
                             // Agent not ready and status unknown - recreate the workspace
                             info!(

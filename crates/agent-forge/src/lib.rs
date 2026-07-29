@@ -42,6 +42,11 @@ pub struct HarnessStatus {
 /// Action to signal that work is ready for review (Sentinel should be spawned)
 pub const ACTION_REVIEW_READY: &str = "review_ready";
 
+/// Action to signal that FORGE is in the planning phase and waiting for
+/// SENTINEL gate approval. NEXUS picks this up and spawns a SENTINEL chat
+/// to review the plan and run `openflows-harness gate approve --phase planning`.
+pub const ACTION_PLANNING_GATE: &str = "planning_gate";
+
 pub struct ForgePairNode {
     #[allow(dead_code)]
     workspace_root: PathBuf,
@@ -287,6 +292,7 @@ impl BatchNode for ForgePairNode {
         let client = Self::coder_client_from_store(store).await;
         let mut has_pr_opened = false;
         let mut has_review_ready = false;
+        let mut has_planning_gate = false;
         let mut has_failed = false;
         let mut has_in_progress = false;
 
@@ -342,7 +348,18 @@ impl BatchNode for ForgePairNode {
                         warn!(ticket_id, worker_id, "Harness reports blocked status");
                         has_failed = true;
                     }
-                    "planning" | "building" | "testing" => {
+                    "planning" => {
+                        // FORGE is in the planning gate — waiting for SENTINEL to
+                        // review the plan and approve the gate. Route to NEXUS so
+                        // it can spawn a SENTINEL chat for plan review.
+                        info!(
+                            ticket_id,
+                            worker_id,
+                            "Harness reports planning phase — SENTINEL review needed for gate approval"
+                        );
+                        has_planning_gate = true;
+                    }
+                    "building" | "testing" => {
                         debug!(
                             ticket_id,
                             worker_id,
@@ -473,7 +490,7 @@ impl BatchNode for ForgePairNode {
                     }
                     _ => {
                         // Only mark as in_progress if we haven't already found a more specific state
-                        if !has_pr_opened && !has_review_ready && !has_failed {
+                        if !has_pr_opened && !has_review_ready && !has_planning_gate && !has_failed {
                             has_in_progress = true;
                         }
                     }
@@ -485,15 +502,19 @@ impl BatchNode for ForgePairNode {
             monitored = results.len(),
             has_pr_opened,
             has_review_ready,
+            has_planning_gate,
             has_failed,
             has_in_progress,
             "ForgePairNode post_batch summary"
         );
 
-        // Priority: PR opened > review ready > failed > in progress
+        // Priority: PR opened > planning gate > review ready > failed > in progress
         if has_pr_opened {
             info!("Forge: PR(s) opened — routing to sentinel for review");
             Ok(Action::new(ACTION_PR_OPENED))
+        } else if has_planning_gate {
+            info!("Forge: planning gate — routing to nexus for SENTINEL plan review");
+            Ok(Action::new(ACTION_PLANNING_GATE))
         } else if has_review_ready {
             info!("Forge: review_ready without PR — routing to trigger Sentinel spawn");
             Ok(Action::new(ACTION_REVIEW_READY))
