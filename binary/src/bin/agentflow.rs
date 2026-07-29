@@ -370,27 +370,25 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     };
 
     let tickets_key = format!("ns:{}:tickets", name);
-    let mut tickets: Vec<serde_json::Value> = store
-        .get_typed(&tickets_key)
-        .await
-        .unwrap_or_default();
-    
+    let mut tickets: Vec<serde_json::Value> =
+        store.get_typed(&tickets_key).await.unwrap_or_default();
+
     let mut reset_count = 0;
 
     for ticket in tickets.iter_mut() {
         let status = ticket.get("status");
-        let is_stale = status.map(|s| {
-            let stype = match s {
-                serde_json::Value::Object(obj) => {
-                    obj.get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                }
-                serde_json::Value::String(s) => s.as_str(),
-                _ => ""
-            };
-            stype == "awaiting_human" || stype == "failed"
-        }).unwrap_or(false);
+        let is_stale = status
+            .map(|s| {
+                let stype = match s {
+                    serde_json::Value::Object(obj) => {
+                        obj.get("type").and_then(|v| v.as_str()).unwrap_or("")
+                    }
+                    serde_json::Value::String(s) => s.as_str(),
+                    _ => "",
+                };
+                stype == "awaiting_human" || stype == "failed"
+            })
+            .unwrap_or(false);
 
         let should_reset = is_stale || *reset_all;
 
@@ -407,7 +405,9 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     }
 
     if reset_count > 0 {
-        store.set(&tickets_key, serde_json::to_value(&tickets)?).await;
+        store
+            .set(&tickets_key, serde_json::to_value(&tickets)?)
+            .await;
         println!("  ✓ Reset {} ticket(s) to Open", reset_count);
     } else {
         println!("  (no stale tickets found)");
@@ -431,7 +431,7 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
 
     println!("  ✓ Tenant '{}' cleaned", name);
     println!("  (Restart the controller to pick up changes)");
-    
+
     Ok(())
 }
 
@@ -610,10 +610,10 @@ async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
 
 async fn run_gate(action: GateCommands) -> Result<()> {
     use openflows_harness::Harness;
-    
-    let redis_url = std::env::var("REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-    
+
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+
     match action {
         GateCommands::Approve {
             tenant,
@@ -624,9 +624,17 @@ async fn run_gate(action: GateCommands) -> Result<()> {
         } => {
             let store = Harness::new(&redis_url, &tenant).await?;
             let approver_role = approver.as_deref().unwrap_or("SENTINEL");
-            let ticket_key = format!("{}:{}", tenant, ticket);
-            store.gate_approve(&ticket_key, approver_role, &phase, notes.as_deref()).await?;
-            println!("✓ Gate approval recorded: {} phase for {}", phase, ticket_key);
+            // Do NOT prepend the tenant to the ticket id: Harness::new already
+            // applies the `ns:{tenant}:` namespace, and gate_approve builds its
+            // keys from `ticket:{}:status` / `ticket:{}:gate:{phase}`. Pre-joining
+            // `<tenant>:<ticket>` here would double the tenant in the key
+            // (`ns:{tenant}:ticket:{tenant}:{ticket}:...`) and diverge from the
+            // worker harness (which writes `ns:{tenant}:ticket:{ticket}:...`),
+            // so the approval would land in a key FORGE never reads.
+            store
+                .gate_approve(&ticket, approver_role, &phase, notes.as_deref())
+                .await?;
+            println!("✓ Gate approval recorded: {} phase for {}", phase, ticket);
         }
         GateCommands::Status {
             tenant,
@@ -634,11 +642,10 @@ async fn run_gate(action: GateCommands) -> Result<()> {
             phase,
         } => {
             let store = Harness::new(&redis_url, &tenant).await?;
-            let ticket_key = format!("{}:{}", tenant, ticket);
-            store.gate_status(&ticket_key, &phase).await?;
+            store.gate_status(&ticket, &phase).await?;
         }
     }
-    
+
     Ok(())
 }
 
