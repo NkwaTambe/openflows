@@ -1418,9 +1418,14 @@ Use `openflows-harness` for all coordination:
         };
 
         for ticket in tickets {
-            // Only check tickets that are currently being worked on
-            let is_in_progress = matches!(&ticket.status, TicketStatus::InProgress { .. });
-            if !is_in_progress {
+            // Check tickets that are currently being worked on.
+            // Both Assigned (chat just created) and InProgress (actively working)
+            // are active states where FORGE may have set a harness phase.
+            let is_active = matches!(
+                &ticket.status,
+                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+            );
+            if !is_active {
                 continue;
             }
 
