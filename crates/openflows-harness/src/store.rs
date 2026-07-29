@@ -212,19 +212,32 @@ impl HarnessStore {
         }
 
         // For transitions that leave a gated phase, require a SENTINEL approval
-        // and consume it so the approval is single-use per planning cycle.
+        // and consume it atomically so the approval is single-use per planning
+        // cycle even under concurrent transitions.
         if let Some(source_phase) = current_phase
             .as_deref()
             .and_then(|cur| gate_source_for_transition(cur, phase))
         {
             let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, source_phase));
-            let gate_approval: Option<String> = self
-                .client
-                .get(&gate_key)
-                .await
-                .context("Redis GET failed")?;
 
-            if gate_approval.is_none() {
+            // Atomically GET-and-DELETE the approval in a single Redis
+            // command. Using separate GET then DEL would let two concurrent
+            // `status set building` calls both observe the approval before
+            // either delete lands, so a single SENTINEL approval would
+            // authorize multiple transitions. GETDEL returns the value it
+            // removed (None if the key was already gone), and the key is gone
+            // by the time the command returns — the loser of the race gets
+            // None and is rejected below. We must propagate the error (no
+            // longer ignore a failed DEL): if the consume silently failed the
+            // approval would survive and the single-use guarantee would be
+            // voided.
+            let consumed_approval: Option<String> = self
+                .client
+                .getdel(&gate_key)
+                .await
+                .context("Redis GETDEL failed while consuming gate approval")?;
+
+            if consumed_approval.is_none() {
                 bail!(
                     "Cannot transition from '{}' to '{}' without SENTINEL approval.\n\
                      SENTINEL must run: openflows-harness gate approve --phase {}\n\
@@ -235,18 +248,11 @@ impl HarnessStore {
                 );
             }
 
-            // Consume the approval: a SENTINEL approval authorizes exactly one
-            // outbound transition past this gate. If the ticket later returns to
-            // the gated phase (e.g. 'planning' with a revised plan), this stale
-            // approval is gone — SENTINEL must approve the new plan fresh.
-            // `gate_status` will then (correctly) report no approval for that
-            // phase until a new one is written.
-            let _: Result<i64, _> = self.client.del(&gate_key).await;
             info!(
                 ticket,
                 from = source_phase,
                 to = phase,
-                "Gate approval verified and consumed, allowing transition"
+                "Gate approval verified and consumed (GETDEL), allowing transition"
             );
         }
 
