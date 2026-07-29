@@ -1114,10 +1114,15 @@ Before significant work, read the relevant skill file to understand the workflow
                         chat_id = %existing_chat_id,
                         worker_id,
                         ticket_id,
-                        "Stored chat no longer exists (404) — clearing stale chat_id to create replacement"
+                        "Stored chat no longer exists (404) — deleting stale chat_id to create replacement"
                     );
-                    store.set(&chat_key, json!(String::default())).await;
-                    store.set(&action_key, json!(String::default())).await;
+                    // DELETE the keys, don't store an empty string. Writing `""`
+                    // here would leave `Some("")` after get_typed deserialization,
+                    // which this function would repeatedly feed to the Coder API
+                    // as an empty chat id (404 forever) and never reach the
+                    // replacement-creation code below — starving the ticket.
+                    store.del(&chat_key).await;
+                    store.del(&action_key).await;
                     // Fall through to create a new chat below.
                 }
                 Ok(Some(chat)) => {
@@ -1157,7 +1162,7 @@ Before significant work, read the relevant skill file to understand the workflow
                         }
                     }
 
-                    // If the chat is in an error state, it is stale — clear it so the
+                    // If the chat is in an error state, it is stale — rotate it so the
                     // code below falls through and provisions a fresh chat bound to the
                     // current workspace. Without this, a dead chat ID can persist in Redis
                     // across workspace re-provisioning and retry cycles, silently starving
@@ -1168,9 +1173,13 @@ Before significant work, read the relevant skill file to understand the workflow
                             worker_id,
                             ticket_id,
                             status = ?status,
-                            "Stored chat is in error state — clearing stale chat_id to create replacement"
+                            "Stored chat is in error state — deleting stale chat_id to create replacement"
                         );
-                        store.set(&chat_key, json!(String::default())).await;
+                        // DELETE the keys (not store an empty string — see the
+                        // 404 branch above for why an empty value would loop
+                        // forever on the next poll).
+                        store.del(&chat_key).await;
+                        store.del(&action_key).await;
                         // Also clear the chat_id from the dispatch payload so mid-flight
                         // dispatch retains context but not a dead chat reference.
                         let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
@@ -1179,13 +1188,12 @@ Before significant work, read the relevant skill file to understand the workflow
                             .await
                             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                         if let Some(obj) = dispatch.as_object_mut() {
-                            obj.remove("chat_id");
-                            store
-                                .set(&dispatch_key, serde_json::Value::Object(obj.clone()))
-                                .await;
+                            if obj.remove("chat_id").is_some() {
+                                store
+                                    .set(&dispatch_key, serde_json::Value::Object(obj.clone()))
+                                    .await;
+                            }
                         }
-                        // Clear action too so recovery logic treats this as a fresh start.
-                        store.set(&action_key, json!(String::default())).await;
                         // Fall through to create a new chat below.
                     } else {
                         debug!(
