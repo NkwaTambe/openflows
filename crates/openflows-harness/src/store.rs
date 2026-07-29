@@ -76,6 +76,23 @@ pub struct HarnessStore {
     tenant: String,
 }
 
+/// Authorize an approver role for a gated phase transition. Only SENTINEL may
+/// approve a gate; FORGE/other roles must be rejected so an agent cannot approve
+/// its own plan and sidestep the mandatory review checkpoint. Comparison is
+/// case-insensitive because the worker CLI derives the role from
+/// `OPENFLOWS_ROLE` and operators may spell the role with varying case.
+pub fn authorize_gate_approver(role: &str) -> Result<()> {
+    if !role.eq_ignore_ascii_case("sentinel") {
+        bail!(
+            "Gate approval rejected: approver role '{}' is not SENTINEL. \
+             Only SENTINEL may approve a gated phase transition; FORGE/other \
+             roles are not authorized to approve their own plan.",
+            role
+        );
+    }
+    Ok(())
+}
+
 impl HarnessStore {
     pub async fn new(redis_url: &str, tenant: &str) -> Result<Self> {
         let config = Config::from_url(redis_url)?;
@@ -117,8 +134,8 @@ impl HarnessStore {
     }
 
     /// Set the current phase for this ticket.
-    /// 
-    /// Enforces gated phase transitions: FORGE cannot move past `planning` 
+    ///
+    /// Enforces gated phase transitions: FORGE cannot move past `planning`
     /// until SENTINEL approves via `gate approve`.
     pub async fn status_set(&self, ticket: &str, role: &str, phase: &str) -> Result<()> {
         if !VALID_PHASES.contains(&phase) {
@@ -131,22 +148,33 @@ impl HarnessStore {
 
         // Check current phase and enforce gating
         let status_key = self.key(&full_ticket_key_flat(ticket, "status"));
-        let current_status: Option<String> = self.client.get(&status_key).await.context("Redis GET failed")?;
-        
+        let current_status: Option<String> = self
+            .client
+            .get(&status_key)
+            .await
+            .context("Redis GET failed")?;
+
         if let Some(ref status_json) = current_status {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(status_json) {
                 if let Some(current_phase) = status.get("phase").and_then(|p| p.as_str()) {
                     // If transitioning FROM a gated phase, check for approval
                     if GATED_PHASES.contains(&current_phase) && current_phase != phase {
-                        let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, current_phase));
-                        let gate_approval: Option<String> = self.client.get(&gate_key).await.context("Redis GET failed")?;
-                        
+                        let gate_key =
+                            self.key(&format!("ticket:{}:gate:{}", ticket, current_phase));
+                        let gate_approval: Option<String> = self
+                            .client
+                            .get(&gate_key)
+                            .await
+                            .context("Redis GET failed")?;
+
                         if gate_approval.is_none() {
                             bail!(
                                 "Cannot transition from '{}' to '{}' without SENTINEL approval.\n\
                                  SENTINEL must run: openflows-harness gate approve --phase {}\n\
                                  This ensures your plan is reviewed before implementation begins.",
-                                current_phase, phase, current_phase
+                                current_phase,
+                                phase,
+                                current_phase
                             );
                         }
                         info!(
@@ -175,9 +203,23 @@ impl HarnessStore {
     }
 
     /// Approve a gated phase transition (SENTINEL only).
-    /// 
+    ///
     /// This allows FORGE to proceed past a gated phase (e.g., `planning` → `building`).
-    pub async fn gate_approve(&self, ticket: &str, role: &str, phase: &str, notes: Option<&str>) -> Result<()> {
+    ///
+    /// Only the SENTINEL role may approve a gate. FORGE cannot approve its own
+    /// plan — if it could, the mandatory review checkpoint would be bypassable by
+    /// the very agent it is meant to supervise. The worker CLI (`openflows-harness
+    /// gate approve`) derives `role` from `OPENFLOWS_ROLE`, so only a SENTINEL
+    /// workspace can satisfy this; the admin `openflows gate approve` CLI passes
+    /// `--approver` (defaulting to SENTINEL). Any other role is rejected.
+    pub async fn gate_approve(
+        &self,
+        ticket: &str,
+        role: &str,
+        phase: &str,
+        notes: Option<&str>,
+    ) -> Result<()> {
+        authorize_gate_approver(role)?;
         if !GATED_PHASES.contains(&phase) {
             bail!(
                 "Phase '{}' is not a gated phase. Gated phases: {}",
@@ -188,8 +230,12 @@ impl HarnessStore {
 
         // Verify current phase matches
         let status_key = self.key(&full_ticket_key_flat(ticket, "status"));
-        let current_status: Option<String> = self.client.get(&status_key).await.context("Redis GET failed")?;
-        
+        let current_status: Option<String> = self
+            .client
+            .get(&status_key)
+            .await
+            .context("Redis GET failed")?;
+
         if let Some(ref status_json) = current_status {
             if let Ok(status) = serde_json::from_str::<serde_json::Value>(status_json) {
                 if let Some(current_phase) = status.get("phase").and_then(|p| p.as_str()) {
@@ -197,7 +243,9 @@ impl HarnessStore {
                         bail!(
                             "Cannot approve '{}' gate — current phase is '{}'. \
                              FORGE must be in the '{}' phase to receive approval.",
-                            phase, current_phase, phase
+                            phase,
+                            current_phase,
+                            phase
                         );
                     }
                 }
@@ -205,24 +253,28 @@ impl HarnessStore {
         } else {
             bail!(
                 "No status found for ticket {}. FORGE must set status to '{}' first.",
-                ticket, phase
+                ticket,
+                phase
             );
         }
 
         let approval = GateApproval {
             phase: phase.to_string(),
             approved_by: role.to_string(),
-            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
             notes: notes.map(|s| s.to_string()),
         };
-        
+
         let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, phase));
         let json = serde_json::to_string(&approval)?;
         let _: Result<(), _> = self
             .client
             .set::<(), _, _>(&gate_key, json, None, None, false)
             .await;
-        
+
         println!("Gate approved: {} phase '{}' by {}", ticket, phase, role);
         info!(key = %gate_key, phase, role, "gate approved");
         Ok(())
@@ -231,16 +283,19 @@ impl HarnessStore {
     /// Check if a gated phase has been approved.
     pub async fn gate_status(&self, ticket: &str, phase: &str) -> Result<()> {
         let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, phase));
-        let approval: Option<String> = self.client.get(&gate_key).await.context("Redis GET failed")?;
-        
+        let approval: Option<String> = self
+            .client
+            .get(&gate_key)
+            .await
+            .context("Redis GET failed")?;
+
         match approval {
             Some(json) => {
-                let approval: GateApproval = serde_json::from_str(&json)
-                    .context("Failed to parse gate approval")?;
-                println!("✓ Gate '{}' approved by {} at {}", 
-                    approval.phase, 
-                    approval.approved_by,
-                    approval.ts
+                let approval: GateApproval =
+                    serde_json::from_str(&json).context("Failed to parse gate approval")?;
+                println!(
+                    "✓ Gate '{}' approved by {} at {}",
+                    approval.phase, approval.approved_by, approval.ts
                 );
                 if let Some(notes) = approval.notes {
                     println!("  Notes: {}", notes);
@@ -453,5 +508,23 @@ mod tests {
             full_ticket_key(ticket, "dispatch", "forge")
         );
         assert_eq!(key, "ns:acme:ticket:T-42:dispatch:forge");
+    }
+
+    #[test]
+    fn test_gate_approver_accepts_sentinel_case_insensitive() {
+        assert!(authorize_gate_approver("sentinel").is_ok());
+        assert!(authorize_gate_approver("SENTINEL").is_ok());
+        assert!(authorize_gate_approver("Sentinel").is_ok());
+    }
+
+    #[test]
+    fn test_gate_approver_rejects_forge_and_others() {
+        // FORGE must never approve its own plan — the review checkpoint exists
+        // to supervise it. Vessel/Lore/empty/unknown roles are also rejected.
+        assert!(authorize_gate_approver("forge").is_err());
+        assert!(authorize_gate_approver("vessel").is_err());
+        assert!(authorize_gate_approver("lore").is_err());
+        assert!(authorize_gate_approver("").is_err());
+        assert!(authorize_gate_approver("admin").is_err());
     }
 }
