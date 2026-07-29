@@ -359,16 +359,20 @@ Before significant work, read the relevant skill file to understand the workflow
             }
 
             let ticket_id = format!("T-{:03}", issue.number);
-            if let Some(existing) = tickets.iter_mut().find(|t| t.id == ticket_id) {
-                // Reset AwaitingHuman tickets back to Open so they can be retried
-                if matches!(existing.status, TicketStatus::AwaitingHuman { .. }) {
-                    info!(
-                        ticket_id = %existing.id,
-                        "Resetting AwaitingHuman ticket to Open for retry"
-                    );
-                    existing.status = TicketStatus::Open;
-                    existing.attempts = 0;
-                }
+            if let Some(existing) = tickets.iter().find(|t| t.id == ticket_id) {
+                // Preserve the current status, including AwaitingHuman. Escalation
+                // is a deliberate terminal-for-humans state — a human must drive
+                // recovery via `openflows tenant clean --name <tenant>` (which
+                // resets AwaitingHuman/Failed tickets to Open). Re-fetching the
+                // same ticket from the GitHub issue list on every sync pass must
+                // NOT silently reopen it, otherwise the controller will retry
+                // escalated work on every poll and repeat failed provisioning
+                // and notifications indefinitely.
+                debug!(
+                    ticket_id = %existing.id,
+                    status = ?existing.status,
+                    "Ticket already tracked; preserving status during issue sync"
+                );
                 continue;
             }
 
@@ -1098,8 +1102,25 @@ Before significant work, read the relevant skill file to understand the workflow
 
         let existing_chat_id: Option<String> = store.get_typed(&chat_key).await;
         if let Some(existing_chat_id) = existing_chat_id {
-            match client.get_chat(&existing_chat_id).await {
-                Ok(chat) => {
+            // Distinguish "the chat no longer exists" (404 → None → rotate) from
+            // a transient API failure (timeout / rate limit / 5xx → Err → keep
+            // the existing chat_id and retry on the next poll). Blankly clearing
+            // the stored chat_id on every Err would let a brief network blip spawn
+            // a duplicate chat bound to the same ticket, leaving two agents to
+            // write conflicting repository / coordination state.
+            match client.get_chat_opt(&existing_chat_id).await {
+                Ok(None) => {
+                    debug!(
+                        chat_id = %existing_chat_id,
+                        worker_id,
+                        ticket_id,
+                        "Stored chat no longer exists (404) — clearing stale chat_id to create replacement"
+                    );
+                    store.set(&chat_key, json!(String::default())).await;
+                    store.set(&action_key, json!(String::default())).await;
+                    // Fall through to create a new chat below.
+                }
+                Ok(Some(chat)) => {
                     let status = chat.status();
 
                     if status == ChatStatus::Waiting {
@@ -1153,13 +1174,15 @@ Before significant work, read the relevant skill file to understand the workflow
                         // Also clear the chat_id from the dispatch payload so mid-flight
                         // dispatch retains context but not a dead chat reference.
                         let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
-                        let mut dispatch: serde_json::Value =
-                            store.get_typed(&dispatch_key).await.unwrap_or(serde_json::Value::Object(
-                                serde_json::Map::new(),
-                            ));
+                        let mut dispatch: serde_json::Value = store
+                            .get_typed(&dispatch_key)
+                            .await
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                         if let Some(obj) = dispatch.as_object_mut() {
                             obj.remove("chat_id");
-                            store.set(&dispatch_key, serde_json::Value::Object(obj.clone())).await;
+                            store
+                                .set(&dispatch_key, serde_json::Value::Object(obj.clone()))
+                                .await;
                         }
                         // Clear action too so recovery logic treats this as a fresh start.
                         store.set(&action_key, json!(String::default())).await;
@@ -1176,16 +1199,20 @@ Before significant work, read the relevant skill file to understand the workflow
                     }
                 }
                 Err(e) => {
+                    // Transient failure (timeout / rate limit / 5xx). DO NOT clear the
+                    // stored chat_id: the chat is most likely still alive on the Coder
+                    // side and would still be active when the API recovers. Clearing it
+                    // here would cause the fall-through below to provision a duplicate
+                    // chat bound to the same ticket, with two agents then racing on the
+                    // same repository / coordination state. Retry on the next poll.
                     warn!(
                         chat_id = %existing_chat_id,
                         worker_id,
                         ticket_id,
                         error = %e,
-                        "Existing chat lookup failed; clearing stale chat_id to create replacement"
+                        "Existing chat lookup failed transiently; keeping chat_id, will retry next poll"
                     );
-                    // Treat API failure the same as Error — clear the stale ID and retry.
-                    store.set(&chat_key, json!(String::default())).await;
-                    store.set(&action_key, json!(String::default())).await;
+                    return;
                 }
             }
         }
@@ -1294,7 +1321,7 @@ Use `openflows-harness` for all coordination:
                 let chat_status = chat.status();
                 let workspace_id_str = &chat.workspace_id;
                 let owner_id = &chat.owner_id;
-                
+
                 info!(
                     chat_id = %chat.id,
                     worker_id,
@@ -1304,7 +1331,7 @@ Use `openflows-harness` for all coordination:
                     initial_status = ?chat_status,
                     "Created Chat for ticket assignment"
                 );
-                
+
                 // If chat immediately enters error state, log additional diagnostic info
                 if matches!(chat_status, ChatStatus::Error) {
                     warn!(
@@ -1376,10 +1403,7 @@ Use `openflows-harness` for all coordination:
 
         for ticket in tickets {
             // Only check tickets that are currently being worked on
-            let is_in_progress = matches!(
-                &ticket.status,
-                TicketStatus::InProgress { .. }
-            );
+            let is_in_progress = matches!(&ticket.status, TicketStatus::InProgress { .. });
             if !is_in_progress {
                 continue;
             }
