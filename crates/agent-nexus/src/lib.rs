@@ -1446,9 +1446,11 @@ Use `openflows-harness` for all coordination:
                     // chat exists for this ticket, spawn one so it can review the plan.
 
                     // Check if gate already approved — if so, FORGE will transition on its own
-                    let gate_key = format!("ns:{}:ticket:{}:gate:planning",
+                    let gate_key = format!(
+                        "ns:{}:ticket:{}:gate:planning",
                         std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
-                        ticket.id);
+                        ticket.id
+                    );
                     let gate_approval: Option<Value> = store.get_typed(&gate_key).await;
                     if gate_approval.is_some() {
                         debug!(
@@ -1459,7 +1461,8 @@ Use `openflows-harness` for all coordination:
                     }
 
                     // Check if SENTINEL chat already exists for plan review
-                    let sentinel_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    let sentinel_chat_key =
+                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
                     let existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
                     if existing_sentinel_chat.is_some() {
@@ -1603,7 +1606,8 @@ Use `openflows-harness` for all coordination:
                     // ── PR Review: SENTINEL reviews completed work ──
 
                     // Check if Sentinel chat already exists for this ticket
-                    let sentinel_chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    let sentinel_chat_key =
+                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
                     let existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
                     if existing_sentinel_chat.is_some() {
@@ -2882,11 +2886,8 @@ Use `openflows-harness` for all coordination:
                             // The workspace is actually healthy; clear the recovery
                             // counter so a later, genuinely-unrelated crash gets a full
                             // retry budget instead of inheriting this false positive's bill.
-                            self.reset_recovery_attempts(
-                                store,
-                                &crashed_workspace.ticket_id,
-                            )
-                            .await;
+                            self.reset_recovery_attempts(store, &crashed_workspace.ticket_id)
+                                .await;
                         } else {
                             // Agent not ready and status unknown - recreate the workspace
                             info!(

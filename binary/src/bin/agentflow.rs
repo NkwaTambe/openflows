@@ -231,8 +231,8 @@ async fn run_controller() -> Result<()> {
     // ── Build flow graph ────────────────────────────────────────────────
     use openflows::state::{
         ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
-        ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PLANNING_GATE,
-        ACTION_PR_OPENED, ACTION_WORK_ASSIGNED,
+        ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK,
+        ACTION_PLANNING_GATE, ACTION_PR_OPENED, ACTION_WORK_ASSIGNED,
     };
 
     let review_approve = "review_approve";
@@ -257,7 +257,7 @@ async fn run_controller() -> Result<()> {
             vec![
                 (ACTION_PR_OPENED, "sentinel"),
                 (ACTION_PLANNING_GATE, "nexus"), // Forge at planning gate → NEXUS spawns SENTINEL
-                (review_ready, "nexus"), // Forge review_ready → NEXUS spawns SENTINEL
+                (review_ready, "nexus"),         // Forge review_ready → NEXUS spawns SENTINEL
                 (ACTION_FAILED, "nexus"),
                 (pocketflow_core::Action::NO_TICKETS, "nexus"),
                 ("suspended", "nexus"),

@@ -490,7 +490,8 @@ impl BatchNode for ForgePairNode {
                     }
                     _ => {
                         // Only mark as in_progress if we haven't already found a more specific state
-                        if !has_pr_opened && !has_review_ready && !has_planning_gate && !has_failed {
+                        if !has_pr_opened && !has_review_ready && !has_planning_gate && !has_failed
+                        {
                             has_in_progress = true;
                         }
                     }

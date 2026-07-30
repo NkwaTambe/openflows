@@ -141,7 +141,8 @@ impl Node for SentinelNode {
 
             if phase == Some("planning") {
                 // Check if gate already approved
-                let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+                let tenant =
+                    std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
                 let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket.id);
                 let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
 
@@ -234,7 +235,9 @@ impl Node for SentinelNode {
             .unwrap_or_default();
 
         if reviewable.is_empty() && planning_gate_pending.is_empty() {
-            return Ok(json!({ "verdicts": [], "has_reviews": false, "has_planning_gates": false }));
+            return Ok(
+                json!({ "verdicts": [], "has_reviews": false, "has_planning_gates": false }),
+            );
         }
 
         info!(
@@ -365,12 +368,10 @@ impl Node for SentinelNode {
                     // Check if the planning gate has been approved since prep() ran.
                     // The SENTINEL chat runs `openflows-harness gate approve --phase planning`
                     // inside the workspace, which writes to SharedStore.
-                    let tenant = std::env::var("OPENFLOWS_TENANT")
-                        .unwrap_or_else(|_| "default".to_string());
-                    let gate_key =
-                        format!("ns:{}:ticket:{}:gate:planning", tenant, ticket_id);
-                    let gate_approval: Option<serde_json::Value> =
-                        store.get_typed(&gate_key).await;
+                    let tenant =
+                        std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+                    let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket_id);
+                    let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
 
                     if gate_approval.is_some() {
                         info!(
