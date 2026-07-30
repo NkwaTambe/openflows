@@ -6,14 +6,17 @@
 #
 # Usage:
 #   ./scripts/reset-controller-state.sh              # interactive confirmation
-#   ./scripts/reset-controller-state.sh --confirm    # skip confirmation
-#   ./scripts/reset-controller-state.sh --full       # also delete all Coder workspaces
+#   ./scripts/reset-controller-state.sh --confirm   # skip confirmation (default tenant)
+#   ./scripts/reset-controller-state.sh --all        # reset ALL tenants
+#   ./scripts/reset-controller-state.sh --full      # also delete all Coder workspaces
 
 set -e
 
 CONFIRM="${1:-}"
+RESET_TENANT="${OPENFLOWS_TENANT:-default}"
 REDIS_CONTAINER="openflows-redis-1"
 REDIS_URL="${REDIS_URL:-redis://localhost:6379}"
+OPENFLOWS_BIN="${OPENFLOWS_BIN:-./target/release/openflows}"
 
 # Check if Redis container is running
 if ! docker ps | grep -q "$REDIS_CONTAINER"; then
@@ -39,7 +42,7 @@ echo "  • CI readiness state (CI setup tickets will survive)"
 echo "  • GitHub sync metadata (issues, PRs, branches)"
 echo ""
 
-if [ "$CONFIRM" != "--confirm" ] && [ "$CONFIRM" != "--full" ]; then
+if [ "$CONFIRM" != "--confirm" ] && [ "$CONFIRM" != "--all" ] && [ "$CONFIRM" != "--full" ]; then
     read -p "Continue? (y/n) " -n 1 -r
     echo ""
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -48,33 +51,63 @@ if [ "$CONFIRM" != "--confirm" ] && [ "$CONFIRM" != "--full" ]; then
     fi
 fi
 
-echo "Clearing Redis keys..."
+echo "Cleaning Redis state..."
 
-# Delete all ticket-related keys (ticket:*, heartbeat:*)
-redis_cmd EVAL "
-local keys = redis.call('KEYS', 'ticket:*')
-for i, k in ipairs(keys) do redis.call('DEL', k) end
-keys = redis.call('KEYS', 'heartbeat:*')
-for i, k in ipairs(keys) do redis.call('DEL', k) end
-return #keys
-" 0 > /dev/null 2>&1 || true
+# Use openflows binary's tenant clean command if available
+# This intelligently resets stale tickets without losing GitHub sync metadata
+if [ -x "$OPENFLOWS_BIN" ] || command -v "$OPENFLOWS_BIN" &>/dev/null; then
+    if [ "$CONFIRM" == "--all" ]; then
+        # List all tenants and clean each one
+        TENANTS=$("$OPENFLOWS_BIN" tenant list 2>/dev/null | grep "^  -" | sed 's/  - //')
+        for TENANT in $TENANTS; do
+            echo "Cleaning tenant: $TENANT"
+            OPENFLOWS_TENANT="$TENANT" "$OPENFLOWS_BIN" tenant clean "$TENANT" --reset-all 2>/dev/null || true
+        done
+    else
+        # Clean default/selected tenant
+        echo "Cleaning tenant: $RESET_TENANT"
+        OPENFLOWS_TENANT="$RESET_TENANT" "$OPENFLOWS_BIN" tenant clean "$RESET_TENANT" --reset-all 2>&1 || true
+    fi
+else
+    # Fallback to direct Redis cleanup (legacy mode)
+    echo "openflows binary not found, using direct Redis cleanup..."
 
-# Delete worker and PR state
-for key in worker_slots pending_prs open_prs command_gate _no_work_count; do
-    redis_cmd DEL "$key" >/dev/null 2>&1 || true
-done
+    # Delete all ticket-related keys including namespaced keys (ns:*:ticket:*, ns:*:heartbeat:*)
+    # Also reset tickets with stale status (awaiting_human, failed with max attempts) back to Open
+    redis_cmd EVAL "
+    -- Clear un_namespaced keys
+    local keys = redis.call('KEYS', 'ticket:*')
+    for i, k in ipairs(keys) do redis.call('DEL', k) end
+    keys = redis.call('KEYS', 'heartbeat:*')
+    for i, k in ipairs(keys) do redis.call('DEL', k) end
+
+    -- Clear namespaced keys (all tenants)
+    keys = redis.call('KEYS', 'ns:*:ticket:*')
+    for i, k in ipairs(keys) do redis.call('DEL', k) end
+    keys = redis.call('KEYS', 'ns:*:heartbeat:*')
+    for i, k in ipairs(keys) do redis.call('DEL', k) end
+
+    -- Clear namespaced tickets lists prefix
+    return 'done'
+    " 0 > /dev/null 2>&1 || true
+
+    # Delete worker and PR state (both un_namespaced and namespaced)
+    for key in worker_slots pending_prs open_prs command_gate _no_work_count; do
+        redis_cmd DEL "$key" >/dev/null 2>&1 || true
+        redis_cmd EVAL "local keys = redis.call('KEYS', 'ns:*:${key}') for i, k in ipairs(keys) do redis.call('DEL', k) end return 0" 0 >/dev/null 2>&1 || true
+    done
+
+    # Reset un_namespaced tickets list
+    redis_cmd DEL "tickets" >/dev/null 2>&1 || true
+    redis_cmd SET "tickets" "[]" >/dev/null 2>&1 || true
+fi
 
 # Count remaining keys
 REMAINING=$(redis_cmd DBSIZE | grep -oE '[0-9]+' || echo "0")
-echo "Cleared ticket and worker state. $REMAINING key(s) remain (preserved)."
-
-# Keep tickets list for GitHub sync, but wipe its contents
-echo "Resetting tickets list..."
-redis_cmd DEL "tickets" >/dev/null 2>&1 || true
-redis_cmd SET "tickets" "[]" >/dev/null 2>&1 || true
+echo "Cleaned state. $REMAINING key(s) remain (preserved)."
 
 echo ""
-echo "Redis state cleared."
+echo "State cleared."
 echo ""
 
 if [ "$CONFIRM" = "--full" ]; then

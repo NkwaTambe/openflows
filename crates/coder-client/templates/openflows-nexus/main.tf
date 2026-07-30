@@ -71,6 +71,13 @@ data "coder_parameter" "github_pat" {
   type        = "string"
 }
 
+data "coder_parameter" "start_controller" {
+  name        = "start_controller"
+  description  = "Whether to auto-start the OpenFlows controller on workspace startup"
+  default     = "true"
+  type        = "bool"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -127,17 +134,23 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"
     export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
-    # GitHub PAT for issue sync (in production, use Coder external auth instead)
+    # GitHub PAT for issue sync - export as env var so controller picks it up automatically
+    export GITHUB_TOKEN="${data.coder_parameter.github_pat.value}"
     echo "${data.coder_parameter.github_pat.value}" > /tmp/github_token 2>/dev/null || true
 
     cd /home/coder/workspace
-    
-    if command -v openflows >/dev/null 2>&1; then
-      echo "Starting OpenFlows Controller..."
-      nohup openflows run >/tmp/openflows-controller.log 2>&1 &
-      echo "Controller started. Check logs: tail -f /tmp/openflows-controller.log"
+
+    # Only auto-start the controller if explicitly enabled
+    if [ "${data.coder_parameter.start_controller.value}" = "true" ]; then
+      if command -v openflows >/dev/null 2>&1; then
+        echo "Starting OpenFlows Controller..."
+        nohup openflows run >/tmp/openflows-controller.log 2>&1 &
+        echo "Controller started. Check logs: tail -f /tmp/openflows-controller.log"
+      else
+        echo "ERROR: openflows binary not found. Controller not started."
+      fi
     else
-      echo "ERROR: openflows binary not found. Controller not started."
+      echo "Manual mode: controller not auto-started. Run 'openflows run' when ready."
     fi
   EOT
 }

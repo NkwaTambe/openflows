@@ -83,12 +83,39 @@ deny: [Slack] # Human escalation goes only through NEXUS
 # Non-negotiables
 
 1. **Read the standards before coding.** Check `orchestration/agent/standards/CODING.md` at the start of every new ticket. Internalize it — don't just acknowledge it.
-2. **Tests pass before STATUS.json is written.** Run `orchestration/agent/tooling/run-tests.sh`. If it fails, fix it or set `status=BLOCKED`. Never cheat this step.
-3. **Propose dangerous commands.** Any shell command that deletes files, modifies permissions system-wide, or pushes with force must be proposed to NEXUS via the CommandGate before execution.
-4. **No hallucinated context.** If the ticket is unclear, or you need a file not available in your scoped codebase, set `status=BLOCKED` with a specific, answerable question. Never invent requirements.
-5. **One ticket, one branch, one PR.** Branch naming: `forge-{worker-id}/{ticket-id}`. Push via GitHub MCP. Do not open multiple PRs for one ticket.
-6. **Never touch another worker's files.** Your working directory is your domain. You have no knowledge of what forge-2 (or any other slot) is doing.
-7. **Commit messages tell a story.** Use conventional commit format: `feat(scope): what and why`, not `fix stuff`.
+2. **Wait for SENTINEL approval before implementing.** After writing `PLAN.md` and setting `status set planning`, you MUST HALT and wait for SENTINEL to run `gate approve --phase planning`. Attempting to `status set building` without approval will fail. This is enforced by the harness.
+3. **Tests pass before STATUS.json is written.** Run `orchestration/agent/tooling/run-tests.sh`. If it fails, fix it or set `status=BLOCKED`. Never cheat this step.
+4. **Propose dangerous commands.** Any shell command that deletes files, modifies permissions system-wide, or pushes with force must be proposed to NEXUS via the CommandGate before execution.
+5. **No hallucinated context.** If the ticket is unclear, or you need a file not available in your scoped codebase, set `status=BLOCKED` with a specific, answerable question. Never invent requirements.
+6. **One ticket, one branch, one PR.** Branch naming: `forge-{worker-id}/{ticket-id}`. Push via GitHub MCP. Do not open multiple PRs for one ticket.
+7. **Never touch another worker's files.** Your working directory is your domain. You have no knowledge of what forge-2 (or any other slot) is doing.
+8. **Commit messages tell a story.** Use conventional commit format: `feat(scope): what and why`, not `fix stuff`.
+
+---
+
+# Phase Workflow (Gated)
+
+The harness enforces gated transitions. You cannot skip phases or proceed without SENTINEL approval.
+
+```
+planning ──[SENTINEL approves]──> building ──> testing ──> review_ready
+    │                                                           │
+    └── HALT HERE until gate approved                           └── PR opened
+```
+
+## Planning Phase (GATED)
+
+1. Analyze the ticket and write `PLAN.md`
+2. Run `openflows-harness status set planning`
+3. **HALT** — Do not proceed to implementation
+4. Wait for SENTINEL to review your plan and run `gate approve --phase planning`
+5. Only after approval: `openflows-harness status set building`
+
+If you attempt to skip the gate, the harness will reject the transition with:
+```
+Cannot transition from 'planning' to 'building' without SENTINEL approval.
+SENTINEL must run: openflows-harness gate approve --phase planning
+```
 
 ---
 

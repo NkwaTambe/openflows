@@ -18,7 +18,21 @@ if [ -f "${PROJECT_ROOT}/.env" ]; then
     source "${PROJECT_ROOT}/.env"
     set +a
 fi
-OPENFLOWS_BIN="${OPENFLOWS_BIN:-openflows}"
+
+# Track whether the caller explicitly pinned a binary (env var or --bin flag).
+# When explicit, we respect it as-is and never touch it. Otherwise we always
+# rebuild the in-repo release binary from source before every invocation, so
+# the controller can never silently keep running against stale code just
+# because nobody remembered to rebuild after a fix (cargo is incremental —
+# this is a no-op in well under a second when nothing changed).
+if [ -n "${OPENFLOWS_BIN:-}" ]; then
+    OPENFLOWS_BIN_EXPLICIT=1
+else
+    OPENFLOWS_BIN="openflows"
+    OPENFLOWS_BIN_EXPLICIT=0
+fi
+SKIP_BUILD=false
+BUILD_DONE=false
 
 usage() {
     cat <<'USAGE'
@@ -31,7 +45,15 @@ Usage:
   ./scripts/prod.sh doctor                             Health check
 
 Options:
-  --bin PATH    Path to openflows binary (default: openflows or ./target/release/openflows)
+  --bin PATH     Use this exact openflows binary and skip auto-rebuild
+  --skip-build   Skip the automatic `cargo build --release` before running
+                 (uses whatever binary find_binary() resolves to, which may
+                 be stale — only use this if you know what you're doing)
+
+Note: by default, every invocation rebuilds ./target/release/openflows from
+current source first (cargo build is incremental, so this is fast when
+nothing changed). This guarantees the controller never silently runs on a
+stale binary after a code fix.
 
 Examples:
   # Start controller (always resets state first):
@@ -47,6 +69,53 @@ Examples:
   ./scripts/prod.sh doctor
 
 USAGE
+}
+
+# Ensure the in-repo release binary is built from the CURRENT source tree.
+# `cargo build` is incremental, so when nothing changed this completes almost
+# instantly — but when the source HAS changed (e.g. a bugfix was just applied),
+# this guarantees prod.sh never silently runs stale, previously-built code.
+# This is what closes the gap that let a fixed bug keep reproducing because an
+# old ./target/release/openflows binary was reused across sessions.
+ensure_fresh_binary() {
+    if [ "$BUILD_DONE" = "true" ]; then
+        return
+    fi
+    echo "  → Ensuring openflows binary is built from current source..."
+    if ! (cd "$PROJECT_ROOT" && cargo build --release -p openflows) ; then
+        echo "❌ Failed to build openflows from source" >&2
+        exit 1
+    fi
+    BUILD_DONE=true
+}
+
+# Warn (and optionally stop) any other running controller processes that may
+# be bound to a now-stale binary from a previous session. Running two
+# controllers against the same Redis/Coder backend causes duplicate ticket
+# assignment races, and a leftover process from before a rebuild will keep
+# exhibiting bugs that were already fixed in the freshly built binary.
+check_stale_processes() {
+    local mypid=$$
+    local stale_pids
+    stale_pids=$(pgrep -f "openflows run" 2>/dev/null | grep -v "^${mypid}\$" || true)
+    if [ -n "$stale_pids" ]; then
+        echo ""
+        echo "⚠  Found other running 'openflows run' process(es): $stale_pids"
+        echo "   These may be running stale, previously-built code. Stop them before"
+        echo "   continuing so the fresh binary from this run is the only one active:"
+        echo "     kill $stale_pids"
+        echo ""
+        echo -n "Stop them now? [y/N] "
+        read -r stop_response
+        if [[ "$stop_response" =~ ^[Yy]$ ]]; then
+            # shellcheck disable=SC2086
+            kill $stale_pids 2>/dev/null || echo "   (some processes could not be stopped — you may need to stop them manually)"
+            sleep 1
+        else
+            echo "   Continuing anyway — you may see stale behavior from the other process(es)."
+        fi
+        echo ""
+    fi
 }
 
 # Find openflows binary
@@ -65,6 +134,16 @@ find_binary() {
 run_openflows() {
     local cmd="$1"
     shift
+
+    if [ "$OPENFLOWS_BIN_EXPLICIT" = "1" ]; then
+        echo "  → Using explicitly pinned binary: $OPENFLOWS_BIN (skipping auto-rebuild)"
+    elif [ "$SKIP_BUILD" = "true" ]; then
+        echo "  → Skipping auto-rebuild (--skip-build)"
+    else
+        ensure_fresh_binary
+        OPENFLOWS_BIN="${PROJECT_ROOT}/target/release/openflows"
+    fi
+
     local bin
     bin=$(find_binary)
     if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$bin" ]; then
@@ -85,7 +164,12 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --bin)
             OPENFLOWS_BIN="$2"
+            OPENFLOWS_BIN_EXPLICIT=1
             shift 2
+            ;;
+        --skip-build)
+            SKIP_BUILD=true
+            shift
             ;;
         --help|-h)
             usage
@@ -116,6 +200,17 @@ case "$CMD" in
         echo "  OpenFlows: Starting Controller"
         echo "═══════════════════════════════════════"
         echo ""
+        echo "Step 0: Ensuring binary is up to date with source..."
+        if [ "$OPENFLOWS_BIN_EXPLICIT" = "1" ]; then
+            echo "  → Using explicitly pinned binary: $OPENFLOWS_BIN (skipping auto-rebuild)"
+        elif [ "$SKIP_BUILD" = "true" ]; then
+            echo "  → Skipping auto-rebuild (--skip-build)"
+        else
+            ensure_fresh_binary
+            OPENFLOWS_BIN="${PROJECT_ROOT}/target/release/openflows"
+            export OPENFLOWS_BIN
+        fi
+        echo ""
         echo "Step 1: Resetting Redis state (clean slate)..."
         if [ -f "${SCRIPT_DIR}/reset-controller-state.sh" ]; then
             "${SCRIPT_DIR}/reset-controller-state.sh" --confirm
@@ -123,7 +218,31 @@ case "$CMD" in
             echo "⚠ reset-controller-state.sh not found, skipping..."
         fi
         echo ""
-        echo "Step 2: Starting OpenFlows controller..."
+        echo "Step 2: Confirming controller start..."
+        echo ""
+        if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+            echo "Open issues in ${GITHUB_REPOSITORY}:"
+            ISSUE_COUNT=$(curl -s "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+                -H "Authorization: token ${GITHUB_PERSONAL_ACCESS_TOKEN:-}" \
+                -H "Accept: application/vnd.github.v3+json" | jq 'length' 2>/dev/null || echo "0")
+            echo "  • $ISSUE_COUNT open issues will be synced as tickets"
+            echo "  • Each ticket will provision a forge workspace agent when started"
+            echo ""
+        fi
+        echo "This will start the OpenFlows controller which will:"
+        echo "  • Sync open GitHub issues as tickets"
+        echo "  • Assign tickets to available forge workers"
+        echo "  • Provision workspace agents to work on tickets"
+        echo ""
+        echo -n "Start the controller? [y/N] "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        echo ""
+        check_stale_processes
+        echo "Step 3: Starting OpenFlows controller..."
         echo ""
         run_openflows run "$@"
         ;;
@@ -132,6 +251,15 @@ case "$CMD" in
         echo "═══════════════════════════════════════"
         echo "  OpenFlows Bootstrap"
         echo "═══════════════════════════════════════"
+        echo ""
+        echo "Step 1: Syncing dev binary..."
+        if [ -f "${SCRIPT_DIR}/dev-sync.sh" ]; then
+            "${SCRIPT_DIR}/dev-sync.sh"
+        else
+            echo "⚠ dev-sync.sh not found, skipping..."
+        fi
+        echo ""
+        echo "Step 2: Running Coder bootstrap..."
         echo ""
         echo "This will:"
         echo "  ✓ Create admin user in Coder"

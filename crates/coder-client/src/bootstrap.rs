@@ -279,6 +279,7 @@ impl CoderBootstrapper {
             // the workspace containers cannot reach "localhost" — they need the Docker service name.
             let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
 
+            let github_pat = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap_or_default();
             match client
                 .create_workspace(&CreateWorkspaceRequest {
                     template_name: "openflows-nexus".to_string(),
@@ -291,6 +292,9 @@ impl CoderBootstrapper {
                         "tenant": tenant,
                         "github_repository": repository,
                         "registry_json": registry_json,
+                        "github_pat": github_pat,
+                        "start_controller": false, // Bootstrap only sets up the workspace
+                                                 // Controller is started via 'openflows run'
                     }),
                 })
                 .await
@@ -545,6 +549,7 @@ impl CoderBootstrapper {
                         "tenant": tenant_name,
                         "github_repository": github_repo,
                         "github_pat": github_pat,
+                        "start_controller": false,
                     }),
                 },
             )

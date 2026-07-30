@@ -47,6 +47,21 @@ Binds a GitHub repo to the controller. **You must add at least one tenant before
 
 ## Development Helpers
 
+### `dev-sync.sh` — Build and Mount Dev Binary
+
+Builds the OpenFlows controller and makes it available to Coder workspaces:
+
+```bash
+./scripts/dev-sync.sh
+```
+
+This:
+1. Builds the `openflows` release binary (if not already built)
+2. Copies it to `.dev-binaries/` for Docker mounting
+3. Hot-deploys into any running Coder workspace (optional)
+
+**Note:** `./scripts/prod.sh bootstrap` runs this automatically. Use manually if you rebuild the binary and want to hot-deploy into a running workspace.
+
 ### `reset-controller-state.sh` — Clean Redis
 
 Reset Redis to a clean state:
@@ -92,7 +107,8 @@ Controller starts inside workspace
 
 | Command | Description |
 |---------|-------------|
-| `./scripts/prod.sh bootstrap` | One-time: Setup Coder + templates |
+| `./scripts/dev-sync.sh` | Build and mount dev binary to Coder |
+| `./scripts/prod.sh bootstrap` | One-time: Setup Coder + templates (includes dev-sync) |
 | `./scripts/prod.sh tenant owner/repo --name team` | Add tenant (required before run) |
 | `./scripts/prod.sh run` | Clean slate + start controller |
 | `./scripts/prod.sh doctor` | Health check |

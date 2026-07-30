@@ -111,6 +111,7 @@ pub const ACTION_CI_FIX_NEEDED: &str = "ci_fix_needed";
 pub const ACTION_DOCS_COMPLETE: &str = "docs_complete";
 pub const ACTION_DOCS_PENDING: &str = "docs_pending";
 pub const ACTION_AWAITING_HUMAN: &str = "awaiting_human";
+pub const ACTION_PLANNING_GATE: &str = "planning_gate";
 
 // ── Ticket-scoped SharedStore key prefixes (Phase 5) ────────────────────
 

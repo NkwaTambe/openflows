@@ -25,6 +25,7 @@ agent-sentinel  = { path = "../crates/agent-sentinel" }
 agent-lore      = { path = "../crates/agent-lore" }
 provisioner    = { path = "../crates/provisioner" }
 coder-client    = { path = "../crates/coder-client" }
+openflows-harness = { path = "../crates/openflows-harness" }
 clap            = { version = "4", features = ["derive"] }
 
   anyhow      = { workspace = true }

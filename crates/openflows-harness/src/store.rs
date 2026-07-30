@@ -14,6 +14,28 @@ use tracing::{debug, info};
 /// Valid phases for the `status set` command.
 const VALID_PHASES: &[&str] = &["planning", "building", "testing", "review_ready", "blocked"];
 
+/// Phases that require SENTINEL approval before transitioning FROM them.
+/// FORGE cannot move past these phases until SENTINEL writes a gate approval.
+const GATED_PHASES: &[&str] = &["planning"];
+
+/// Phases a brand-new ticket (no recorded status yet) may enter directly.
+/// FORGE must first sit in `planning` and earn a SENTINEL gate approval before
+/// it is allowed into any downstream phase; `blocked` is permitted as a failure
+/// escape hatch so a freshly-provisioned workspace can report an immediate
+/// blocker without first pretending to plan. Anything else is rejected to
+/// prevent FORGE from short-circuiting straight to `building`/`testing`/
+/// `review_ready` and bypassing the planning-gate review entirely.
+const ENTRY_PHASES: &[&str] = &["planning", "blocked"];
+
+/// Gate approval payload written by SENTINEL to allow FORGE to proceed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateApproval {
+    pub phase: String,
+    pub approved_by: String,
+    pub ts: u64,
+    pub notes: Option<String>,
+}
+
 /// Valid verdicts for the `review submit` command.
 const VALID_VERDICTS: &[&str] = &["approve", "reject"];
 
@@ -63,6 +85,49 @@ pub struct HarnessStore {
     tenant: String,
 }
 
+/// Authorize an approver role for a gated phase transition. Only SENTINEL may
+/// approve a gate; FORGE/other roles must be rejected so an agent cannot approve
+/// its own plan and sidestep the mandatory review checkpoint. Comparison is
+/// case-insensitive because the worker CLI derives the role from
+/// `OPENFLOWS_ROLE` and operators may spell the role with varying case.
+pub fn authorize_gate_approver(role: &str) -> Result<()> {
+    if !role.eq_ignore_ascii_case("sentinel") {
+        bail!(
+            "Gate approval rejected: approver role '{}' is not SENTINEL. \
+             Only SENTINEL may approve a gated phase transition; FORGE/other \
+             roles are not authorized to approve their own plan.",
+            role
+        );
+    }
+    Ok(())
+}
+
+/// True iff `phase` may be set as a ticket's FIRST recorded status (i.e. the
+/// ticket has no prior status in Redis). FORGE must enter through `planning`
+/// (or `blocked`, the failure escape hatch) so a fresh ticket cannot jump
+/// straight to `building`/`testing`/`review_ready` and thereby skip the
+/// SENTINEL-reviewed planning gate.
+pub fn is_allowed_first_phase(phase: &str) -> bool {
+    ENTRY_PHASES.contains(&phase)
+}
+
+/// If transitioning `current_phase -> target` requires crossing a SENTINEL
+/// gate, return the gated phase being LEFT (the phase whose gate approval
+/// must be consulted and consumed); otherwise return `None`.
+///
+/// A gate is crossed when the current phase is itself gated (e.g. `planning`)
+/// and the target differs from it. Transitions among downstream phases (e.g.
+/// `building -> testing`) do not require a fresh approval, and returning TO
+/// a gated phase (`building -> planning`) is free — the next outbound
+/// transition will be gated, which is where the approval is enforced.
+pub fn gate_source_for_transition(current_phase: &str, target: &str) -> Option<&'static str> {
+    if GATED_PHASES.contains(&current_phase) && current_phase != target {
+        GATED_PHASES.iter().find(|&&p| p == current_phase).copied()
+    } else {
+        None
+    }
+}
+
 impl HarnessStore {
     pub async fn new(redis_url: &str, tenant: &str) -> Result<Self> {
         let config = Config::from_url(redis_url)?;
@@ -104,6 +169,13 @@ impl HarnessStore {
     }
 
     /// Set the current phase for this ticket.
+    ///
+    /// Enforces gated phase transitions: FORGE cannot move past `planning`
+    /// until SENTINEL approves via `gate approve`, and the approval is
+    /// consumed on the outbound transition so a later return to `planning`
+    /// (e.g. for a revised plan) requires a fresh SENTINEL review. A brand-new
+    /// ticket with no prior status must enter via `planning` (or `blocked`),
+    /// so it cannot short-circuit straight to `building` and skip the gate.
     pub async fn status_set(&self, ticket: &str, role: &str, phase: &str) -> Result<()> {
         if !VALID_PHASES.contains(&phase) {
             bail!(
@@ -112,7 +184,78 @@ impl HarnessStore {
                 VALID_PHASES.join(", ")
             );
         }
-        let key = self.key(&full_ticket_key_flat(ticket, "status"));
+
+        // Read current phase (if any) and enforce gating.
+        let status_key = self.key(&full_ticket_key_flat(ticket, "status"));
+        let current_status: Option<String> = self
+            .client
+            .get(&status_key)
+            .await
+            .context("Redis GET failed")?;
+
+        let current_phase: Option<String> = current_status
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(String::from));
+
+        // Fresh ticket (no recorded status): must enter through the planning
+        // gate. FORGE cannot bypass the SENTINEL-reviewed plan by writing
+        // `building`/`testing`/`review_ready` as its first status.
+        if current_phase.is_none() && !is_allowed_first_phase(phase) {
+            bail!(
+                "Cannot set first status to '{}' for ticket {}. FORGE must enter through \
+                 'planning' and obtain SENTINEL gate approval before any downstream phase. \
+                 (Set status to 'planning', or 'blocked' to report an immediate blocker.)",
+                phase,
+                ticket
+            );
+        }
+
+        // For transitions that leave a gated phase, require a SENTINEL approval
+        // and consume it atomically so the approval is single-use per planning
+        // cycle even under concurrent transitions.
+        if let Some(source_phase) = current_phase
+            .as_deref()
+            .and_then(|cur| gate_source_for_transition(cur, phase))
+        {
+            let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, source_phase));
+
+            // Atomically GET-and-DELETE the approval in a single Redis
+            // command. Using separate GET then DEL would let two concurrent
+            // `status set building` calls both observe the approval before
+            // either delete lands, so a single SENTINEL approval would
+            // authorize multiple transitions. GETDEL returns the value it
+            // removed (None if the key was already gone), and the key is gone
+            // by the time the command returns — the loser of the race gets
+            // None and is rejected below. We must propagate the error (no
+            // longer ignore a failed DEL): if the consume silently failed the
+            // approval would survive and the single-use guarantee would be
+            // voided.
+            let consumed_approval: Option<String> = self
+                .client
+                .getdel(&gate_key)
+                .await
+                .context("Redis GETDEL failed while consuming gate approval")?;
+
+            if consumed_approval.is_none() {
+                bail!(
+                    "Cannot transition from '{}' to '{}' without SENTINEL approval.\n\
+                     SENTINEL must run: openflows-harness gate approve --phase {}\n\
+                     This ensures your plan is reviewed before implementation begins.",
+                    source_phase,
+                    phase,
+                    source_phase
+                );
+            }
+
+            info!(
+                ticket,
+                from = source_phase,
+                to = phase,
+                "Gate approval verified and consumed (GETDEL), allowing transition"
+            );
+        }
+
         let val = serde_json::json!({
             "phase": phase,
             "role": role,
@@ -120,10 +263,116 @@ impl HarnessStore {
         });
         let _: Result<(), _> = self
             .client
-            .set::<(), _, _>(&key, val.to_string(), None, None, false)
+            .set::<(), _, _>(&status_key, val.to_string(), None, None, false)
             .await;
-        println!("Wrote: {}", key);
-        info!(key = %key, phase, "status set");
+        println!("Wrote: {}", status_key);
+        info!(key = %status_key, phase, "status set");
+        Ok(())
+    }
+
+    /// Approve a gated phase transition (SENTINEL only).
+    ///
+    /// This allows FORGE to proceed past a gated phase (e.g., `planning` → `building`).
+    ///
+    /// Only the SENTINEL role may approve a gate. FORGE cannot approve its own
+    /// plan — if it could, the mandatory review checkpoint would be bypassable by
+    /// the very agent it is meant to supervise. The worker CLI (`openflows-harness
+    /// gate approve`) derives `role` from `OPENFLOWS_ROLE`, so only a SENTINEL
+    /// workspace can satisfy this; the admin `openflows gate approve` CLI passes
+    /// `--approver` (defaulting to SENTINEL). Any other role is rejected.
+    pub async fn gate_approve(
+        &self,
+        ticket: &str,
+        role: &str,
+        phase: &str,
+        notes: Option<&str>,
+    ) -> Result<()> {
+        authorize_gate_approver(role)?;
+        if !GATED_PHASES.contains(&phase) {
+            bail!(
+                "Phase '{}' is not a gated phase. Gated phases: {}",
+                phase,
+                GATED_PHASES.join(", ")
+            );
+        }
+
+        // Verify current phase matches
+        let status_key = self.key(&full_ticket_key_flat(ticket, "status"));
+        let current_status: Option<String> = self
+            .client
+            .get(&status_key)
+            .await
+            .context("Redis GET failed")?;
+
+        if let Some(ref status_json) = current_status {
+            if let Ok(status) = serde_json::from_str::<serde_json::Value>(status_json) {
+                if let Some(current_phase) = status.get("phase").and_then(|p| p.as_str()) {
+                    if current_phase != phase {
+                        bail!(
+                            "Cannot approve '{}' gate — current phase is '{}'. \
+                             FORGE must be in the '{}' phase to receive approval.",
+                            phase,
+                            current_phase,
+                            phase
+                        );
+                    }
+                }
+            }
+        } else {
+            bail!(
+                "No status found for ticket {}. FORGE must set status to '{}' first.",
+                ticket,
+                phase
+            );
+        }
+
+        let approval = GateApproval {
+            phase: phase.to_string(),
+            approved_by: role.to_string(),
+            ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            notes: notes.map(|s| s.to_string()),
+        };
+
+        let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, phase));
+        let json = serde_json::to_string(&approval)?;
+        let _: Result<(), _> = self
+            .client
+            .set::<(), _, _>(&gate_key, json, None, None, false)
+            .await;
+
+        println!("Gate approved: {} phase '{}' by {}", ticket, phase, role);
+        info!(key = %gate_key, phase, role, "gate approved");
+        Ok(())
+    }
+
+    /// Check if a gated phase has been approved.
+    pub async fn gate_status(&self, ticket: &str, phase: &str) -> Result<()> {
+        let gate_key = self.key(&format!("ticket:{}:gate:{}", ticket, phase));
+        let approval: Option<String> = self
+            .client
+            .get(&gate_key)
+            .await
+            .context("Redis GET failed")?;
+
+        match approval {
+            Some(json) => {
+                let approval: GateApproval =
+                    serde_json::from_str(&json).context("Failed to parse gate approval")?;
+                println!(
+                    "✓ Gate '{}' approved by {} at {}",
+                    approval.phase, approval.approved_by, approval.ts
+                );
+                if let Some(notes) = approval.notes {
+                    println!("  Notes: {}", notes);
+                }
+            }
+            None => {
+                println!("✗ Gate '{}' not yet approved", phase);
+            }
+        }
         Ok(())
     }
 
@@ -327,5 +576,67 @@ mod tests {
             full_ticket_key(ticket, "dispatch", "forge")
         );
         assert_eq!(key, "ns:acme:ticket:T-42:dispatch:forge");
+    }
+
+    #[test]
+    fn test_gate_approver_accepts_sentinel_case_insensitive() {
+        assert!(authorize_gate_approver("sentinel").is_ok());
+        assert!(authorize_gate_approver("SENTINEL").is_ok());
+        assert!(authorize_gate_approver("Sentinel").is_ok());
+    }
+
+    #[test]
+    fn test_gate_approver_rejects_forge_and_others() {
+        // FORGE must never approve its own plan — the review checkpoint exists
+        // to supervise it. Vessel/Lore/empty/unknown roles are also rejected.
+        assert!(authorize_gate_approver("forge").is_err());
+        assert!(authorize_gate_approver("vessel").is_err());
+        assert!(authorize_gate_approver("lore").is_err());
+        assert!(authorize_gate_approver("").is_err());
+        assert!(authorize_gate_approver("admin").is_err());
+    }
+
+    #[test]
+    fn test_first_status_must_enter_via_planning_or_blocked() {
+        // A brand-new ticket must enter through the planning gate (or report
+        // an immediate blocker via `blocked`). It cannot short-circuit
+        // straight to building/testing/review_ready and skip the SENTINEL plan
+        // review.
+        assert!(is_allowed_first_phase("planning"));
+        assert!(is_allowed_first_phase("blocked"));
+        assert!(!is_allowed_first_phase("building"));
+        assert!(!is_allowed_first_phase("testing"));
+        assert!(!is_allowed_first_phase("review_ready"));
+    }
+
+    #[test]
+    fn test_gate_source_only_for_leaving_planning() {
+        // Leaving planning -> any other phase requires (and consumes) an
+        // approval sourced from the planning gate.
+        assert_eq!(
+            gate_source_for_transition("planning", "building"),
+            Some("planning")
+        );
+        assert_eq!(
+            gate_source_for_transition("planning", "testing"),
+            Some("planning")
+        );
+        assert_eq!(
+            gate_source_for_transition("planning", "review_ready"),
+            Some("planning")
+        );
+
+        // Staying in planning is a no-op, not a gated transition.
+        assert_eq!(gate_source_for_transition("planning", "planning"), None);
+
+        // Transitions among downstream phases do not require re-approval.
+        assert_eq!(gate_source_for_transition("building", "testing"), None);
+        assert_eq!(gate_source_for_transition("testing", "review_ready"), None);
+
+        // Returning TO planning is free; the next outbound transition is
+        // gated, and because the previous approval was consumed on the way
+        // out, the revised plan forces a fresh SENTINEL approval.
+        assert_eq!(gate_source_for_transition("building", "planning"), None);
+        assert_eq!(gate_source_for_transition("blocked", "planning"), None);
     }
 }

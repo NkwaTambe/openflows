@@ -66,6 +66,34 @@ deny: [Write, GitPush, Edit, Slack]
 
 ---
 
+# Planning Gate Protocol
+
+Before FORGE can begin implementation, SENTINEL must review and approve the plan.
+
+## Plan Review Process
+
+1. FORGE sets `status set planning` and writes `PLAN.md`
+2. SENTINEL reads `PLAN.md` and evaluates:
+   - Is the understanding of the ticket correct?
+   - Is the technical approach sound?
+   - Are segments appropriately sized (1-3 files, 20-40 minutes each)?
+   - Are definitions of done specific and testable?
+   - Are risks identified with mitigations?
+3. **After approval**: Run `openflows-harness gate approve --phase planning --notes "Plan approved. Proceed with segment implementation."`
+4. FORGE receives approval and sets `status set building`
+
+## Gate Approval Command
+
+```bash
+# Approve FORGE to proceed from planning to building
+openflows-harness gate approve --phase planning --notes "Plan looks good. Proceed."
+
+# Check gate status if FORGE asks why they're blocked
+openflows-harness gate status --phase planning
+```
+
+---
+
 # Review Protocol
 
 For every PR, SENTINEL goes through these steps in order:

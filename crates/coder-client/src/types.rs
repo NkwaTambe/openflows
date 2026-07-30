@@ -122,14 +122,16 @@ impl CoderWorkspace {
             .unwrap_or_else(|| AgentStatus::Unknown("no_agent".to_string()))
     }
 
-    /// Returns true when the workspace build is "running" **and** the agent
-    /// is either connected or has lifecycle state "ready". This is more lenient
-    /// than checking both conditions strictly, accounting for timing variations
-    /// between agent status and lifecycle state.
+    /// Returns true when the agent is ready to receive work.
+    ///
+    /// An agent that is explicitly `Connected` with a `Ready` lifecycle is
+    /// considered ready regardless of the workspace's top-level build status
+    /// string. Coder's build `status` field can lag or report a transient
+    /// non-"running" value (e.g. during build transitions) while the agent is
+    /// already fully operational; the agent's own connection/lifecycle state
+    /// is the authoritative signal. For `Timeout`/`Unknown` agent statuses we
+    /// additionally require the build to report running before trusting readiness.
     pub fn is_agent_ready(&self) -> bool {
-        if !self.is_running() {
-            return false;
-        }
         let agent = self
             .latest_build
             .as_ref()
@@ -140,9 +142,19 @@ impl CoderWorkspace {
                     a.status,
                     AgentStatus::Connected | AgentStatus::Timeout | AgentStatus::Unknown(_)
                 );
-                let lifecycle_ok = a.lifecycle_state.is_ready()
-                    || matches!(a.lifecycle_state, AgentLifecycleState::Starting);
-                status_ok && lifecycle_ok
+                // Only accept "Ready" lifecycle state - not "Starting" or others
+                let lifecycle_ok = a.lifecycle_state.is_ready();
+                if !status_ok || !lifecycle_ok {
+                    return false;
+                }
+                // An explicitly Connected agent with a Ready lifecycle is ready
+                // to receive work regardless of transient build-status transitions.
+                if a.status == AgentStatus::Connected {
+                    return true;
+                }
+                // For Timeout/Unknown agent statuses, additionally require the
+                // build to report running before trusting readiness.
+                self.is_running()
             }
             None => false,
         }

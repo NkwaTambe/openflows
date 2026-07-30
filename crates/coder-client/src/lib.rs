@@ -725,9 +725,9 @@ impl CoderClient {
             "rich_parameter_values": rich_parameter_values,
         });
 
-        info!(
-            "Creating workspace with payload: {}",
-            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        debug!(
+            workspace_name = %req.name,
+            "Creating workspace with payload"
         );
 
         let resp = self
@@ -1181,6 +1181,14 @@ impl CoderClient {
 
     /// Get a Chat by ID.
     /// GET /api/experimental/chats/{chat}
+    ///
+    /// Returns `Err` for transient failures (timeouts, rate limits, 5xx,
+    /// network errors). Callers that need to distinguish "the chat no longer
+    /// exists" from "the API is temporarily unavailable" should use
+    /// [`get_chat_opt`], which maps a 404 to `Ok(None)` so a deleted chat can
+    /// be safely rotated without dropping an active chat on a transient blip.
+    ///
+    /// [`get_chat_opt`]: CoderClient::get_chat_opt
     pub async fn get_chat(&self, chat_id: &str) -> Result<crate::types::Chat> {
         let resp = self
             .authenticated_request(
@@ -1195,6 +1203,35 @@ impl CoderClient {
             Ok(resp.json().await?)
         } else {
             let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get chat ({}): {}", status, body)
+        }
+    }
+
+    /// Like [`get_chat`], but a 404 ("chat not found") is returned as
+    /// `Ok(None)` instead of `Err`. A 404 means the chat resource has been
+    /// deleted and the stored ID is permanently stale — callers should rotate
+    /// it. Any other non-success status (timeout/rate-limit/5xx) is returned
+    /// as `Err` so callers can leave the existing chat ID in place and retry
+    /// on the next poll, rather than creating a duplicate chat.
+    ///
+    /// [`get_chat`]: CoderClient::get_chat
+    pub async fn get_chat_opt(&self, chat_id: &str) -> Result<Option<crate::types::Chat>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/experimental/chats/{}", chat_id),
+            )
+            .send()
+            .await
+            .context("Failed to get chat")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(Some(resp.json().await?))
+        } else if status.as_u16() == reqwest::StatusCode::NOT_FOUND.as_u16() {
+            Ok(None)
+        } else {
             let body = resp.text().await.unwrap_or_default();
             bail!("Failed to get chat ({}): {}", status, body)
         }
@@ -1255,6 +1292,44 @@ impl CoderClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             bail!("Failed to send chat message ({}): {}", status, body)
+        }
+    }
+
+    /// Get recent messages from a Chat.
+    /// GET /api/experimental/chats/{chat_id}/messages?after_id={id}&limit={n}
+    pub async fn get_chat_messages(
+        &self,
+        chat_id: &str,
+        limit: u64,
+    ) -> Result<Vec<crate::types::ChatMessage>> {
+        let resp = self
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!(
+                    "/api/experimental/chats/{}/messages?limit={}",
+                    chat_id, limit
+                ),
+            )
+            .send()
+            .await
+            .context("Failed to get chat messages")?;
+
+        if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            let messages = body
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(messages)
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to get chat messages ({}): {}", status, body)
         }
     }
 

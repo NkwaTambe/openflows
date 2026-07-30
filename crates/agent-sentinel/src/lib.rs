@@ -11,8 +11,8 @@ use config::state::{
     full_ticket_key, full_ticket_key_flat, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION,
     KEY_TICKET_STATUS, KEY_WORKER_SLOTS,
 };
-use config::{Ticket, TicketStatus, WorkerSlot};
-use pocketflow_core::{Action, Node, SharedStore};
+use config::{Ticket, TicketStatus, WorkerSlot, WorkerStatus};
+use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -91,6 +91,7 @@ impl Node for SentinelNode {
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
 
         let mut reviewable = Vec::new();
+        let mut planning_gate_pending = Vec::new();
 
         for ticket in &tickets {
             let worker_id = match &ticket.status {
@@ -99,6 +100,7 @@ impl Node for SentinelNode {
                 _ => continue,
             };
 
+            // ── Check for PR review verdicts ──
             let review_key = full_ticket_key(&ticket.id, "review", "sentinel");
             let review_json: Option<String> = store.get_typed(&review_key).await;
             let has_review = review_json.is_some();
@@ -122,7 +124,50 @@ impl Node for SentinelNode {
                     "verdict": review.verdict,
                     "report": review.report,
                     "pr_number": review.pr_number,
+                    "review_type": "pr_review",
                 }));
+            }
+
+            // ── Check for planning gate review status ──
+            // If SENTINEL has a chat for this ticket in planning phase, check if
+            // the gate has been approved. If NOT yet approved, mark it as
+            // pending planning review so post() can handle it.
+            let status_key = full_ticket_key_flat(&ticket.id, KEY_TICKET_STATUS);
+            let status_json: Option<serde_json::Value> = store.get_typed(&status_key).await;
+            let phase = status_json
+                .as_ref()
+                .and_then(|v| v.get("phase"))
+                .and_then(|v| v.as_str());
+
+            if phase == Some("planning") {
+                // Check if gate already approved
+                let tenant =
+                    std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+                let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket.id);
+                let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
+
+                if gate_approval.is_none() {
+                    // Gate not yet approved — SENTINEL is reviewing or needs to review
+                    let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
+                    let chat_id: Option<String> = store.get_typed(&chat_key).await;
+
+                    // Only add to planning_gate_pending if SENTINEL has been spawned
+                    // (chat exists). If no chat yet, NEXUS still needs to spawn it.
+                    if chat_id.is_some() {
+                        planning_gate_pending.push(json!({
+                            "ticket_id": ticket.id,
+                            "worker_id": worker_id,
+                            "review_type": "planning_gate",
+                        }));
+                    }
+                } else {
+                    // Gate is approved — this is handled by ForgePairNode detecting
+                    // the phase transition from planning → building
+                    debug!(
+                        ticket_id = %ticket.id,
+                        "Planning gate already approved — SENTINEL review complete"
+                    );
+                }
             }
 
             let chat_key = full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
@@ -174,6 +219,7 @@ impl Node for SentinelNode {
 
         Ok(json!({
             "reviewable": reviewable,
+            "planning_gate_pending": planning_gate_pending,
         }))
     }
 
@@ -183,26 +229,54 @@ impl Node for SentinelNode {
             .cloned()
             .unwrap_or_default();
 
-        if reviewable.is_empty() {
-            return Ok(json!({ "verdicts": [], "has_reviews": false }));
+        let planning_gate_pending = prep_result["planning_gate_pending"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        if reviewable.is_empty() && planning_gate_pending.is_empty() {
+            return Ok(
+                json!({ "verdicts": [], "has_reviews": false, "has_planning_gates": false }),
+            );
         }
 
         info!(
-            count = reviewable.len(),
-            "Sentinel: processing review verdicts"
+            review_count = reviewable.len(),
+            planning_gate_count = planning_gate_pending.len(),
+            "Sentinel: processing reviews and planning gates"
         );
 
         let mut verdicts = Vec::new();
         for review in &reviewable {
             let ticket_id = review["ticket_id"].as_str().unwrap_or("");
             let verdict = review["verdict"].as_str().unwrap_or("");
+            let review_type = review["review_type"].as_str().unwrap_or("pr_review");
             verdicts.push(json!({
                 "ticket_id": ticket_id,
                 "verdict": verdict,
+                "review_type": review_type,
             }));
         }
 
-        Ok(json!({ "verdicts": verdicts, "has_reviews": !verdicts.is_empty() }))
+        // Planning gate tickets are pending review by SENTINEL (chat is active).
+        // The actual review (approve/reject) happens inside the chat — the
+        // controller just needs to route these tickets correctly.
+        // If a planning gate has been approved by the chat, it will be
+        // detected in post() via the gate key in SharedStore.
+        for gate in &planning_gate_pending {
+            let ticket_id = gate["ticket_id"].as_str().unwrap_or("");
+            verdicts.push(json!({
+                "ticket_id": ticket_id,
+                "verdict": "planning_gate_pending",
+                "review_type": "planning_gate",
+            }));
+        }
+
+        Ok(json!({
+            "verdicts": verdicts,
+            "has_reviews": !reviewable.is_empty(),
+            "has_planning_gates": !planning_gate_pending.is_empty(),
+        }))
     }
 
     async fn post(&self, store: &SharedStore, exec_result: Value) -> Result<Action> {
@@ -211,19 +285,22 @@ impl Node for SentinelNode {
             .cloned()
             .unwrap_or_default();
         let has_reviews = exec_result["has_reviews"].as_bool().unwrap_or(false);
+        let has_planning_gates = exec_result["has_planning_gates"].as_bool().unwrap_or(false);
 
-        if !has_reviews {
-            debug!("Sentinel: no reviews to process");
+        if !has_reviews && !has_planning_gates {
+            debug!("Sentinel: no reviews or planning gates to process");
             return Ok(Action::new("no_work"));
         }
 
         let mut any_approved = false;
         let mut any_rejected = false;
+        let mut any_planning_approved = false;
         let client = Self::coder_client_from_store(store).await;
 
         for verdict in &verdicts {
             let ticket_id = verdict["ticket_id"].as_str().unwrap_or("");
             let verdict_str = verdict["verdict"].as_str().unwrap_or("");
+            let _review_type = verdict["review_type"].as_str().unwrap_or("pr_review");
 
             match verdict_str {
                 "approve" => {
@@ -286,6 +363,61 @@ impl Node for SentinelNode {
 
                     any_rejected = true;
                 }
+                "planning_gate_pending" => {
+                    // SENTINEL chat is actively reviewing the plan.
+                    // Check if the planning gate has been approved since prep() ran.
+                    // The SENTINEL chat runs `openflows-harness gate approve --phase planning`
+                    // inside the workspace, which writes to SharedStore.
+                    let tenant =
+                        std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+                    let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket_id);
+                    let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
+
+                    if gate_approval.is_some() {
+                        info!(
+                            ticket_id,
+                            "Sentinel: planning gate APPROVED — FORGE can proceed to building"
+                        );
+
+                        // Archive the sentinel chat since gate review is complete
+                        let sentinel_chat_key =
+                            full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                        if let Some(ref client) = &client {
+                            if let Some(sentinel_chat_id) =
+                                store.get_typed::<String>(&sentinel_chat_key).await
+                            {
+                                if let Err(e) = client.archive_chat(&sentinel_chat_id).await {
+                                    warn!(
+                                        ticket_id,
+                                        error = %e,
+                                        "Failed to archive sentinel chat after planning gate approval"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Release the sentinel slot so it's available for future reviews
+                        let worker_id = verdict["worker_id"].as_str().unwrap_or("");
+                        if !worker_id.is_empty() {
+                            let mut slots: HashMap<String, WorkerSlot> =
+                                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                            if let Some(slot) = slots.get_mut(worker_id) {
+                                slot.status = WorkerStatus::Idle;
+                            }
+                            store
+                                .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+                                .await;
+                        }
+
+                        any_planning_approved = true;
+                    } else {
+                        info!(
+                            ticket_id,
+                            "Sentinel: planning gate review in progress — waiting for chat to complete"
+                        );
+                        // Gate not yet approved — pause and check again on next poll
+                    }
+                }
                 _ => {
                     warn!(
                         ticket_id,
@@ -296,12 +428,21 @@ impl Node for SentinelNode {
             }
         }
 
+        // Priority: PR approved > planning gate approved > PR rejected > no work
         if any_approved {
             Ok(Action::new(ACTION_REVIEW_APPROVE))
+        } else if any_planning_approved {
+            // Planning gate approved — FORGE can now proceed to building.
+            // Route back to nexus so it can detect the gate approval and
+            // allow FORGE's workflow to continue.
+            info!("Sentinel: planning gate approved — routing back to nexus for FORGE to resume");
+            Ok(Action::new("no_work"))
         } else if any_rejected {
             Ok(Action::new(ACTION_REVIEW_REJECT))
         } else {
-            Ok(Action::new("no_work"))
+            // Planning gate reviews are in progress but not yet complete.
+            // Pause and let the next poll check again.
+            Ok(Action::new(PAUSE_SIGNAL))
         }
     }
 }

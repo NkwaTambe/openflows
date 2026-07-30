@@ -15,10 +15,37 @@ use config::{
     Ticket, TicketStatus, WorkerSlot, ACTION_FAILED, ACTION_PR_OPENED,
 };
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, BatchNode, SharedStore};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
+
+/// PR info written by the harness when forge opens a PR.
+/// Matches the schema in openflows-harness/src/store.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessPrInfo {
+    pub pr_number: u64,
+    pub branch: String,
+    pub title: String,
+}
+
+/// Status payload written by the harness.
+/// Matches the schema in openflows-harness/src/store.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessStatus {
+    pub phase: String,
+    pub role: String,
+    pub ts: u64,
+}
+
+/// Action to signal that work is ready for review (Sentinel should be spawned)
+pub const ACTION_REVIEW_READY: &str = "review_ready";
+
+/// Action to signal that FORGE is in the planning phase and waiting for
+/// SENTINEL gate approval. NEXUS picks this up and spawns a SENTINEL chat
+/// to review the plan and run `openflows-harness gate approve --phase planning`.
+pub const ACTION_PLANNING_GATE: &str = "planning_gate";
 
 pub struct ForgePairNode {
     #[allow(dead_code)]
@@ -126,6 +153,86 @@ impl ForgePairNode {
             }
         }
     }
+
+    /// Read the harness-written status for a ticket.
+    /// Returns the phase if set (planning, building, testing, review_ready, blocked).
+    async fn read_harness_status(store: &SharedStore, ticket_id: &str) -> Option<HarnessStatus> {
+        let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
+        let status_json: Option<String> = store.get_typed(&status_key).await;
+
+        if let Some(json_str) = status_json {
+            // Try parsing as HarnessStatus struct first
+            if let Ok(status) = serde_json::from_str::<HarnessStatus>(&json_str) {
+                return Some(status);
+            }
+            // Fallback: maybe it's just a plain JSON object
+            if let Ok(obj) = serde_json::from_str::<Value>(&json_str) {
+                if let Some(phase) = obj.get("phase").and_then(|v| v.as_str()) {
+                    return Some(HarnessStatus {
+                        phase: phase.to_string(),
+                        role: obj
+                            .get("role")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("forge")
+                            .to_string(),
+                        ts: obj.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Read the harness-written PR info for a ticket.
+    /// This is written when the agent calls `openflows-harness pr opened`.
+    async fn read_harness_pr_info(store: &SharedStore, ticket_id: &str) -> Option<HarnessPrInfo> {
+        let pr_key = full_ticket_key_flat(ticket_id, "pr");
+        let pr_json: Option<String> = store.get_typed(&pr_key).await;
+
+        if let Some(json_str) = pr_json {
+            if let Ok(pr_info) = serde_json::from_str::<HarnessPrInfo>(&json_str) {
+                return Some(pr_info);
+            }
+        }
+        None
+    }
+
+    /// Sync harness-written PR info to the global pending_prs list.
+    /// This ensures that PRs recorded by the harness are picked up by VESSEL.
+    async fn sync_harness_pr_to_pending(
+        store: &SharedStore,
+        ticket_id: &str,
+        worker_id: &str,
+        pr_info: &HarnessPrInfo,
+    ) {
+        let mut pending_prs: Vec<Value> =
+            store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
+
+        // Check if this PR is already in pending_prs
+        let already_tracked = pending_prs
+            .iter()
+            .any(|p| p["number"].as_u64() == Some(pr_info.pr_number));
+
+        if !already_tracked {
+            info!(
+                ticket_id,
+                pr_number = pr_info.pr_number,
+                branch = %pr_info.branch,
+                "Syncing harness PR info to pending_prs"
+            );
+
+            pending_prs.push(json!({
+                "number": pr_info.pr_number,
+                "ticket_id": ticket_id,
+                "head_branch": pr_info.branch,
+                "title": pr_info.title,
+                "worker_id": worker_id,
+                "source": "harness",
+            }));
+
+            store.set(KEY_PENDING_PRS, json!(pending_prs)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -170,7 +277,7 @@ impl BatchNode for ForgePairNode {
     async fn exec_one(&self, item: Value) -> Result<Value> {
         let ticket_id = item["ticket_id"].as_str().unwrap_or("");
         let worker_id = item["worker_id"].as_str().unwrap_or("");
-        info!(
+        debug!(
             ticket_id,
             worker_id, "ForgePairNode monitoring forge worker"
         );
@@ -184,6 +291,8 @@ impl BatchNode for ForgePairNode {
 
         let client = Self::coder_client_from_store(store).await;
         let mut has_pr_opened = false;
+        let mut has_review_ready = false;
+        let mut has_planning_gate = false;
         let mut has_failed = false;
         let mut has_in_progress = false;
 
@@ -198,29 +307,151 @@ impl BatchNode for ForgePairNode {
             };
 
             let ticket_id = item["ticket_id"].as_str().unwrap_or("");
-            let _worker_id = item["worker_id"].as_str().unwrap_or("");
+            let worker_id = item["worker_id"].as_str().unwrap_or("");
             let role = "forge";
 
+            // === NEW: Read harness-written status ===
+            // NOTE: Only log at info level for significant state transitions.
+            // Normal in-progress phases (planning/building/testing) are debug-only
+            // to avoid filling logs with per-poll routine output.
+            if let Some(harness_status) = Self::read_harness_status(store, ticket_id).await {
+                debug!(
+                    ticket_id,
+                    worker_id,
+                    phase = %harness_status.phase,
+                    "Read harness status"
+                );
+
+                match harness_status.phase.as_str() {
+                    "review_ready" => {
+                        info!(
+                            ticket_id,
+                            worker_id, "Harness reports review_ready — checking for PR info"
+                        );
+
+                        // Check if harness wrote PR info
+                        if let Some(pr_info) = Self::read_harness_pr_info(store, ticket_id).await {
+                            info!(
+                                ticket_id,
+                                pr_number = pr_info.pr_number,
+                                "Found harness PR info — syncing to pending_prs"
+                            );
+                            Self::sync_harness_pr_to_pending(store, ticket_id, worker_id, &pr_info)
+                                .await;
+                            has_pr_opened = true;
+                        } else {
+                            // No PR info but review_ready — signal for Sentinel spawn
+                            has_review_ready = true;
+                        }
+                    }
+                    "blocked" => {
+                        warn!(ticket_id, worker_id, "Harness reports blocked status");
+                        has_failed = true;
+                    }
+                    "planning" => {
+                        // FORGE is in the planning gate — waiting for SENTINEL to
+                        // review the plan and approve the gate. Route to NEXUS so
+                        // it can spawn a SENTINEL chat for plan review.
+                        info!(
+                            ticket_id,
+                            worker_id,
+                            "Harness reports planning phase — SENTINEL review needed for gate approval"
+                        );
+                        has_planning_gate = true;
+                    }
+                    "building" | "testing" => {
+                        debug!(
+                            ticket_id,
+                            worker_id,
+                            phase = %harness_status.phase,
+                            "Harness reports work in progress"
+                        );
+                        has_in_progress = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            // === Also check Coder chat status (existing logic) ===
             let chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, role);
             let chat_id: Option<String> = store.get_typed(&chat_key).await;
 
             if let (Some(ref client), Some(chat_id)) = (&client, chat_id) {
                 match client.get_chat(&chat_id).await {
                     Ok(chat) => {
-                        Self::sync_chat_status_to_store(store, ticket_id, role, chat.status())
-                            .await;
+                        let status = chat.status();
+
+                        // Only emit a full diagnostic warn when this is the first time we
+                        // are seeing this chat in error state. Once chat_action is already
+                        // set to "interrupted", we have already processed it and every
+                        // subsequent poll would re-log the same stale data — degrade to
+                        // debug to keep logs actionable.
+                        if matches!(status, ChatStatus::Error) {
+                            let action_key =
+                                full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+                            let last_action: Option<String> = store.get_typed(&action_key).await;
+                            let first_sighting = last_action
+                                .as_deref()
+                                .map(|a| !matches!(a, "interrupted" | "first_error_logged"))
+                                .unwrap_or(true);
+
+                            if first_sighting {
+                                // Log enough context to identify and debug the dead chat, but
+                                // NOT the message body itself. Coder chat messages can carry
+                                // private ticket data, source code, tool output, or credentials;
+                                // emitting `content_raw` verbatim would leak all of that into the
+                                // controller log surface and any downstream log retention system.
+                                // Operators who need the full message can fetch it from the Coder
+                                // API via the message id reported here.
+                                let last_msg = client
+                                    .get_chat_messages(&chat_id, 1)
+                                    .await
+                                    .ok()
+                                    .and_then(|m| m.first().cloned());
+                                store.set(&action_key, json!("first_error_logged")).await;
+                                let last_message_id =
+                                    last_msg.as_ref().map(|m| m.id.as_str()).unwrap_or("");
+                                let last_message_role =
+                                    last_msg.as_ref().map(|m| m.role.as_str()).unwrap_or("");
+                                let last_message_bytes = last_msg
+                                    .as_ref()
+                                    .map(|m| m.content_raw.to_string().len())
+                                    .unwrap_or(0);
+                                warn!(
+                                    chat_id = %chat_id,
+                                    ticket_id,
+                                    workspace_id = %chat.workspace_id,
+                                    status = ?status,
+                                    owner_id = %chat.owner_id,
+                                    last_message_id = last_message_id,
+                                    last_message_role = last_message_role,
+                                    last_message_bytes = last_message_bytes,
+                                    "Forge chat entered error state — will be re-provisioned automatically"
+                                );
+                            } else {
+                                debug!(
+                                    chat_id = %chat_id,
+                                    ticket_id,
+                                    status = ?status,
+                                    "Forge chat still in error; already reported"
+                                );
+                            }
+                        }
+
+                        Self::sync_chat_status_to_store(store, ticket_id, role, status).await;
                     }
                     Err(e) => {
-                        warn!(
+                        debug!(
                             chat_id = %chat_id,
                             ticket_id,
                             error = %e,
-                            "Failed to get forge chat status"
+                            "Failed to get forge chat status (will skip sync for this poll)"
                         );
                     }
                 }
             }
 
+            // === Check pending_prs (existing logic) ===
             let pending_prs: Vec<Value> =
                 store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
             let ticket_has_pr = pending_prs
@@ -258,7 +489,11 @@ impl BatchNode for ForgePairNode {
                         has_failed = true;
                     }
                     _ => {
-                        has_in_progress = true;
+                        // Only mark as in_progress if we haven't already found a more specific state
+                        if !has_pr_opened && !has_review_ready && !has_planning_gate && !has_failed
+                        {
+                            has_in_progress = true;
+                        }
                     }
                 }
             }
@@ -266,12 +501,24 @@ impl BatchNode for ForgePairNode {
 
         info!(
             monitored = results.len(),
-            has_pr_opened, has_failed, has_in_progress, "ForgePairNode post_batch summary"
+            has_pr_opened,
+            has_review_ready,
+            has_planning_gate,
+            has_failed,
+            has_in_progress,
+            "ForgePairNode post_batch summary"
         );
 
+        // Priority: PR opened > planning gate > review ready > failed > in progress
         if has_pr_opened {
-            info!("Forge: PR(s) opened — routing to vessel");
+            info!("Forge: PR(s) opened — routing to sentinel for review");
             Ok(Action::new(ACTION_PR_OPENED))
+        } else if has_planning_gate {
+            info!("Forge: planning gate — routing to nexus for SENTINEL plan review");
+            Ok(Action::new(ACTION_PLANNING_GATE))
+        } else if has_review_ready {
+            info!("Forge: review_ready without PR — routing to trigger Sentinel spawn");
+            Ok(Action::new(ACTION_REVIEW_READY))
         } else if has_failed {
             info!("Forge: failure detected — routing back to nexus");
             Ok(Action::new(ACTION_FAILED))
