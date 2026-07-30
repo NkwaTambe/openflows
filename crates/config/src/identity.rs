@@ -233,11 +233,18 @@ impl IdentityManager {
                 anyhow::anyhow!("Base agent 'forge' not found in registry or inactive")
             })?;
 
-            if instance_num > entry.instances {
+            // Use effective_instances() so v2 registries that declare only
+            // `max_instances` (and omit the deprecated v1 `instances`, which
+            // defaults to 0) are honored here. Without this, forge-1 would always
+            // fail validation against instances==0 ("exceeds configured instances (0)")
+            // even when max_instances is 2, blocking all forge token resolution
+            // and therefore all forge work assignment.
+            let effective = entry.effective_instances();
+            if instance_num > effective {
                 return Err(anyhow::anyhow!(
                     "Forge instance {} exceeds configured instances ({})",
                     instance_num,
-                    entry.instances
+                    effective
                 ));
             }
 
@@ -262,6 +269,19 @@ impl IdentityManager {
                         role.as_str()
                     )
                 })?;
+
+                // Validate instance number against effective_instances() (honors
+                // max_instances for v2 registries whose deprecated `instances`
+                // field is absent/0). Mirrors the forge branch.
+                let effective = entry.effective_instances();
+                if instance_num > effective {
+                    return Err(anyhow::anyhow!(
+                        "{} instance {} exceeds configured instances ({})",
+                        role.as_str(),
+                        instance_num,
+                        effective
+                    ));
+                }
 
                 return Ok((entry, *role, Some(instance_num)));
             }
