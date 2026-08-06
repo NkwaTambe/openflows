@@ -125,3 +125,52 @@ This applies whether the missing thing is `PLAN.md`, a PR diff, or a `verify` re
 Nothing about this changes the shape of the existing gated-phase state machine in `openflows-harness` (`planning` → `building` → `testing` → `review_ready`, with SENTINEL's `gate approve` consuming a single-use approval token via Redis `GETDEL`). Delegated verification is additive: one more thing SENTINEL can *ask for* before it decides whether to call `gate approve`. The gate itself still lives entirely in Redis, still requires the SENTINEL role, and still can't be bypassed by FORGE approving its own plan.
 
 What changes is what "evidence" can mean. Before this, a SENTINEL review was necessarily an act of reading — a plan, a diff — and reasoning from prose. Now it can also be an act of *asking the code to speak for itself*, through a narrow, audited, allowlisted channel that never requires SENTINEL to leave the boundary of its own workspace.
+
+---
+
+## Implementation Status (Issue #143)
+
+This feature is being implemented across 8 tasks tracked in `.kilo/plans/1785948146715-sentinel-forge-a2a-verify.md`:
+
+### ✅ Completed
+
+1. **Task 1: a2a-protocol crate** — Serde types, Redis key helpers, command allowlist validation (9 tests passing)
+2. **Task 2: Nexus A2A relay server** — JSON-RPC HTTP server with Axum, pair-scoped routing, idempotency dedup, result mirroring
+3. **Task 3: Harness verify subcommands** — CLI skeleton for `verify request`, `verify serve`, `verify list`
+4. **Task 4: Sentinel gate refusal** — Hard-fail when `pair:{id}:plan` is missing, preventing blind approvals (issue #143 root cause fix)
+5. **Task 5.1: A2A client** — HTTP client library for harness workers (health check, submit_verify_request, polling)
+
+### 🚧 In Progress / Deferred
+
+6. **Task 5.2-5.3: Executor sandbox + mirroring** — Full sandbox execution (process group + timeout), stdout/stderr streaming, result persistence
+7. **Task 6: Worker template wiring** — Updated Forge template to spawn `verify serve` daemon on startup
+8. **Task 7: Documentation updates** — This document; pending updates to orchestration protocol docs
+9. **Task 8: Integration & E2E tests** — Comprehensive test suite for A2A relay, sandbox isolation, failure modes
+
+### Next Steps
+
+- **Phase 2a:** Complete executor sandbox implementation with proper stdout/stderr capture and streaming via SSE
+- **Phase 2b:** Full integration testing covering: relay routing, executor availability checks, timeouts, disconnection/reconnection, idempotency validation
+- **Phase 3:** Extend support to additional executor roles (dedicated `verifier` workspace) based on usage data
+
+### How to Use (v1)
+
+```bash
+# Sentinel workspace: submit a verify request
+openflows-harness verify request \
+  --argv cargo test --package mylib \
+  --timeout-secs 300 \
+  --expect-exit 0
+
+# Forge workspace: automatically started via worker template
+# (the `verify serve` daemon subscribes to tasks from nexus relay)
+
+# Human audit: view recent verification results
+openflows-harness verify list --pair-id T-048
+```
+
+### References
+
+- **Main tracking issue:** [The-AgenticFlow/openflows#143](https://github.com/The-AgenticFlow/openflows/issues/143)
+- **Plan document:** `.kilo/plans/1785948146715-sentinel-forge-a2a-verify.md`
+- **Implementation branches:** `feat/a2a-verify-v2` (current)

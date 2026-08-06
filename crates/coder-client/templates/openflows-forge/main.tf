@@ -216,6 +216,13 @@ resource "coder_agent" "main" {
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
+
+    # Start verify executor daemon (task 5 of issue #143: A2A delegated verification)
+    # Subscribes to verify tasks from nexus relay, executes them in sandbox, returns results.
+    # Uses the same environment as heartbeat (REDIS_URL, OPENFLOWS_TENANT, OPENFLOWS_TICKET, OPENFLOWS_ROLE).
+    # This is a long-running process that polls for task assignments via SSE.
+    nohup openflows-harness verify serve >/dev/null 2>&1 &
+    log "Verify executor started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET) — issue #143 task 5"
   EOT
 }
 
