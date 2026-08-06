@@ -531,6 +531,65 @@ impl HarnessStore {
         info!(key = %key, "heartbeat stopped");
         Ok(())
     }
+
+    /// Submit a verify request (SENTINEL-side, task 3 of issue #143).
+    /// Sends A2A request to nexus relay, streams progress, writes final result to stdout as JSON.
+    pub async fn verify_request(
+        &self,
+        ticket: &str,
+        argv: Vec<String>,
+        timeout_secs: u64,
+        expect_exit: Option<i32>,
+        artifacts: Option<&str>,
+    ) -> Result<()> {
+        // TODO (task 3): 
+        // 1. Create A2A client (reuse workspace token from store)
+        // 2. Build VerifyRequest from args
+        // 3. Connect to nexus A2A relay (A2A_RELAY_ADDR env var)
+        // 4. Stream message/send request
+        // 5. Subscribe to task events (SSE)
+        // 6. Stream progress to stderr
+        // 7. On completion, write VerifyResult to stdout as JSON
+        // 8. Exit non-zero if result doesn't satisfy expect clause
+
+        println!("verify request: not yet implemented (task 3 of issue #143)");
+        eprintln!("TODO: Send A2A verify request to nexus relay for ticket {}", ticket);
+        Ok(())
+    }
+
+    /// Long-running executor (FORGE-side, task 3 of issue #143).
+    /// Subscribes to verify tasks from nexus relay, executes them, returns results.
+    pub async fn verify_serve(&self, ticket: &str, role: &str) -> Result<()> {
+        // TODO (task 3):
+        // 1. Create A2A client
+        // 2. Register as executor (Forge role) for this pair_id
+        // 3. Subscribe to task assignments via message/stream (SSE)
+        // 4. On task arrival: execute command in sandbox (process group, timeout)
+        // 5. Stream stdout/stderr chunks as VerifyProgressEvent
+        // 6. On completion: return VerifyResult artifact
+        // 7. Mirror result to Redis (pair:{id}:verification, audit:a2a:{task_id}:*)
+        // 8. Loop forever until canceled
+
+        println!("verify serve: not yet implemented (task 3 of issue #143)");
+        eprintln!("TODO: Start verify executor for {} ({})", ticket, role);
+        Ok(())
+    }
+
+    /// List recent verification results (humans/audit, task 3 of issue #143).
+    pub async fn verify_list(&self, pair_id: Option<&str>) -> Result<()> {
+        // TODO (task 3):
+        // 1. If pair_id given, read pair:{id}:verification from Redis
+        // 2. Otherwise, enumerate all pair:*:verification keys
+        // 3. Pretty-print VerifyResult artifacts
+
+        println!("verify list: not yet implemented (task 3 of issue #143)");
+        if let Some(id) = pair_id {
+            eprintln!("TODO: List verification results for {}", id);
+        } else {
+            eprintln!("TODO: List all verification results");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
