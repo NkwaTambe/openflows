@@ -133,15 +133,13 @@ jobs:
         if: matrix.use_zigbuild
         run: pip3 install cargo-zigbuild ziglang
 
-      - name: Build binaries
-        run: >
-          ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release
-          --target ${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}
-          --bin openflows
-          --bin openflows-setup
-          --bin openflows-dashboard
-          --bin openflows-doctor
-          --bin anthropic-proxy
+       - name: Build binaries
+         run: >
+           ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release
+           --target ${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}
+           --bin openflows
+           --bin openflows-doctor
+           --bin openflows-harness
 
       - name: Create tarball
         run: |
@@ -150,7 +148,7 @@ jobs:
           ARCHIVE="openflows-${VERSION}-${PLATFORM}"
           mkdir -p "dist/${ARCHIVE}"
 
-          for bin in openflows openflows-setup openflows-dashboard openflows-doctor anthropic-proxy; do
+          for bin in openflows openflows-doctor openflows-harness; do
             cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
           done
 
