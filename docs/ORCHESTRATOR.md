@@ -83,6 +83,59 @@ When Nexus assigns a ticket to a worker, it:
 
 The persona is loaded from `orchestration/agent/agents/{role}.agent.md` and embedded in the chat message, giving the agent complete context about their role and system expectations.
 
+## A2A Relay (Agent-to-Agent Communication)
+
+The A2A relay enables Sentinel to request code execution in Forge's workspace without direct workspace access. This is required for acceptance criteria that need to execute commands (tests, builds, linters).
+
+### Architecture
+
+```
+Sentinel Workspace                 Nexus                   Forge Workspace
+    │                              │                           │
+    │ verify request               │                           │
+    ├─ command: cargo test         │                           │
+    ├─ timeout: 300s               │                           │
+    └─ expect: exit_code=0         │                           │
+         │                         │                           │
+         └────────────────────────▶│ A2A Relay                │
+                                   │ (HTTP:3000)             │
+                                   │ - Route by pair_id      │
+                                   │ - Validate allowlist    │
+                                   │ - Dedup (pair, hash)    │
+                                   │ - Mirror result to Redis│
+                                   │                         │
+                                   └────────────────────────▶│ verify serve
+                                                              │ - Spawn process
+                                                              │ - Enforce timeout
+                                                              │ - Capture output
+                                                              │ - Persist result
+                                                              │
+                                                    Result ◀─┘
+                                                       │
+    Poll result ◀────────────────────────────────────┘
+```
+
+### Features
+
+- **Pair-Scoped Routing**: Each (pair_id, role) pair has its own session
+- **Command Allowlist**: Only safe commands allowed (cargo test, npm test, make test, bun test)
+- **Timeout Enforcement**: `tokio::time::timeout` per task (default 600s, configurable)
+- **Output Bounding**: Stdout/stderr truncated to 10KB tail to prevent memory explosion
+- **Idempotency**: Requests deduplicated by (pair_id, sha256(body))
+- **Result Durability**: All results mirrored to Redis before ACK
+- **Error Handling**: Comprehensive failure modes (timeout, executor offline, command rejected)
+
+### Configuration
+
+- **HTTP Address**: `127.0.0.1:3000` (configurable via `A2A_RELAY_ADDR`)
+- **Max Task Timeout**: 3600s (1 hour)
+- **Output Buffer**: 10KB per stream (configurable)
+- **Idempotency TTL**: 24 hours (in-memory dedup with bounded cache)
+
+### Protocol
+
+See `docs/architecture/a2a-verification.md` for full JSON-RPC and SSE protocol specification.
+
 ## The Agents
 
 ### FORGE (Builder)
@@ -129,12 +182,39 @@ Adversarial reviewer that checks code against CONTRACT.md before merging.
 - `plan_mode: true` → Uses more thinking tokens for thorough review
 - Reviews security, test coverage, adherence to contract
 - Creates blocking comments on PR if issues found
+- **Gate Validation**: Refuses approval if PLAN.md is missing (blocks blind approvals)
+- **A2A Verification**: Can execute acceptance criteria tests via Forge workspace without direct access
 
 **Workflow:**
 1. Receives handoff notification
-2. Reviews diff against CONTRACT.md
-3. Posts review comments to GitHub PR
-4. Labels PR as `needs-revision` or `approved`
+2. Validates PLAN.md exists (hard-fail if missing, emit blocked:missing_artifacts)
+3. Reviews diff against CONTRACT.md
+4. (Optional) Run acceptance tests via A2A relay: `openflows-harness verify request --argv "cargo test --features acceptance"`
+5. Posts review comments to GitHub PR
+6. Labels PR as `needs-revision` or `approved`
+
+**A2A Verification Usage:**
+```bash
+# Submit a test task
+openflows-harness verify request \
+  --argv cargo test --package mylib \
+  --timeout-secs 300 \
+  --expect-exit 0
+
+# Poll result
+openflows-harness verify list --pair-id T-048
+
+# Output:
+# {
+#   "task_id": "550e8400-e29b-41d4-a716-446655440000",
+#   "exit_code": 0,
+#   "timed_out": false,
+#   "duration_ms": 12843,
+#   "stdout_ref": "audit:a2a:550e8400:stdout",
+#   "stderr_ref": "audit:a2a:550e8400:stderr",
+#   "executor": {"role": "forge", "workspace": "forge-T-048"}
+# }
+```
 
 ### VESSEL (DevOps)
 

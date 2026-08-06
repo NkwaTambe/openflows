@@ -274,6 +274,70 @@ coder ssh <workspace> -- openflows-harness dispatch read
 # (Claude Code connects → SessionStart fires → hook context injected)
 ```
 
+## A2A Executor Bootstrap (Forge Verification Executor)
+
+In addition to the agent chat session, Forge workspaces also spawn a background verification executor via the A2A relay. This enables Sentinel to execute code (tests, builds) in Forge's workspace without direct access.
+
+### Executor Startup (Terraform startup_script)
+
+```bash
+# Main initialization
+/usr/local/bin/openflows-harness
+
+# ... other hooks and setup ...
+
+# Start A2A executor daemon (runs in background, supervised by systemd)
+systemctl start openflows-a2a-executor
+
+# OR for direct startup:
+nohup openflows-harness verify serve \
+  --ticket "${CODER_WORKSPACE_ID}" \
+  --role forge \
+  &>> /var/log/openflows-executor.log &
+```
+
+### Executor Environment
+
+The executor requires:
+
+| Variable | Source | Purpose |
+|----------|--------|---------|
+| `OPENFLOWS_TENANT` | Terraform workspace variables | Namespace for Redis keys |
+| `REDIS_URL` | Terraform secret management | Connection to shared store |
+| `CODER_WORKSPACE_ID` | Coder environment | Workspace identifier for audit trail |
+| `OPENFLOWS_TICKET` | Terraform workspace tag | Pair ID for routing |
+
+### Executor Lifecycle
+
+```
+1. Workspace provisioned with A2A executor binary installed
+2. Startup script spawns: openflows-harness verify serve
+3. Executor connects to Nexus A2A relay (health check)
+4. Logs to stdout: "✓ Forge verify executor ready"
+5. Executor polls A2A relay for task assignments
+6. On task arrival: spawn sandbox process with timeout enforcement
+7. Capture stdout/stderr, enforce command allowlist
+8. Persist result to Redis (pair:{id}:verification)
+9. Loop until SIGTERM
+```
+
+### Health Check
+
+Nexus can verify executor is alive via:
+
+```bash
+curl -s http://127.0.0.1:3000/health | jq .
+# Returns: {"status": "ok", "uptime_ms": 12345, ...}
+```
+
+### Failure Modes Handled
+
+- ✅ Executor crashes → restarted by supervisor (systemd)
+- ✅ Network partition → connection lost, task times out, result persisted
+- ✅ Command timeout → killed after 600s (configurable), marked timed_out=true
+- ✅ Output explosion → truncated to 10KB tail, memory bounded
+- ✅ Disallowed command → rejected before spawn, logged to audit:a2a:rejected
+
 ## Future: Persona-Driven Bootstraps
 
 Once agent personalities/personas are integrated, each role can have custom bootstrap logic:
