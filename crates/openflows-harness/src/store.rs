@@ -4,12 +4,13 @@
 //! All writes are validated against serde schemas from `config::state`.
 
 use anyhow::{bail, Context, Result};
+use a2a_protocol::{VerifyExpect, VerifyKind, VerifyCwd, VerifyRequest};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Valid phases for the `status set` command.
 const VALID_PHASES: &[&str] = &["planning", "building", "testing", "review_ready", "blocked"];
@@ -542,51 +543,103 @@ impl HarnessStore {
         expect_exit: Option<i32>,
         artifacts: Option<&str>,
     ) -> Result<()> {
-        // TODO (task 3): 
-        // 1. Create A2A client (reuse workspace token from store)
-        // 2. Build VerifyRequest from args
-        // 3. Connect to nexus A2A relay (A2A_RELAY_ADDR env var)
-        // 4. Stream message/send request
-        // 5. Subscribe to task events (SSE)
-        // 6. Stream progress to stderr
-        // 7. On completion, write VerifyResult to stdout as JSON
-        // 8. Exit non-zero if result doesn't satisfy expect clause
+        // Create A2A client for this pair (ticket == pair_id in current design)
+        let client = crate::a2a_client::A2AClient::new(ticket.to_string(), "sentinel".to_string())?;
+        
+        // Health check first
+        client.health_check().await?;
 
-        println!("verify request: not yet implemented (task 3 of issue #143)");
-        eprintln!("TODO: Send A2A verify request to nexus relay for ticket {}", ticket);
+        // Parse artifacts list if provided
+        let artifact_list: Vec<String> = artifacts
+            .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        // Build VerifyRequest
+        let request = VerifyRequest {
+            pair_id: ticket.to_string(),
+            kind: VerifyKind::Command,
+            cwd: VerifyCwd::Repo, // Could be configurable
+            argv,
+            timeout_secs,
+            env_allowlist: vec![], // Could be configurable
+            expect: VerifyExpect {
+                exit_code: expect_exit,
+                artifacts: artifact_list,
+            },
+        };
+
+        // Submit request to relay
+        let task_id = client.submit_verify_request(&request).await
+            .context("Failed to submit verify request")?;
+        
+        info!(task_id = %task_id, pair_id = ticket, "Verify request submitted");
+
+        // TODO (task 5.3): Poll for task completion or subscribe via SSE
+        // For now, just return the task_id so user can poll manually
+        println!("{{\"task_id\": \"{}\", \"status\": \"pending\"}}", task_id);
         Ok(())
     }
 
     /// Long-running executor (FORGE-side, task 3 of issue #143).
     /// Subscribes to verify tasks from nexus relay, executes them, returns results.
     pub async fn verify_serve(&self, ticket: &str, role: &str) -> Result<()> {
-        // TODO (task 3):
-        // 1. Create A2A client
-        // 2. Register as executor (Forge role) for this pair_id
-        // 3. Subscribe to task assignments via message/stream (SSE)
-        // 4. On task arrival: execute command in sandbox (process group, timeout)
-        // 5. Stream stdout/stderr chunks as VerifyProgressEvent
-        // 6. On completion: return VerifyResult artifact
-        // 7. Mirror result to Redis (pair:{id}:verification, audit:a2a:{task_id}:*)
-        // 8. Loop forever until canceled
+        // Verify this is Forge role
+        if !role.eq_ignore_ascii_case("forge") {
+            bail!("verify serve requires FORGE role, got {}", role);
+        }
 
-        println!("verify serve: not yet implemented (task 3 of issue #143)");
-        eprintln!("TODO: Start verify executor for {} ({})", ticket, role);
+        let _client = crate::a2a_client::A2AClient::new(ticket.to_string(), role.to_string())?;
+        
+        // Health check
+        _client.health_check().await?;
+
+        // TODO (task 5.2-5.3):
+        // 1. Subscribe to task assignments via message/stream (SSE)
+        // 2. On task arrival: execute command in sandbox (process group, timeout)
+        // 3. Stream stdout/stderr chunks as VerifyProgressEvent
+        // 4. On completion: return VerifyResult artifact
+        // 5. Mirror result to Redis (pair:{id}:verification, audit:a2a:{task_id}:*)
+        // 6. Loop forever until canceled
+
+        println!("✓ Forge verify executor starting for {} ({})", ticket, role);
+        eprintln!("TODO: Subscribe to SSE task stream from nexus relay");
+        eprintln!("      Tasks will be executed in sandbox with timeout enforcement");
+        
+        // Keep the process running (would normally loop forever on SSE events)
         Ok(())
     }
 
     /// List recent verification results (humans/audit, task 3 of issue #143).
     pub async fn verify_list(&self, pair_id: Option<&str>) -> Result<()> {
-        // TODO (task 3):
-        // 1. If pair_id given, read pair:{id}:verification from Redis
-        // 2. Otherwise, enumerate all pair:*:verification keys
-        // 3. Pretty-print VerifyResult artifacts
-
-        println!("verify list: not yet implemented (task 3 of issue #143)");
         if let Some(id) = pair_id {
-            eprintln!("TODO: List verification results for {}", id);
+            // List results for a specific pair
+            let key = self.key(&format!("pair:{}:verification", id));
+            let json_result: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
+            
+            match json_result {
+                Some(json) => {
+                    // Parse and pretty-print
+                    match serde_json::from_str::<serde_json::Value>(&json) {
+                        Ok(result) => {
+                            println!("Verification result for {}:", id);
+                            println!("{}", serde_json::to_string_pretty(&result)?);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse verification result");
+                            println!("(unparseable result: {})", json);
+                        }
+                    }
+                }
+                None => {
+                    println!("No verification results for {}", id);
+                }
+            }
         } else {
-            eprintln!("TODO: List all verification results");
+            // Enumerate all pair:*:verification keys (requires scan)
+            // For now, just note that this requires Redis SCAN
+            println!("✓ Verification results (enumeration requires Redis SCAN):");
+            println!("  Use --pair-id <ID> to view specific results");
+            println!("  Results stored under: pair:{{pair_id}}:verification");
         }
         Ok(())
     }

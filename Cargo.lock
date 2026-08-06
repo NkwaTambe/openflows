@@ -1293,17 +1293,20 @@ dependencies = [
 name = "openflows-harness"
 version = "0.1.0"
 dependencies = [
+ "a2a-protocol",
  "anyhow",
  "chrono",
  "clap",
  "config",
  "fred",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -10,7 +10,7 @@
 //!   OPENFLOWS_TICKET   — Current ticket ID (e.g., "T-42")
 //!   OPENFLOWS_ROLE     — Current role (forge, sentinel, vessel, lore)
 
-mod store;
+use openflows_harness::store;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
