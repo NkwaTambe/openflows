@@ -13,8 +13,8 @@ mod verify;
 
 pub use keys::{audit_rejected_key, audit_task_key, verification_key};
 pub use verify::{
-    ExecutorInfo, VerifyArtifact, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest,
-    VerifyResult,
+    ExecutorInfo, VerifyArtifact, VerifyExpect, VerifyKind, VerifyCwd, VerifyProgressEvent,
+    VerifyRequest, VerifyResult,
 };
 
 /// The only `task_type` value this crate currently defines. Reserved so the

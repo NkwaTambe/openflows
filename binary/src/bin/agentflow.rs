@@ -174,6 +174,21 @@ async fn run_controller() -> Result<()> {
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
 
+    // ── Start A2A relay (issue #143) ────────────────────────────────────
+    // The relay runs as a background HTTP server, handling A2A JSON-RPC
+    // requests from Sentinel/Forge workspaces (verify requests, streaming
+    // progress, result mirroring to Redis).
+    let _a2a_relay = match agent_nexus::a2a::start_a2a_relay(std::sync::Arc::new(store.clone())).await {
+        Ok(relay) => {
+            tracing::info!("A2A relay started successfully");
+            Some(relay)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to start A2A relay; verify requests will not be available");
+            None
+        }
+    };
+
     // ── Resolve orchestration directory ─────────────────────────────────
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;

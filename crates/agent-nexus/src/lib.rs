@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
+pub mod a2a;
+
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
 /// (Inlined from the deleted agent-client crate.)
 #[derive(Debug, Clone)]
