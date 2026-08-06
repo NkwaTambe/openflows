@@ -16,6 +16,9 @@ mod http_server;
 mod routing;
 mod verify_handler;
 
+#[cfg(test)]
+mod tests;
+
 pub use http_server::create_router;
 pub use routing::{A2ARelay, A2ASession, TaskEntry};
 pub use verify_handler::submit_verify_request;
