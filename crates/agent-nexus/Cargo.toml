@@ -11,6 +11,7 @@ github = { path = "../github" }
 coder-client = { path = "../coder-client" }
 openflows-notifier = { package = "notifier", path = "../notifier" }
 a2a-protocol = { path = "../a2a-protocol" }
+provisioner = { path = "../provisioner" }
 
 anyhow = { workspace = true }
 serde = { workspace = true }

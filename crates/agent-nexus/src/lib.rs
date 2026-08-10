@@ -15,6 +15,7 @@ use config::{
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
+use provisioner::{transport::CoderTransport, Provisioner};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -965,6 +966,35 @@ Before significant work, read the relevant skill file to understand the workflow
             workspace_id = %workspace.id,
             "Coder workspace provisioned"
         );
+
+        // ── Provision configuration into the workspace ──────────────────
+        // Copy skills, standards, and persona files via SSH so the agent
+        // has everything it needs when it starts working.
+        if let Ok(orch_dir) = std::env::var("ORCHESTRATOR_DIR") {
+            let orch_path = std::path::PathBuf::from(orch_dir);
+            let transport = CoderTransport::new(client.clone(), &workspace.id);
+            let provisioner = Provisioner::new(&orch_path);
+            let worker_role = Self::worker_role(worker_id);
+            if let Ok(reg) = self.load_registry() {
+                if let Err(e) = provisioner.provision_role(&transport, &worker_role, &reg).await {
+                    warn!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        role = %worker_role,
+                        error = %e,
+                        "Failed to provision workspace configuration — continuing anyway"
+                    );
+                } else {
+                    info!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        role = %worker_role,
+                        "Provisioned workspace configuration (skills, standards, persona)"
+                    );
+                }
+            }
+        }
+
         Ok(Some(workspace.id))
     }
 
@@ -1058,6 +1088,12 @@ Before significant work, read the relevant skill file to understand the workflow
         ticket: &Ticket,
     ) {
         let ticket_id = &ticket.id;
+        debug!(
+            worker_id,
+            ticket_id,
+            "create_chat_for_assignment: starting"
+        );
+
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -1109,6 +1145,12 @@ Before significant work, read the relevant skill file to understand the workflow
         let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
 
         let existing_chat_id: Option<String> = store.get_typed(&chat_key).await;
+        debug!(
+            worker_id,
+            ticket_id,
+            existing = ?existing_chat_id,
+            "Checking for existing chat in Redis"
+        );
         if let Some(existing_chat_id) = existing_chat_id {
             // Distinguish "the chat no longer exists" (404 → None → rotate) from
             // a transient API failure (timeout / rate limit / 5xx → Err → keep
@@ -1136,7 +1178,44 @@ Before significant work, read the relevant skill file to understand the workflow
                 Ok(Some(chat)) => {
                     let status = chat.status();
 
-                    if status == ChatStatus::Waiting {
+                    // The chat must be bound to the workspace currently provisioned
+                    // for this worker. If the stored chat points at a different (old,
+                    // deleted, or re-provisioned) workspace ID, the workspace agent
+                    // it is bound to no longer exists and the chat can never connect —
+                    // it will sit in `waiting`/`error` forever while the real workspace
+                    // runs idle. Treat a workspace mismatch as stale and rotate the
+                    // chat so it is recreated against the current workspace below.
+                    let workspace_mismatch = chat.workspace_id != workspace_id;
+                    if workspace_mismatch {
+                        info!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            stored_workspace_id = %chat.workspace_id,
+                            current_workspace_id = %workspace_id,
+                            "Stored chat bound to a different/stale workspace — rotating chat to bind to the current workspace"
+                        );
+                        // DELETE the keys (not store an empty string — see the 404 branch
+                        // above for why an empty value would loop forever on the next poll).
+                        store.del(&chat_key).await;
+                        store.del(&action_key).await;
+                        // Also clear the chat_id from the dispatch payload so mid-flight
+                        // dispatch retains context but not a dead chat reference.
+                        let dispatch_key = full_ticket_key(ticket_id, KEY_TICKET_DISPATCH, role);
+                        let mut dispatch: serde_json::Value = store
+                            .get_typed(&dispatch_key)
+                            .await
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        if let Some(obj) = dispatch.as_object_mut() {
+                            if obj.remove("chat_id").is_some() {
+                                store
+                                    .set(&dispatch_key, serde_json::Value::Object(obj.clone()))
+                                    .await;
+                            }
+                        }
+                    }
+
+                    if !workspace_mismatch && status == ChatStatus::Waiting {
                         let last_action: Option<String> = store.get_typed(&action_key).await;
                         if matches!(last_action.as_deref(), None | Some("completed")) {
                             // Send a minimal follow-up that leverages harness state
@@ -1175,7 +1254,9 @@ Before significant work, read the relevant skill file to understand the workflow
                     // current workspace. Without this, a dead chat ID can persist in Redis
                     // across workspace re-provisioning and retry cycles, silently starving
                     // the ticket of an active chat while the LLM continues re-polling it.
-                    if status == ChatStatus::Error {
+                    // A workspace mismatch (handled above) also falls through here to
+                    // create a replacement — never keep a chat bound to a dead workspace.
+                    if !workspace_mismatch && status == ChatStatus::Error {
                         debug!(
                             chat_id = %chat.id,
                             worker_id,
@@ -1203,7 +1284,7 @@ Before significant work, read the relevant skill file to understand the workflow
                             }
                         }
                         // Fall through to create a new chat below.
-                    } else {
+                    } else if !workspace_mismatch {
                         debug!(
                             chat_id = %chat.id,
                             worker_id,
@@ -1213,6 +1294,8 @@ Before significant work, read the relevant skill file to understand the workflow
                         );
                         return;
                     }
+                    // When `workspace_mismatch` is true and the chat was not handled as
+                    // error/waiting above, fall through to create a fresh chat below.
                 }
                 Err(e) => {
                     // Transient failure (timeout / rate limit / 5xx). DO NOT clear the
@@ -1321,6 +1404,14 @@ Use `openflows-harness` for all coordination:
         let initial_prompt = format!(
             "{}\n\n**Begin work immediately.** Set `openflows-harness status set planning`, then start analyzing the task.\n",
             base_prompt
+        );
+
+        info!(
+            worker_id,
+            ticket_id,
+            workspace_id = %workspace_id,
+            model_config_id = ?model_config_id,
+            "Creating Coder Chat for ticket assignment"
         );
 
         let chat_req = CreateChatRequest {

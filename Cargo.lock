@@ -57,6 +57,7 @@ dependencies = [
  "github",
  "notifier",
  "pocketflow-core",
+ "provisioner",
  "serde",
  "serde_json",
  "tokio",

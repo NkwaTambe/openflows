@@ -223,6 +223,39 @@ resource "coder_agent" "main" {
     # This is a long-running process that polls for task assignments via SSE.
     nohup openflows-harness verify serve >/dev/null 2>&1 &
     log "Verify executor started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET) — issue #143 task 5"
+
+    # ── Start coding agent ──────────────────────────────────────────────
+    # The agent CLI binary (claude, codex, aider, etc.) may be bind-mounted
+    # from the host at /opt/openflows-dev/. If found, copy it to PATH and
+    # launch it as the work agent. The SessionStart hook fires on launch,
+    # providing the task dispatch, current phase, and workflow instructions.
+    # If no CLI binary is available, the workspace relies on Coder control-
+    # plane agents via the Coder Chat created by the controller.
+    AGENT_CLI=""
+    if [ -f /opt/openflows-dev/claude ]; then
+      AGENT_CLI="claude"
+      sudo cp /opt/openflows-dev/claude /usr/local/bin/claude
+      sudo chmod +x /usr/local/bin/claude
+      log "Mounted Claude Code binary from host — starting agent"
+    elif command -v claude >/dev/null 2>&1; then
+      AGENT_CLI="claude"
+      log "Claude Code found on PATH — starting agent"
+    elif [ -f /opt/openflows-dev/codex ]; then
+      AGENT_CLI="codex"
+      sudo cp /opt/openflows-dev/codex /usr/local/bin/codex
+      sudo chmod +x /usr/local/bin/codex
+      log "Mounted Codex binary from host — starting agent"
+    elif command -v codex >/dev/null 2>&1; then
+      AGENT_CLI="codex"
+      log "Codex found on PATH — starting agent"
+    fi
+
+    if [ -n "$AGENT_CLI" ]; then
+      nohup "$AGENT_CLI" -p "Start working on ticket $OPENFLOWS_TICKET. Read dispatch with 'openflows-harness dispatch read' and follow the workflow. Use 'openflows-harness status set <phase>' to report progress." </dev/null >/tmp/agent.log 2>&1 &
+      log "Agent started (cli=$AGENT_CLI ticket=$OPENFLOWS_TICKET pid=$!)"
+    else
+      log "No agent CLI binary found — workspace will rely on Coder Chat control-plane agent"
+    fi
   EOT
 }
 
