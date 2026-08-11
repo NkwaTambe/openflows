@@ -28,7 +28,7 @@ A linear, end-to-end walkthrough for going from a fresh clone to a running contr
 #### 1. Start Docker infrastructure
 
 ```bash
-docker compose up
+docker compose up -d
 ```
 
 This starts three services (see `docker-compose.yml`):
@@ -120,7 +120,7 @@ This **always** resets Redis to a clean slate, then starts the controller. Creat
 #### 7. Verify it's working
 
 ```bash
-# Watch the controller log
+# Watch the controller log in a separate terminal
 tail -f /tmp/openflows-controller.log
 
 # Health check
