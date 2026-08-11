@@ -15,8 +15,8 @@ use config::{
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
-use provisioner::{transport::CoderTransport, Provisioner};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
+use provisioner::{transport::CoderTransport, Provisioner};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -976,7 +976,10 @@ Before significant work, read the relevant skill file to understand the workflow
             let provisioner = Provisioner::new(&orch_path);
             let worker_role = Self::worker_role(worker_id);
             if let Ok(reg) = self.load_registry() {
-                if let Err(e) = provisioner.provision_role(&transport, &worker_role, &reg).await {
+                if let Err(e) = provisioner
+                    .provision_role(&transport, &worker_role, &reg)
+                    .await
+                {
                     warn!(
                         worker_id,
                         workspace_id = %workspace.id,
@@ -1088,11 +1091,7 @@ Before significant work, read the relevant skill file to understand the workflow
         ticket: &Ticket,
     ) {
         let ticket_id = &ticket.id;
-        debug!(
-            worker_id,
-            ticket_id,
-            "create_chat_for_assignment: starting"
-        );
+        debug!(worker_id, ticket_id, "create_chat_for_assignment: starting");
 
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
@@ -1389,11 +1388,21 @@ Use `openflows-harness` for all coordination:
 5. `blocked` → Stuck? Set status and explain
 "#;
 
-        // Build comprehensive initial prompt with all context
+        // Build comprehensive initial prompt with all context.
+        //
+        // The full persona is provisioned into the workspace as `AGENTS.md`
+        // (see `provisioner::Provisioner::provision_role`), which Coder Agents
+        // reads and injects into the system prompt for every conversation in
+        // that workspace — so we keep the persona out of the first user
+        // message to keep it light and reliable. We still reference the
+        // workspace files explicitly and keep the task/skills/dispatch/coordination
+        // context inline so the orchestrator drives the ticket on message one.
         let base_prompt = match persona {
-            Some(p) => format!(
-                "{}\n\n{}\n\n{}\n\n{}\n\n{}",
-                p, ticket_content, skills_content, dispatch_info, coordination_info
+            Some(_) => format!(
+                "You are the **{}** agent.\n\nYour full persona, skills, and standards are \
+                 provisioned in this workspace as `AGENTS.md` and `{}.agent.md` — read them \
+                 for your identity, capabilities, and protocols.\n\n{}\n\n{}\n\n{}\n\n{}",
+                role, role, ticket_content, skills_content, dispatch_info, coordination_info
             ),
             None => format!(
                 "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized agent.\n\n{}\n\n{}\n\n{}\n\n{}",
@@ -1422,59 +1431,148 @@ Use `openflows-harness` for all coordination:
             labels: Some(labels),
         };
 
-        match client.create_chat(&chat_req).await {
-            Ok(chat) => {
-                // Also check the initial chat status for diagnostics
-                let chat_status = chat.status();
-                let workspace_id_str = &chat.workspace_id;
-                let owner_id = &chat.owner_id;
+        // Create the chat with a bounded retry so a transient failure of the
+        // first request does not silently starve the ticket and force a manual
+        // "continue". The persona is now served server-side via the workspace's
+        // `AGENTS.md` (see Provisioner::provision_role), so the first message is
+        // smaller and materially less likely to trip a failure in the first place.
+        const CREATE_CHAT_MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 1u32;
+        let created = loop {
+            match client.create_chat(&chat_req).await {
+                Ok(chat) => break Some(chat),
+                Err(e) => {
+                    warn!(
+                        worker_id,
+                        ticket_id,
+                        attempt,
+                        max_attempts = CREATE_CHAT_MAX_ATTEMPTS,
+                        error = %e,
+                        "Failed to create Chat for ticket assignment — will retry"
+                    );
+                    if attempt >= CREATE_CHAT_MAX_ATTEMPTS {
+                        debug!(
+                            worker_id,
+                            ticket_id,
+                            "Gave up creating chat this cycle; keys left unset so the next poll recreates it"
+                        );
+                        break None;
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                }
+            }
+        };
 
-                info!(
+        let Some(chat) = created else {
+            return;
+        };
+
+        // Also check the initial chat status for diagnostics.
+        let chat_status = chat.status();
+        let workspace_id_str = &chat.workspace_id;
+        let owner_id = &chat.owner_id;
+
+        info!(
+            chat_id = %chat.id,
+            worker_id,
+            ticket_id,
+            workspace_id = %workspace_id_str,
+            owner_id = %owner_id,
+            initial_status = ?chat_status,
+            "Created Chat for ticket assignment"
+        );
+
+        // If the chat immediately enters error state, try to nudge it back with
+        // the same harness-aware resume prompt used on the `Waiting` path. Only
+        // after exhausting resume attempts do we treat the chat as dead, log the
+        // diagnostic (pointing at Coder Agents config), and leave the keys unset
+        // so the poller rotates to a fresh chat rather than pinning a dead one.
+        if matches!(chat_status, ChatStatus::Error) {
+            const CHAT_RESUME_MAX_ATTEMPTS: u32 = 3;
+            let mut resumed = false;
+            for resume_attempt in 1u32..=CHAT_RESUME_MAX_ATTEMPTS {
+                match self.resume_chat(&client, &chat, ticket_id).await {
+                    Ok(_) => {
+                        info!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            resume_attempt,
+                            "Recovered chat from initial error state"
+                        );
+                        resumed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            resume_attempt,
+                            max_attempts = CHAT_RESUME_MAX_ATTEMPTS,
+                            error = %e,
+                            "Chat in error state — resume attempt failed"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            2 * resume_attempt as u64,
+                        ))
+                        .await;
+                    }
+                }
+            }
+            if !resumed {
+                warn!(
                     chat_id = %chat.id,
-                    worker_id,
                     ticket_id,
                     workspace_id = %workspace_id_str,
                     owner_id = %owner_id,
-                    initial_status = ?chat_status,
-                    "Created Chat for ticket assignment"
+                    status_raw = %chat.status_raw,
+                    "Chat immediately entered error status and did not recover - check Coder Agents configuration. \
+                     Leaving keys unset so the next poll creates a replacement chat."
                 );
-
-                // If chat immediately enters error state, log additional diagnostic info
-                if matches!(chat_status, ChatStatus::Error) {
-                    warn!(
-                        chat_id = %chat.id,
-                        ticket_id,
-                        workspace_id = %workspace_id_str,
-                        owner_id = %owner_id,
-                        status_raw = %chat.status_raw,
-                        "Chat immediately entered error status - check Coder Agents configuration"
-                    );
-                }
-
-                // Store chat ID in SharedStore
-                store.set(&chat_key, json!(chat.id)).await;
-
-                // Store chat_action as "started" for tracking
-                store.set(&action_key, json!("started")).await;
-
-                // Update dispatch payload with actual chat ID
-                let mut updated_dispatch = dispatch_payload.clone();
-                updated_dispatch["chat_id"] = json!(chat.id);
-                store.set(&dispatch_key, updated_dispatch).await;
-
-                // Store workspace_id mapping
-                let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
-                store.set(&ws_key, json!(workspace_id)).await;
-            }
-            Err(e) => {
-                warn!(
-                    worker_id,
-                    ticket_id,
-                    error = %e,
-                    "Failed to create Chat for ticket assignment"
-                );
+                return;
             }
         }
+
+        // Store chat ID in SharedStore
+        store.set(&chat_key, json!(chat.id)).await;
+
+        // Store chat_action as "started" for tracking
+        store.set(&action_key, json!("started")).await;
+
+        // Update dispatch payload with actual chat ID
+        let mut updated_dispatch = dispatch_payload.clone();
+        updated_dispatch["chat_id"] = json!(chat.id);
+        store.set(&dispatch_key, updated_dispatch).await;
+
+        // Store workspace_id mapping
+        let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
+        store.set(&ws_key, json!(workspace_id)).await;
+    }
+
+    /// Send a harness-aware resume prompt to a chat that is stuck.
+    ///
+    /// Reuses the harness-state-driven follow-up so the agent resumes from where
+    /// it left off instead of receiving a generic "continue".
+    async fn resume_chat(
+        &self,
+        client: &CoderClient,
+        chat: &coder_client::types::Chat,
+        ticket_id: &str,
+    ) -> anyhow::Result<coder_client::types::ChatMessage> {
+        let follow_up_prompt = format!(
+            "Resume work on ticket {}. Check your phase with \
+             `openflows-harness status get` and dispatch with \
+             `openflows-harness dispatch read`. Continue from there.",
+            ticket_id
+        );
+        client
+            .send_chat_message(
+                &chat.id,
+                vec![coder_client::types::ChatInputPart::text(follow_up_prompt)],
+            )
+            .await
     }
 
     async fn create_chat_for_ticket_id(

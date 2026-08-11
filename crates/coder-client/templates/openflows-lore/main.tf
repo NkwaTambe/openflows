@@ -55,26 +55,26 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $$*" >&2; }
+    log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
 
     # Setup git credentials: get token from workspace owner via Coder API
     # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
     CODER_URL="${var.coder_url}"
     OWNER_ID="${data.coder_workspace_owner.me.id}"
     
-    if [ -n "$$CODER_URL" ] && [ -n "$$CODER_AGENT_TOKEN" ] && [ -n "$$OWNER_ID" ]; then
-      GITHUB_TOKEN=$$(curl -s \
-        -H "Coder-Session-Token: $$CODER_AGENT_TOKEN" \
-        "$$CODER_URL/api/v2/users/$$OWNER_ID/gitauths/github" 2>/dev/null \
+    if [ -n "$CODER_URL" ] && [ -n "$CODER_AGENT_TOKEN" ] && [ -n "$OWNER_ID" ]; then
+      GITHUB_TOKEN=$(curl -s \
+        -H "Coder-Session-Token: $CODER_AGENT_TOKEN" \
+        "$CODER_URL/api/v2/users/$OWNER_ID/gitauths/github" 2>/dev/null \
         | jq -r '.access_token // empty')
       
       # Fallback to env var if API call fails
-      GITHUB_TOKEN="$${GITHUB_TOKEN:-$$GITHUB_PERSONAL_ACCESS_TOKEN}"
+      GITHUB_TOKEN="$${GITHUB_TOKEN:-$GITHUB_PERSONAL_ACCESS_TOKEN}"
       
       # Configure git with token for HTTPS push auth
-      if [ -n "$$GITHUB_TOKEN" ]; then
+      if [ -n "$GITHUB_TOKEN" ]; then
         git config --global credential.helper store
-        echo "https://git:$$GITHUB_TOKEN@github.com" > /home/coder/.git-credentials
+        echo "https://git:$GITHUB_TOKEN@github.com" > /home/coder/.git-credentials
         chmod 600 /home/coder/.git-credentials
         log "Configured git credentials for GitHub push auth"
       else
