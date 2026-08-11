@@ -1,230 +1,207 @@
-# OpenFlows: One-Command Startup
+# OpenFlows — Quick Start
 
-## Recommended: Use `.env` File (Persistent)
+This guide covers everything you need to get OpenFlows running on a fresh machine: prerequisites, one-time setup (`.env`, Docker, bootstrap, licenses, tokens), adding a tenant, running the controller, verifying it works, and common troubleshooting.
 
-### Step 1: Create `.env` file (One-time setup — 5 minutes)
+> **Overview:** For what OpenFlows is, its architecture, how far it has come, and what's left to finish, see the [README](README.md).
+
+---
+
+## Prerequisites
+
+- **Docker 24+** — runs Redis, the Coder database, and Coder itself.
+- **Rust 1.70+** — builds the `openflows` and `openflows-harness` binaries during bootstrap.
+- **Node 18+** — for the GitHub MCP tooling used by agents.
+- **The `coder` CLI** on your `PATH` — `prod.sh bootstrap` shells out to `coder templates push`. Install it if missing:
+  ```bash
+  curl -fsSL https://coder.com/install.sh | sh
+  ```
+  Then make sure `coder` is on your `PATH` (re-login or add `~/.local/bin` / `~/bin`) and confirm with `coder version`.
+- **A GitHub personal access token** with the `repo` scope.
+
+---
+
+## Step 1 — Configure the environment
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env` and fill in three values:
+Edit `.env` and fill in at least:
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub PAT with the `repo` scope (from <https://github.com/settings/tokens>) |
+| `GITHUB_REPOSITORY` | Your repo as `owner/repo` (e.g. `my-org/my-repo`) |
+| `CODER_SESSION_TOKEN` | Leave empty for now — obtained in [Step 4](#step-4--coder-license--github-login--api-token) |
+
+Optional overrides (used when bootstrap creates the Coder admin account):
 
 ```bash
-# Your GitHub personal access token
-# Get from: https://github.com/settings/tokens
-GITHUB_TOKEN=ghp_...
-
-# Your GitHub repository
-GITHUB_REPOSITORY=owner/repo
-
-# Your Coder session token
-# Get from: http://localhost:7080 → Account → Tokens
-CODER_SESSION_TOKEN=cdr_...
+CODER_ADMIN_USERNAME=admin
+CODER_ADMIN_EMAIL=admin@openflows.dev
+CODER_ADMIN_PASSWORD=Op3nFl0ws!
 ```
 
-### Step 2: Start OpenFlows (Reusable — 30 seconds)
-
-```bash
-./scripts/start.sh --reset
-```
-
-Done! The script automatically loads variables from `.env`.
+> **`.dev-binaries` note:** This directory is created and populated automatically during bootstrap and is bind-mounted into Coder workspaces. If bootstrap fails with `cp: ...: Permission denied`, the directory has become `root`-owned. Fix it:
+> ```bash
+> sudo chown -R "$USER":"$USER" .dev-binaries/
+> ```
+> (Create it first if needed: `mkdir -p .dev-binaries`.)
 
 ---
 
-## Alternative: Export Variables (Temporary)
-
-If you prefer not to use `.env`, you can export directly:
+## Step 2 — Start the Docker infrastructure
 
 ```bash
-export GITHUB_TOKEN="ghp_..."
-export GITHUB_REPOSITORY="owner/repo"
-export CODER_SESSION_TOKEN="cdr_..."
-
-./scripts/start.sh --reset
+docker compose up -d
 ```
+
+This starts three services (see `docker-compose.yml`):
+
+- **Redis** — the shared state store (port `6379`)
+- **coder-db** — PostgreSQL for Coder (no external port)
+- **coder** — the Coder server itself (port `7080`)
+
+Wait until all services are healthy:
+
+```bash
+docker compose ps
+```
+
+You should see `redis`, `coder-db`, and `coder` all reporting `healthy` (or `running`). The `coder` service runs a healthcheck, so give it a few seconds on first start.
+
+> **Port 6379 conflict:** If the container fails with `failed to bind host port 0.0.0.0:6379/tcp: address already in use`, another process or container is already bound to port 6379 (e.g. a `streamr-redis` container). Remove or stop the conflicting container, or change the port mapping in `docker-compose.yml`.
 
 ---
 
-## How to Get Each Token
+## Step 3 — Bootstrap (one-time setup)
 
-For detailed token acquisition guide, see [`TOKEN_GUIDE.md`](TOKEN_GUIDE.md).
-
-### GITHUB_TOKEN
-1. Go to https://github.com/settings/tokens
-2. Click "Generate new token" → "Generate new token (classic)"
-3. Select scope: ☑️ `repo` (all options under repo)
-4. Click "Generate token"
-5. **Copy the token immediately** (you won't see it again)
-6. Paste in `.env` as `GITHUB_TOKEN=ghp_...`
-
-### CODER_SESSION_TOKEN
-**What it's for:** OpenFlows uses this to authenticate with Coder and perform operations on your behalf:
-  - Provision new agent workspaces
-  - Create chats for agents to work in
-  - Monitor workspace status and health
-  - Manage workspace lifecycle
-
-**Where to get it:**
-
-> **⚠️ First time setup:** When Coder starts for the first time, it will prompt you to create
-> your **first admin account** (your Coder dashboard login). This is separate from the API token.
-
-**Step-by-step:**
-1. **Run the startup script** — starts Coder first:
-   ```bash
-   ./scripts/start.sh --reset
-   ```
-2. **Create your admin account** when Coder prompts (first time only):
-   - This is your Coder dashboard login (email + password)
-3. **Open Coder UI**: http://localhost:7080
-4. **Sign in** with your admin account
-5. **Get API token**:
-   - Click your **username** in the top-right corner
-   - Select **Account** from the dropdown menu
-   - Click **Tokens** tab
-   - Click **Create Token** button
-   - Copy the token (format: `cdr_xxxxxxxxxxxx`)
-6. **Add to `.env`**:
-   ```bash
-   echo 'CODER_SESSION_TOKEN=cdr_...' >> .env
-   ```
-7. **Run again**:
-   ```bash
-   ./scripts/start.sh --reset
-   ```
-
-**Note:** Two separate things are created: (1) admin account = dashboard login, (2) API token = OpenFlows access. Keep both private.
-
-### GITHUB_REPOSITORY
-Simply your GitHub repo path (e.g., `my-org/my-repo`):
 ```bash
-GITHUB_REPOSITORY=my-org/my-repo
+./scripts/prod.sh bootstrap
 ```
+
+This will:
+
+1. **Build and sync dev binaries** — compiles `openflows` (controller) and `openflows-harness` (worker coordination) in release mode and copies both to `.dev-binaries/` for mounting into Coder workspaces.
+2. **Create the admin user in Coder** — creates the initial admin account (see Step 4 for credentials).
+3. **Push workspace templates** — deploys the `nexus`, `forge`, `sentinel`, `vessel`, and `lore` templates via `coder templates push`.
+4. **Verify LLM/GitHub auth** — ensures a GitHub token and at least one LLM model are configured.
 
 ---
 
-## What Happens After You Run `./scripts/start.sh --reset`
+## Step 4 — Coder license, GitHub login & API token
 
-The script automatically:
-1. ✅ Loads variables from `.env`
-2. ✅ Checks your tokens
-3. ✅ Resets Redis to clean state (removes 60+ zombie keys)
-4. ✅ Starts Docker containers (Coder, Redis, etc.)
-5. ✅ Builds OpenFlows binaries
-6. ✅ Starts the controller daemon
-7. ✅ Outputs: "✅ OpenFlows Ready to Work"
+Override them with `CODER_ADMIN_USERNAME` / `CODER_ADMIN_EMAIL` / `CODER_ADMIN_PASSWORD` before running bootstrap.
 
 Then:
-- **Create a GitHub issue** in your repo (or via API)
-- **Monitor progress**: `tail -f /tmp/openflows-controller.log`
-- Watch: issue detected → assigned → workspace provisioned → work starts
+
+1. Open **http://localhost:7080**
+2. **Sign in with GitHub only** — configure Coder to use **GitHub OAuth** as the login method (first-time only). Do not create a password-only account.
+3. **Add a Coder license** — create a license from your account at coder.com, then add it at **http://localhost:7080/deployment/licenses/add**. (Coder requires a valid license before some functionality is enabled. For local development you can use Coder's free/developer license — see <https://coder.com/docs/next/admin/licenses>.)
+4. Click your **username** (top-right corner) → **Account** → **Tokens**.
+5. Click **Create Token**, copy the token, and paste it into `.env` as:
+   ```bash
+   CODER_SESSION_TOKEN=your_token_here
+   ```
 
 ---
 
-## Common Commands
+## Step 5 — Add a tenant
 
-| Task | Command |
-|------|---------|
-| **Start (fresh)** | `./scripts/start.sh --reset` |
-| **Start (keep state)** | `./scripts/start.sh` |
-| **View logs** | `tail -f /tmp/openflows-controller.log` |
-| **Check workers** | `docker exec openflows-redis-1 redis-cli GET worker_slots \| jq .` |
-| **Check tickets** | `docker exec openflows-redis-1 redis-cli GET tickets \| jq .` |
-| **Reset Redis only** | `./scripts/reset-controller-state.sh --confirm` |
-| **Show help** | `./scripts/start.sh --help` |
+```bash
+./scripts/prod.sh tenant <owner/repo> --name <my-team>
+```
+
+This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller. See [TOKEN_GUIDE.md](TOKEN_GUIDE.md) for the token acquisition walkthrough.
+
+---
+
+## Step 6 — Run the controller
+
+```bash
+# Run this in a separate terminal; the controller remains in the foreground
+./scripts/prod.sh run
+```
+
+This **always** resets Redis to a clean slate, then starts the controller in the foreground (logs stream to this terminal). Create a GitHub issue in a bound repo → OpenFlows automatically assigns, provisions a workspace, and starts working.
+
+---
+
+## Step 7 — Verify it's working
+
+Because the controller runs in the foreground, its logs stream directly to the terminal where you started `./scripts/prod.sh run`. In a **separate terminal** you can verify:
+
+```bash
+# Health check
+./scripts/prod.sh doctor
+```
+
+Confirm the Docker services are healthy:
+
+```bash
+docker compose ps
+```
+
+A successful run shows Coder, Redis, and the controller all healthy, and the controller terminal streaming with sync/provisioning activity once you create an issue.
+
+> **On `/tmp/openflows-controller.log`:** That log file only exists in the **production** flow, where the controller runs inside a Nexus workspace and its startup script redirects output (`openflows run >/tmp/openflows-controller.log`). Locally, `prod.sh run` runs in the foreground — watch that terminal instead.
 
 ---
 
 ## Troubleshooting
 
-### "Missing required environment variables"
+### `Failed to run coder templates push` (during bootstrap)
+
+The `coder` CLI is missing or not on your `PATH`. Bootstrap shells out to `coder templates push`. Install it:
+
+```bash
+curl -fsSL https://coder.com/install.sh | sh
+```
+
+Ensure `coder` is on your `PATH`, confirm with `coder version`, then re-run bootstrap.
+
+### "No LLM models configured in Coder"
+
+Open the Coder dashboard → **AI Settings** → **Coder Agents** → **Models** and configure at least one provider/model, then re-run bootstrap.
+
+### `cp: cannot create regular file '.dev-binaries/openflows': Permission denied`
+
+The `.dev-binaries/` directory is `root`-owned. Take ownership:
+
+```bash
+sudo chown -R "$USER":"$USER" .dev-binaries/
+```
+
+### Missing required environment variables
+
 Make sure `.env` is in the project root:
+
 ```bash
 cp .env.example .env
 # Edit .env with your tokens
 ```
 
-Or export them:
-```bash
-export GITHUB_TOKEN="ghp_..."
-export GITHUB_REPOSITORY="owner/repo"
-export CODER_SESSION_TOKEN="cdr_..."
-```
+### Redis container not responding
 
-### "Redis container not responding"
 ```bash
 docker ps | grep redis
-docker compose up -d   # Restart if needed
+docker compose up -d   # restart if needed
 ```
 
-### "Failed to start Docker containers"
-```bash
-# Ensure Docker is running
-docker ps
+### `failed to bind host port 0.0.0.0:6379/tcp: address already in use`
 
-# Check docker-compose.yml exists
-ls docker-compose.yml
-```
+Another process or container already holds port 6379. Find the conflicting container with `docker ps --format '{{.Names}}\t{{.Ports}}' | grep 6379` and remove/stop it (e.g. `docker rm -f streamr-redis`), or change the redis port mapping in `docker-compose.yml`.
 
-### "Controller failed to start"
-```bash
-# Check logs for errors
-tail -50 /tmp/openflows-controller.log
+### Controller not picking up issues
 
-# Check port 7080 isn't already in use
-lsof -i :7080
-```
-
-### "Workspace not provisioning"
-```bash
-# Check controller logs for provision errors
-tail -f /tmp/openflows-controller.log | grep -i provision
-
-# Verify Coder is accessible
-curl http://localhost:7080/api/v2/buildinfo
-```
-
----
-
-## Workflow Example
-
-```bash
-# 1. Setup (first time only)
-cp .env.example .env
-# Edit .env with tokens
-
-# 2. Start
-./scripts/start.sh --reset
-# Output: ✅ OpenFlows Ready to Work
-
-# 3. Create an issue (in GitHub web UI or via CLI)
-# GitHub issue is created
-
-# 4. Watch the logs
-tail -f /tmp/openflows-controller.log
-
-# Expected output:
-# - "sync_issues: found new issue T-001"
-# - "Nexus: dispatching assignable ticket to an idle forge worker"
-# - "Provisioning Coder workspace for worker"
-# - "Coder workspace provisioned"
-# - "Created Chat for ticket assignment"
-# - Later: "flow recovery: inconsistencies detected"
-
-# 5. Monitor workspace startup
-# In Coder UI (localhost:7080), you'll see a chat session start
-# The agent begins working on the issue
-
-# 6. Agent completes work
-# Opens PR → Sentinel reviews → PR merged → Ticket done
-```
+1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name ,<my-team>`).
+2. Check the terminal running the controller for errors (locally) — or `tail -f /tmp/openflows-controller.log` in the production flow.
+3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
 ---
 
 ## For More Details
 
-- **Full Documentation**: See [`README.md`](README.md)
-- **Testing & Debugging**: See [`TESTING_QUICK_START.md`](TESTING_QUICK_START.md)
-- **Technical Deep-Dive**: See [`FIXES_SUMMARY.md`](FIXES_SUMMARY.md)
+- **Full Documentation**: See [README.md](README.md)
+- **Testing & Debugging**: See [TESTING_QUICK_START.md](TESTING_QUICK_START.md)
+- **Token Acquisition**: See [TOKEN_GUIDE.md](TOKEN_GUIDE.md)

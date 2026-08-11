@@ -7,199 +7,11 @@
 
 Give it a GitHub repo and some issues, and OpenFlows orchestrates a team of coordinated AI agents that plan the work, write the code, review it adversarially, and ship reviewed PRs — without you writing a single line of code. Each agent runs as a **Coder Agent** (control-plane AI loop) operating on an ephemeral, governed Coder workspace, with LLM keys kept in the Coder control plane and every action tied to your identity.
 
+> **Getting started?** All setup, startup, and troubleshooting steps live in [**QUICK_START.md**](QUICK_START.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
+
 ## Why architecture-first
 
-AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/articles/architecture-is-the-product.md`](docs/articles/architecture-is-the-product.md).
-
-## Quick Start
-
-### Prerequisites
-
-- **Docker 24+** (required to run Redis, the Coder database, and Coder itself)
-- **Rust 1.70+** (required to build the `openflows` and `openflows-harness` binaries during bootstrap)
-- **Node 18+** (needed for GitHub MCP tooling used by agents)
-- **The `coder` CLI** on your `PATH` (bootstrap shells out to `coder templates push` to deploy workspace templates)
-- **GitHub personal access token** with the `repo` scope
-
-### Complete Setup (from scratch)
-
-A linear, end-to-end walkthrough for going from a fresh clone to a running controller.
-
-#### 1. Start Docker infrastructure
-
-```bash
-docker compose up -d
-```
-
-This starts three services (see `docker-compose.yml`):
-- **Redis** — the shared state store (port `6379`)
-- **coder-db** — PostgreSQL for Coder (no external port)
-- **coder** — the Coder server itself (port `7080`)
-
-Wait until all services are healthy:
-
-```bash
-docker compose ps
-```
-
-You should see `redis`, `coder-db`, and `coder` all reporting `healthy` (or `running`). The `coder` service runs a healthcheck, so give it a few seconds on first start.
-
-#### 2. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your values:
-
-- **`GITHUB_TOKEN`** — A GitHub personal access token with the `repo` scope, from <https://github.com/settings/tokens> (click "Generate new token" → "Generate new token (classic)", select `repo`). Copy it immediately.
-- **`GITHUB_REPOSITORY`** — Your repo in the format `owner/repo` (e.g. `my-org/my-repo`).
-- **`CODER_SESSION_TOKEN`** — **Leave empty for now.** This token can only be obtained *after* Coder is running and you've created your admin account, so you'll fill it in during step 4.
-
-> **Note on `.dev-binaries`:** This directory is created and populated automatically during bootstrap, and is bind-mounted into Coder workspaces (see `docker-compose.yml`). If you ever see a `cp: ...: Permission denied` error during the binary-sync step, the directory has likely become `root`-owned. Fix it with:
-> ```bash
-> sudo chown -R "$USER":"$USER" .dev-binaries/
-> ```
-> (Create it first if needed: `mkdir -p .dev-binaries`.)
-
-#### 3. Bootstrap (one-time setup)
-
-```bash
-./scripts/prod.sh bootstrap
-```
-
-This will:
-1. **Build and sync dev binaries** — Compiles `openflows` (controller) and `openflows-harness` (worker coordination) in release mode (`cargo build --release`), then copies both to `.dev-binaries/` for Docker mounting into Coder workspaces.
-2. **Create the admin user in Coder** — Creates the initial admin account (see step 4 for the credentials).
-3. **Push workspace templates** — Deploys the `nexus`, `forge`, `sentinel`, `vessel`, and `lore` templates via `coder templates push`.
-4. **Verify LLM/GitHub auth** — Ensures a GitHub token and at least one LLM model are configured.
-
-> **Troubleshooting:** See the [Troubleshooting](#troubleshooting) section below for common bootstrap failures (missing `coder` CLI, Coder license, LLM model not configured, etc.).
-
-#### 4. Get the Coder session token & admin credentials
-
-The bootstrap script prints the admin account it created. By default the credentials are:
-
-| Field | Default |
-|-------|---------|
-| Username | `admin` |
-| Email | `admin@openflows.dev` |
-| Password | `Op3nFl0ws!` |
-
-You can override these before running bootstrap via the `CODER_ADMIN_USERNAME`, `CODER_ADMIN_EMAIL`, and `CODER_ADMIN_PASSWORD` environment variables.
-
-Then get a valid session token so the OpenFlows controller can authenticate to Coder:
-
-1. Open <http://localhost:7080>
-2. **Sign in with GitHub only** — configure Coder to use GitHub OAuth as the login method (first-time only). Do not create a password-based account.
-3. **Add a Coder license** — create a license from your account at coder.com, then add it at <http://localhost:7080/deployment/licenses/add>
-4. Click your **username** (top-right corner) → **Account** → **Tokens**
-5. Click **Create Token**
-6. Copy the token and paste it into `.env` as:
-   ```bash
-   CODER_SESSION_TOKEN=cdr_your_token_here
-   ```
-
-> **Creating a Coder license:** Coder requires a valid license before some functionality is enabled. In the Coder dashboard go to **Deploy** → **Licenses** and add a new license, by pasting it into <http://localhost:7080/deployment/licenses/add>. For local development you can use Coder's free/developer license (see <https://coder.com/docs/next/admin/licenses>), or generate one from your Coder product account.
-
-#### 5. Add a tenant
-
-```bash
-./scripts/prod.sh tenant <owner/repo> --name <my-team>
-```
-
-This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller. See [TOKEN_GUIDE.md](TOKEN_GUIDE.md) for the token acquisition walkthrough.
-
-#### 6. Run the controller
-
-```bash
-# Run this in a separate terminal; the controller remains in the foreground
-./scripts/prod.sh run
-```
-
-This **always** resets Redis to a clean slate, then starts the controller. Create a GitHub issue in a bound repo → OpenFlows automatically assigns, provisions a workspace, and starts working.
-
-#### 7. Verify it's working
-
-The controller runs in the foreground of the terminal where you started `./scripts/prod.sh run`, so its logs stream directly to that terminal. To verify it in a separate terminal:
-
-```bash
-# Health check
-./scripts/prod.sh doctor
-```
-
-Confirm the Docker services are healthy:
-
-```bash
-docker compose ps
-```
-
-> **Note on `/tmp/openflows-controller.log`:** That log file only exists in the **production** flow, where the Controller runs inside a Nexus workspace and its startup script redirects output (`openflows run >/tmp/openflows-controller.log`). When you run the controller locally with `./scripts/prod.sh run`, no such log file is created — watch the foreground terminal instead.
-
-A successful run shows Coder, Redis, and the controller all healthy, and the controller terminal streaming with sync/provisioning activity once you create an issue.
-
-### Troubleshooting
-
-#### `Failed to run coder templates push` (during bootstrap)
-
-The `coder` CLI is missing or not on your `PATH`. Bootstrap shells out to `coder templates push`. Install it, for example:
-
-```bash
-curl -fsSL https://coder.com/install.sh | sh
-```
-
-Then make sure the `coder` binary is on your `PATH` (re-login or add `~/.local/bin`/`~/bin`), and confirm with `coder version`, then re-run bootstrap.
-
-#### `cp: cannot create regular file '.dev-binaries/openflows': Permission denied`
-
-The `.dev-binaries/` directory is `root`-owned. Take ownership:
-
-```bash
-sudo chown -R "$USER":"$USER" .dev-binaries/
-```
-
-#### "No LLM models configured in Coder"
-
-Open the Coder dashboard → **AI Settings** → **Coder Agents** → **Models** and configure at least one provider/model, then re-run bootstrap.
-
-#### `docker compose` / health check failures
-
-```bash
-# Ensure Docker is running
-docker ps
-
-# Restart the stack
-docker compose up -d
-docker compose ps   # wait for healthy
-```
-
-#### Controller not picking up issues
-
-1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
-2. Check the terminal running the controller for errors (locally) — or `tail -f /tmp/openflows-controller.log` in the production flow.
-3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
-
----
-
-## Production Architecture
-
-In production, the controller runs inside a **Nexus workspace** provisioned by Coder. The workspace auto-starts the controller via startup_script.
-
-```
-Coder provisions nexus workspace from template
-    ↓
-Workspace startup script runs
-    ↓
-Line 1: Installs openflows-harness binary
-    ↓
-Line 2: Starts heartbeat daemon
-    ↓
-Line 3: Executes: openflows run
-    ↓
-Controller auto-starts inside workspace
-```
-
-The nexus workspace template is in `crates/coder-client/templates/openflows-nexus/`. It receives all env vars from Coder and auto-starts the controller.
+AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/architecture/OpenFlows_Coder_Integrated_Architecture.md`](docs/architecture/OpenFlows_Coder_Integrated_Architecture.md) for the full design.
 
 ## How It Works
 
@@ -234,15 +46,6 @@ FORGE writes plan (PLAN.md) → Sets status to 'planning' → HALTS
 - Gate approval is stored with timestamp and approver role, enabling audit trails
 - Only the `planning` → `building` transition is gated; subsequent phases are unconstrained
 
-**For administrators:**
-```bash
-# Approve FORGE to proceed (run from control plane or within nexus workspace)
-openflows gate approve --tenant my-team --ticket T-42 --phase planning --approver SENTINEL
-
-# Check gate status
-openflows gate status --tenant my-team --ticket T-42 --phase planning
-```
-
 This ensures every issue is carefully planned before coding begins, catching scope creep and spec mismatches early.
 
 ### Coder governs *where* agents run — OpenFlows governs *how* they coordinate
@@ -273,6 +76,22 @@ One Coder server serves many teams. Each tenant = a real Coder user + a repo bin
 
 Configure multiple tenants via environment variables or the control plane API (documented in `docs/`).
 
+## Project Status
+
+OpenFlows is an actively developed, functioning system that already ships merged PRs end-to-end. Current state (v1.2.x):
+
+**Working today:**
+- A full agent team (NEXUS / FORGE / SENTINEL / VESSEL / LORE) running as Coder Agents on ephemeral, governed workspaces.
+- End-to-end flow: GitHub issue → planning gate → FORGE implementation → SENTINEL adversarial review → VESSEL merge → merged PR.
+- Gated planning approval with audit-trailed gate records in Redis.
+- `reconcile()` failure recovery: orphan / stale worker detection, retry with backoff, and unmerged-PR resume.
+- Typed SharedStore contracts and the `openflows-harness` CLI as the only Redis client inside workspaces.
+- Multi-tenancy via per-tenant Redis keyspace prefixes and Coder RBAC.
+- Production controller deployment inside a Nexus workspace (auto-start via startup script).
+- A pluggable skill / MCP / model registry.
+
+See [QUICK_START.md](QUICK_START.md) to run it, and the planning-gate / architecture docs for the intended end state.
+
 ## Plug-and-Play Extension
 
 - **Add a skill**: Drop a directory in `orchestration/plugin/skills/` with a `SKILL.md`, list it in `registry.json` under the role's `skills` array. No code change.
@@ -285,13 +104,9 @@ See [`docs/extending.md`](docs/extending.md) for details.
 
 | Guide | What it covers |
 |-------|---------------|
-| [QUICK_START.md](QUICK_START.md) | Detailed setup walkthrough |
+| [QUICK_START.md](QUICK_START.md) | Complete setup, startup, and troubleshooting |
 | [TOKEN_GUIDE.md](TOKEN_GUIDE.md) | Token acquisition step-by-step |
-| [BUILD.md](BUILD.md) | Building from source |
-| [INSTALL.md](INSTALL.md) | Full installation and configuration |
-| [RUN.md](RUN.md) | Running and configuration reference |
-| [TUTORIAL.md](TUTORIAL.md) | Step-by-step walkthrough |
-| [DEMO.md](DEMO.md) | Quick demo walkthrough (requires a real LLM key) |
+| [TESTING_QUICK_START.md](TESTING_QUICK_START.md) | Testing & debugging walkthrough |
 | [docs/coder-compatibility.md](docs/coder-compatibility.md) | Coder version compatibility and verification |
 | [docs/tenancy.md](docs/tenancy.md) | Multi-tenant model and Redis namespacing |
 | [docs/governance.md](docs/governance.md) | AI governance controls and network policy |
