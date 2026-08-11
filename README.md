@@ -88,7 +88,7 @@ The bootstrap script prints the admin account it created. By default the credent
 
 You can override these before running bootstrap via the `CODER_ADMIN_USERNAME`, `CODER_ADMIN_EMAIL`, and `CODER_ADMIN_PASSWORD` environment variables.
 
-Then get your API token so OpenFlows can authenticate to Coder:
+Then get a valid session token so the OpenFlows controller can authenticate to Coder:
 
 1. Open <http://localhost:7080>
 2. **Sign in with GitHub only** — configure Coder to use GitHub OAuth as the login method (first-time only). Do not create a password-based account.
