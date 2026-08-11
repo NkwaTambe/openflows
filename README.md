@@ -112,6 +112,7 @@ This binds a GitHub repo to the controller. You must add at least one tenant bef
 #### 6. Run the controller
 
 ```bash
+# Run this in a separate terminal; the controller remains in the foreground
 ./scripts/prod.sh run
 ```
 
