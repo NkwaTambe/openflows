@@ -200,12 +200,19 @@ resource "docker_container" "workspace" {
     "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
+    # reach it over the shared docker network (issue #143). Workspaces address
+    # it via the `openflows-nexus` network alias below.
+    "A2A_RELAY_ADDR=0.0.0.0:3000",
     # Path to orchestration files containing agent personas and skills
     "ORCHESTRATOR_DIR=/home/coder/.openflows/orchestration",
   ]
 
   networks_advanced {
     name = "openflows_default"
+    # Stable service name so forge/sentinel templates can default
+    # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
+    aliases = ["openflows-nexus"]
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]

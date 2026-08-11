@@ -20,6 +20,12 @@ variable "harness_version" {
   description = "openflows-harness binary version to download"
 }
 
+variable "a2a_relay_addr" {
+  type        = string
+  default     = "openflows-nexus:3000"
+  description = "Address of the nexus A2A relay (JSON-RPC verify transport, issue #143). Forge resolves the nexus container over the shared docker network by its service name to claim and execute verify tasks."
+}
+
 # Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
 data "coder_parameter" "role" {
   name        = "role"
@@ -213,6 +219,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
+    export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
@@ -296,6 +303,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
+    "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

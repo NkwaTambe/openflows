@@ -46,6 +46,12 @@ variable "harness_version" {
   description = "openflows-harness binary version to download"
 }
 
+variable "a2a_relay_addr" {
+  type        = string
+  default     = "openflows-nexus:3000"
+  description = "Address of the nexus A2A relay (JSON-RPC verify transport, issue #143). Workspaces resolve the nexus container over the shared docker network by its service name."
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -102,6 +108,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TENANT="${var.tenant}"
     export OPENFLOWS_TICKET="${var.ticket_id}"
     export OPENFLOWS_ROLE="${var.role}"
+    export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
@@ -125,6 +132,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TENANT=${var.tenant}",
     "OPENFLOWS_TICKET=${var.ticket_id}",
     "OPENFLOWS_ROLE=${var.role}",
+    "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]
