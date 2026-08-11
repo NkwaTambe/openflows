@@ -121,10 +121,9 @@ This **always** resets Redis to a clean slate, then starts the controller. Creat
 
 #### 7. Verify it's working
 
-```bash
-# Check the controller log (use `tail -f` in a separate terminal to stream it live)
-tail -n 50 /tmp/openflows-controller.log
+The controller runs in the foreground of the terminal where you started `./scripts/prod.sh run`, so its logs stream directly to that terminal. To verify it in a separate terminal:
 
+```bash
 # Health check
 ./scripts/prod.sh doctor
 ```
@@ -135,7 +134,9 @@ Confirm the Docker services are healthy:
 docker compose ps
 ```
 
-A successful run shows Coder, Redis, and the controller all healthy, and the log streaming with sync/provisioning activity once you create an issue.
+> **Note on `/tmp/openflows-controller.log`:** That log file only exists in the **production** flow, where the Controller runs inside a Nexus workspace and its startup script redirects output (`openflows run >/tmp/openflows-controller.log`). When you run the controller locally with `./scripts/prod.sh run`, no such log file is created — watch the foreground terminal instead.
+
+A successful run shows Coder, Redis, and the controller all healthy, and the controller terminal streaming with sync/provisioning activity once you create an issue.
 
 ### Troubleshooting
 
@@ -175,7 +176,7 @@ docker compose ps   # wait for healthy
 #### Controller not picking up issues
 
 1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
-2. Check the controller log for errors: `tail -f /tmp/openflows-controller.log`.
+2. Check the terminal running the controller for errors (locally) — or `tail -f /tmp/openflows-controller.log` in the production flow.
 3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
 ---
