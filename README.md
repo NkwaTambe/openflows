@@ -28,7 +28,7 @@ A linear, end-to-end walkthrough for going from a fresh clone to a running contr
 #### 1. Start Docker infrastructure
 
 ```bash
-docker compose up -d
+docker compose up
 ```
 
 This starts three services (see `docker-compose.yml`):
