@@ -37,6 +37,8 @@ services:
       CODER_PROVISIONER_DAEMONS: "1"
       CODER_PROVISIONER_DAEMON_TYPE: "docker"
       DOCKER_HOST: unix:///var/run/docker.sock
+      REDIS_URL: ${REDIS_URL:-redis://localhost:6379}
+      CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # TEMPORARY: Mount local openflows binary for testing (remove when using GitHub releases)
