@@ -15,38 +15,101 @@ AI can generate code against a spec, but it can't write the spec. As models make
 
 ### Prerequisites
 
-- Docker 24+
-- Rust 1.70+ (build system)
-- GitHub personal access token
+- **Docker 24+** (required to run Redis, the Coder database, and Coder itself)
+- **Rust 1.70+** (required to build the `openflows` and `openflows-harness` binaries during bootstrap)
+- **Node 18+** (needed for GitHub MCP tooling used by agents)
+- **The `coder` CLI** on your `PATH` (bootstrap shells out to `coder templates push` to deploy workspace templates)
+- **GitHub personal access token** with the `repo` scope
 
-### Setup
+### Complete Setup (from scratch)
+
+A linear, end-to-end walkthrough for going from a fresh clone to a running controller.
+
+#### 1. Start Docker infrastructure
+
+```bash
+docker compose up -d
+```
+
+This starts three services (see `docker-compose.yml`):
+- **Redis** — the shared state store (port `6379`)
+- **coder-db** — PostgreSQL for Coder (no external port)
+- **coder** — the Coder server itself (port `7080`)
+
+Wait until all services are healthy:
+
+```bash
+docker compose ps
+```
+
+You should see `redis`, `coder-db`, and `coder` all reporting `healthy` (or `running`). The `coder` service runs a healthcheck, so give it a few seconds on first start.
+
+#### 2. Configure environment
 
 ```bash
 cp .env.example .env
-# Edit .env: set GITHUB_TOKEN but leave CODER_SESSION_TOKEN empty
 ```
 
-### One-time Bootstrap
+Edit `.env` with your values:
+
+- **`GITHUB_TOKEN`** — A GitHub personal access token with the `repo` scope, from <https://github.com/settings/tokens> (click "Generate new token" → "Generate new token (classic)", select `repo`). Copy it immediately.
+- **`GITHUB_REPOSITORY`** — Your repo in the format `owner/repo` (e.g. `my-org/my-repo`).
+- **`CODER_SESSION_TOKEN`** — **Leave empty for now.** This token can only be obtained *after* Coder is running and you've created your admin account, so you'll fill it in during step 4.
+
+> **Note on `.dev-binaries`:** This directory is created and populated automatically during bootstrap, and is bind-mounted into Coder workspaces (see `docker-compose.yml`). If you ever see a `cp: ...: Permission denied` error during the binary-sync step, the directory has likely become `root`-owned. Fix it with:
+> ```bash
+> sudo chown -R "$USER":"$USER" .dev-binaries/
+> ```
+> (Create it first if needed: `mkdir -p .dev-binaries`.)
+
+#### 3. Bootstrap (one-time setup)
 
 ```bash
 ./scripts/prod.sh bootstrap
 ```
 
-This:
-1. **Builds and syncs dev binaries** — Compiles `openflows` (controller) and `openflows-harness` (worker coordination), copies both to `.dev-binaries/` for Docker mounting into Coder workspaces
-2. **Creates admin user in Coder** — Sets up the initial admin account
-3. **Pushes workspace templates** — Deploys nexus, forge, sentinel, vessel, and lore templates
-4. **Verifies LLM/GitHub auth** — Ensures GitHub token and LLM models are configured
+This will:
+1. **Build and sync dev binaries** — Compiles `openflows` (controller) and `openflows-harness` (worker coordination) in release mode (`cargo build --release`), then copies both to `.dev-binaries/` for Docker mounting into Coder workspaces.
+2. **Create the admin user in Coder** — Creates the initial admin account (see step 4 for the credentials).
+3. **Push workspace templates** — Deploys the `nexus`, `forge`, `sentinel`, `vessel`, and `lore` templates via `coder templates push`.
+4. **Verify LLM/GitHub auth** — Ensures a GitHub token and at least one LLM model are configured.
 
-### Add a Tenant
+> **Troubleshooting:** See the [Troubleshooting](#troubleshooting) section below for common bootstrap failures (missing `coder` CLI, Coder license, LLM model not configured, etc.).
+
+#### 4. Get the Coder session token & admin credentials
+
+The bootstrap script prints the admin account it created. By default the credentials are:
+
+| Field | Default |
+|-------|---------|
+| Username | `admin` |
+| Email | `admin@openflows.dev` |
+| Password | `Op3nFl0ws!` |
+
+You can override these before running bootstrap via the `CODER_ADMIN_USERNAME`, `CODER_ADMIN_EMAIL`, and `CODER_ADMIN_PASSWORD` environment variables.
+
+Then get your API token so OpenFlows can authenticate to Coder:
+
+1. Open <http://localhost:7080>
+2. Sign in with the admin credentials above (first-time only)
+3. Click your **username** (top-right corner) → **Account** → **Tokens**
+4. Click **Create Token**
+5. Copy the token (looks like `cdr_xxxxxxxxxxxx`) and paste it into `.env` as:
+   ```bash
+   CODER_SESSION_TOKEN=cdr_your_token_here
+   ```
+
+> **Creating a Coder license:** Coder requires a valid license before some functionality is enabled. In the Coder dashboard go to **Deploy** → **Licenses** and add a new license. For local development you can use Coder's free/developer license (see <https://coder.com/docs/next/admin/licenses>), or generate one from your Coder product account.
+
+#### 5. Add a tenant
 
 ```bash
 ./scripts/prod.sh tenant owner/repo --name my-team
 ```
 
-This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller.
+This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller. See [TOKEN_GUIDE.md](TOKEN_GUIDE.md) for the token acquisition walkthrough.
 
-### Start the Controller
+#### 6. Run the controller
 
 ```bash
 ./scripts/prod.sh run
@@ -54,16 +117,64 @@ This binds a GitHub repo to the controller. You must add at least one tenant bef
 
 This **always** resets Redis to a clean slate, then starts the controller. Create a GitHub issue in a bound repo → OpenFlows automatically assigns, provisions a workspace, and starts working.
 
-**Monitor:**
+#### 7. Verify it's working
+
 ```bash
+# Watch the controller log
 tail -f /tmp/openflows-controller.log
-```
 
-### Health Check
-
-```bash
+# Health check
 ./scripts/prod.sh doctor
 ```
+
+Confirm the Docker services are healthy:
+
+```bash
+docker compose ps
+```
+
+A successful run shows Coder, Redis, and the controller all healthy, and the log streaming with sync/provisioning activity once you create an issue.
+
+### Troubleshooting
+
+#### `Failed to run coder templates push` (during bootstrap)
+
+The `coder` CLI is missing or not on your `PATH`. Bootstrap shells out to `coder templates push`. Install it, for example:
+
+```bash
+curl -fsSL https://coder.com/install.sh | sh
+```
+
+Then make sure the `coder` binary is on your `PATH` (re-login or add `~/.local/bin`/`~/bin`), and confirm with `coder version`, then re-run bootstrap.
+
+#### `cp: cannot create regular file '.dev-binaries/openflows': Permission denied`
+
+The `.dev-binaries/` directory is `root`-owned. Take ownership:
+
+```bash
+sudo chown -R "$USER":"$USER" .dev-binaries/
+```
+
+#### "No LLM models configured in Coder"
+
+Open the Coder dashboard → **AI Settings** → **Coder Agents** → **Models** and configure at least one provider/model, then re-run bootstrap.
+
+#### `docker compose` / health check failures
+
+```bash
+# Ensure Docker is running
+docker ps
+
+# Restart the stack
+docker compose up -d
+docker compose ps   # wait for healthy
+```
+
+#### Controller not picking up issues
+
+1. Confirm a tenant is bound (`./scripts/prod.sh tenant owner/repo --name my-team`).
+2. Check the controller log for errors: `tail -f /tmp/openflows-controller.log`.
+3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
 ---
 
