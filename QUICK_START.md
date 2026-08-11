@@ -93,7 +93,15 @@ This will:
 
 The bootstrap script creates the initial Coder admin account. By default the credentials are:
 
+| Field | Default |
+|-------|---------|
+| Username | `admin` |
+| Email | `admin@openflows.dev` |
+| Password | `Op3nFl0ws!` |
+
 Override them with `CODER_ADMIN_USERNAME` / `CODER_ADMIN_EMAIL` / `CODER_ADMIN_PASSWORD` before running bootstrap.
+
+> **Password requirements:** If the `CODER_ADMIN_PASSWORD` you set does not meet Coder's security requirements (at least 8 characters, and containing an uppercase letter, a lowercase letter, a digit, and a special character), bootstrap **silently falls back to `Op3nFl0ws!`** and creates the admin with that instead. Either set a password that satisfies these requirements, or sign in with the default `Op3nFl0ws!` (check the bootstrap output for the "falling back to default" warning).
 
 Then:
 
