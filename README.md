@@ -174,7 +174,7 @@ docker compose ps   # wait for healthy
 
 #### Controller not picking up issues
 
-1. Confirm a tenant is bound (`./scripts/prod.sh tenant owner/repo --name my-team`).
+1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
 2. Check the controller log for errors: `tail -f /tmp/openflows-controller.log`.
 3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
