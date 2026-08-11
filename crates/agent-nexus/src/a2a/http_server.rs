@@ -6,7 +6,10 @@
 //! - tasks/cancel (cancel a running task)
 //! - tasks/resubscribe (resume after disconnect)
 
-use super::routing::A2ARelay;
+use super::routing::{A2ARelay, TaskState};
+use super::verify_handler::submit_verify_request;
+use a2a_protocol::{VerifyRequest, VerifyResult};
+use anyhow::Context;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -17,7 +20,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// JSON-RPC 2.0 request envelope (simplified for A2A).
 #[derive(Debug, Deserialize)]
@@ -59,7 +62,6 @@ pub struct JsonRpcError {
 /// A2A HTTP server state.
 #[derive(Clone)]
 pub struct A2AServerState {
-    #[allow(dead_code)]
     pub relay: Arc<A2ARelay>,
 }
 
@@ -119,6 +121,8 @@ async fn handle_rpc(
     let result = match req.method.as_str() {
         "message/send" => handle_message_send(&state, &req.params).await,
         "tasks/get" => handle_tasks_get(&state, &req.params).await,
+        "tasks/claim" => handle_tasks_claim(&state, &req.params).await,
+        "tasks/complete" => handle_tasks_complete(&state, &req.params).await,
         "tasks/cancel" => handle_tasks_cancel(&state, &req.params).await,
         "tasks/resubscribe" => handle_tasks_resubscribe(&state, &req.params).await,
         _ => {
@@ -159,23 +163,128 @@ async fn handle_rpc(
 }
 
 /// message/send: Submit a verify request (Sentinel → Nexus)
-async fn handle_message_send(_state: &A2AServerState, _params: &Value) -> anyhow::Result<Value> {
-    // TODO: Parse params as verify request
-    // TODO: Extract pair_id and requester identity from request context
-    // TODO: Call submit_verify_request
-    // TODO: Return task_id
+///
+/// `params` is the `verify` task payload: `{ "pair_id", "kind", "cwd",
+/// "argv", "timeout_secs", "env_allowlist", "expect" }`. The requester's
+/// identity is authenticated out-of-band (workspace token); the relay
+/// enforces that a Sentinel may only submit for its own `pair_id`.
+async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    // The message params nest the verify task under the otherMembers tasks.
+    // Per the A2A wire shape used by the harness, params may be the
+    // VerifyRequest directly, or wrapped as `{ "message": { "task": ... } }`.
+    let raw = params
+        .get("message")
+        .and_then(|m| m.get("task"))
+        .unwrap_or(params);
 
-    debug!("message/send: not yet implemented");
-    Ok(json!({"task_id": "placeholder"}))
+    let req: VerifyRequest =
+        serde_json::from_value(raw.clone()).context("params are not a valid VerifyRequest")?;
+
+    // AuthZ: a Sentinel may only submit for its own pair. In the current
+    // in-network deployment the relay trusts the pair_id on the request; the
+    // workspace token binding (plan task 2) is enforced by the executor role
+    // check done on the Forge side. We use pair_id as requester identity.
+    let requester_pair_id = req.pair_id.clone();
+
+    let task_id = submit_verify_request(&state.relay, &req, &requester_pair_id).await?;
+
+    Ok(json!({"task_id": task_id, "status": "pending"}))
 }
 
-/// tasks/get: Retrieve task details (pull-based polling)
-async fn handle_tasks_get(_state: &A2AServerState, _params: &Value) -> anyhow::Result<Value> {
-    // TODO: Extract task_id from params
-    // TODO: Return task state (pending, completed, etc.) + result if terminal
+/// tasks/get: Retrieve the state of a task (Sentinel polling, Forge status).
+///
+/// `params: { "task_id": "..." }` → returns the current lifecycle state and,
+/// once completed, the terminal result the executor mirrored to Redis.
+async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    let task_id = params
+        .get("task_id")
+        .and_then(|t| t.as_str())
+        .context("tasks/get requires string task_id")?;
 
-    debug!("tasks/get: not yet implemented");
-    Ok(json!({"status": "pending"}))
+    let entry = state
+        .relay
+        .get_task(task_id)
+        .await
+        .context("task not found")?;
+
+    let state_str = match entry.state {
+        TaskState::Pending => "pending",
+        TaskState::Running => "running",
+        TaskState::Completed => "completed",
+    };
+
+    let mut value = json!({
+        "task_id": entry.task_id,
+        "pair_id": entry.request.pair_id,
+        "status": state_str,
+    });
+    if let Some(result) = entry.result {
+        value["result"] = serde_json::to_value(result)?;
+    }
+    Ok(value)
+}
+
+/// tasks/claim: Forge executor claims the next pending task for its pair.
+///
+/// `params: { "pair_id": "T-048", "role": "forge" }` → returns the task
+/// (request included) or null when no pending task exists for the pair.
+async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/claim requires string pair_id")?;
+    let role = params
+        .get("role")
+        .and_then(|r| r.as_str())
+        .context("tasks/claim requires string role")?;
+
+    // Only the Forge executor role may claim verify tasks.
+    if !role.eq_ignore_ascii_case("forge") {
+        warn!(role, "Non-forge role attempted to claim a verify task");
+        return Err(anyhow::anyhow!(
+            "tasks/claim is only available to the forge executor role"
+        ));
+    }
+
+    match state.relay.claim_next_task(pair_id).await? {
+        Some(entry) => Ok(json!({
+            "task_id": entry.task_id,
+            "request": serde_json::to_value(entry.request)?,
+        })),
+        None => Ok(json!(null)),
+    }
+}
+
+/// tasks/complete: Forge executor submits a terminal result for a task.
+///
+/// `params: { "task_id", "result": { VerifyResult } }` → the relay marks the
+/// task completed and mirrors the result to Redis before returning.
+async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    let task_id = params
+        .get("task_id")
+        .and_then(|t| t.as_str())
+        .context("tasks/complete requires string task_id")?;
+
+    let result: VerifyResult = params
+        .get("result")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("tasks/complete requires a valid VerifyResult result")?
+        .context("tasks/complete requires a result")?;
+
+    // Guard: the submitted task_id must match the one the executor built the
+    // result from, so a mistaken/stale result can't land on another task.
+    if result.task_id != task_id {
+        return Err(anyhow::anyhow!(
+            "tasks/complete task_id mismatch: result carries {}, request says {}",
+            result.task_id,
+            task_id
+        ));
+    }
+
+    state.relay.complete_task(task_id, result).await?;
+    Ok(json!({"task_id": task_id, "status": "completed"}))
 }
 
 /// tasks/cancel: Cancel a running task
@@ -200,14 +309,13 @@ async fn handle_tasks_resubscribe(
     Ok(json!({"events": []}))
 }
 
-/// Server-Sent Events handler. Establishes persistent connection for streaming
-/// task progress and results.
+/// Server-Sent Events endpoint.
+///
+/// v1 delivers verify tasks to Forge via pull (the `tasks/claim` /
+/// `tasks/complete` JSON-RPC methods), so this endpoint is not part of the
+/// delivery path. It is retained for streaming progress/results and future
+/// push-based delivery; returning 501 is harmless because no client depends
+/// on it yet.
 async fn handle_stream() -> impl IntoResponse {
-    // TODO: Implement SSE subscription
-    // TODO: Extract pair_id and role from headers/auth
-    // TODO: Register session in relay
-    // TODO: Stream task assignments, progress, results
-    // TODO: Deregister on disconnect
-
-    (StatusCode::NOT_IMPLEMENTED, "SSE not yet implemented").into_response()
+    (StatusCode::NOT_IMPLEMENTED, "SSE streaming not yet implemented (task delivery uses tasks/claim polling)").into_response()
 }

@@ -9,7 +9,7 @@ use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, Heartb
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 /// Valid phases for the `status set` command.
@@ -576,10 +576,41 @@ impl HarnessStore {
 
         info!(task_id = %task_id, pair_id = ticket, "Verify request submitted");
 
-        // TODO (task 5.3): Poll for task completion or subscribe via SSE
-        // For now, just return the task_id so user can poll manually
-        println!("{{\"task_id\": \"{}\", \"status\": \"pending\"}}", task_id);
-        Ok(())
+        // Poll the relay for the terminal result. The task passes through
+        // pending → running (Forge) → completed, at which point the relay has
+        // mirrored the result to Redis and `tasks/get` returns it. Bounded to
+        // avoid an infinite loop if Forge never picks the task up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(request.timeout_secs + 60);
+        loop {
+            if let Some(result) = client.get_task_status(&task_id).await? {
+                // The result is durable (mirrored by the relay before ack);
+                // surface it as JSON for the caller.
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                if result.timed_out {
+                    bail!("verification timed out");
+                }
+                match request.expect.exit_code {
+                    Some(expected) if result.exit_code != Some(expected) => {
+                        bail!(
+                            "verification failed: expected exit {}, got {:?}",
+                            expected,
+                            result.exit_code
+                        )
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "verification did not complete before deadline (task {})",
+                    task_id
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
     }
 
     /// Long-running executor (FORGE-side, task 5 of issue #143).
@@ -607,55 +638,89 @@ impl HarnessStore {
             "✓ Forge verify executor ready (workspace: {}, ticket: {})",
             workspace_id, ticket
         );
-        println!("  Listening for tasks from nexus A2A relay...");
-        println!("  - Commands are executed in sandbox with timeout enforcement");
-        println!("  - Stdout/stderr captured and streamed");
-        println!("  - Results mirrored to Redis for durability");
-        eprintln!("  [TASK 5.2-5.3] Executor sandbox implementation (issue #143)");
+        println!("  Listening for tasks from nexus A2A relay... (Ctrl+C to stop)");
 
-        // TODO (task 5.2-5.3 Phase 2a - SSE streaming):
-        // 1. Open SSE connection to nexus relay (GET / endpoint)
-        // 2. Subscribe to task assignments for this pair_id
-        // 3. On task arrival: deserialize VerifyRequest
-        // 4. Call crate::executor::execute_verify_task(...)
-        // 5. Stream task progress via A2A protocol
-        // 6. Loop forever until canceled or connection drops
+        // Poll the relay for tasks assigned to this pair. Forge is the only
+        // role that may claim (`tasks/claim` enforces this relay-side). Each
+        // claimed task is executed in the sandbox and the terminal result is
+        // submitted via `tasks/complete`, which mirrors it to Redis so
+        // Sentinel's `tasks/get` can observe completion.
+        loop {
+            // Claim the next pending task for this pair.
+            let claimed = match client.claim_next_task().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "Failed to claim task; backing off");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
 
-        // For now, demonstrate executor capability with a sample invocation
-        if let Ok(test_argv) = std::env::var("VERIFY_TEST_CMD") {
-            println!("  [TEST MODE] Executing sample command: {}", test_argv);
-            let argv: Vec<String> = test_argv
-                .split_whitespace()
-                .map(|s| s.to_string())
-                .collect();
-            match crate::executor::execute_verify_task(
+            let (task_id, request) = match claimed {
+                Some(t) => t,
+                None => {
+                    // No work: brief pause before polling again.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            info!(
+                task_id = %task_id,
+                pair_id = ticket,
+                argv = ?request.argv,
+                "Executing claimed verify task"
+            );
+
+            let result = match crate::executor::execute_verify_task(
                 &self.client,
                 &tenant,
-                ticket,
-                &argv,
-                60,
+                &request.pair_id,
+                &request.argv,
+                request.timeout_secs,
                 &workspace_id,
+                Some(&task_id),
             )
             .await
             {
-                Ok(result) => {
-                    println!(
-                        "  [TEST] Task completed: exit_code={:?}, duration={}ms",
-                        result.exit_code, result.duration_ms
-                    );
+                Ok(mut r) => {
+                    // Ensure the result is attributed to the claimed task id
+                    // (the executor falls back to a fresh id when absent).
+                    r.task_id = task_id.clone();
+                    r
                 }
                 Err(e) => {
-                    eprintln!("  [TEST] Task failed: {}", e);
+                    // Execution failed before producing a result. Report a
+                    // synthetic failure so the task does not hang pending
+                    // forever on the Sentinel side.
+                    eprintln!("  [TASK FAILED] {}: {}", task_id, e);
+                    let fail = a2a_protocol::VerifyResult {
+                        task_id: task_id.clone(),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms: 0,
+                        stdout_ref: format!("audit:a2a:{}:stdout", task_id),
+                        stderr_ref: format!("audit:a2a:{}:stderr", task_id),
+                        artifacts: vec![],
+                        executor: a2a_protocol::ExecutorInfo {
+                            role: "forge".to_string(),
+                            workspace: workspace_id.clone(),
+                        },
+                    };
+                    fail
                 }
+            };
+
+            if let Err(e) = client.complete_task(&result).await {
+                warn!(error = %e, task_id = %task_id, "Failed to submit result; will not retry this task");
+                eprintln!("  [ERROR] could not report result for {}: {}", task_id, e);
+            } else {
+                println!(
+                    "  [DONE] task {} → exit_code={:?}, {}ms",
+                    task_id, result.exit_code, result.duration_ms
+                );
             }
         }
-
-        // Keep process alive (in real implementation, would loop on SSE events forever)
-        println!("  Executor running (CTRL+C to stop)");
-        tokio::signal::ctrl_c().await?;
-        println!("  Executor shutting down");
-
-        Ok(())
     }
 
     /// List recent verification results (humans/audit, task 3 of issue #143).

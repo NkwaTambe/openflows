@@ -8,6 +8,7 @@
 use a2a_protocol::{VerifyRequest, VerifyResult};
 use anyhow::{anyhow, Result};
 use pocketflow_core::SharedStore;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -23,13 +24,29 @@ pub struct A2ASession {
                       // TODO: event channel for streaming progress back to workspace
 }
 
+/// Lifecycle state of a single A2A `verify` task as it moves
+/// Sentinel → relay → Forge → relay → Sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    /// Submitted by Sentinel, awaiting assignment to a Forge executor.
+    Pending,
+    /// Claimed by a Forge executor, currently running.
+    Running,
+    /// Forge submitted a terminal result; mirrored to Redis.
+    Completed,
+}
+
 /// Pair-scoped task entry, keyed by idempotency hash.
 #[derive(Clone)]
 pub struct TaskEntry {
     pub task_id: String,
     pub request: VerifyRequest,
     pub idempotency_key: String,
-    // TODO: result channel, progress channel
+    pub requester: String,
+    pub state: TaskState,
+    pub result: Option<VerifyResult>,
+    // TODO: progress channel for streaming back to Sentinel
 }
 
 /// Central A2A relay hosted by nexus. Manages pair-scoped routing,
@@ -39,9 +56,11 @@ pub struct A2ARelay {
     store: Arc<SharedStore>,
     // (pair_id, role) → connected session
     sessions: Arc<RwLock<HashMap<(String, String), A2ASession>>>,
-    // (pair_id, idempotency_key) → task entry (for dedup)
-    // TODO: add TTL or bounded eviction
+    // task_id → task entry (claim/complete/get by task_id)
     tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    // idempotency_key → task_id (dedup: (pair_id, sha256(request_body)))
+    // TODO: add TTL or bounded eviction
+    idempotency: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl A2ARelay {
@@ -51,6 +70,7 @@ impl A2ARelay {
             store,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            idempotency: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -141,17 +161,21 @@ impl A2ARelay {
     /// Check idempotency: if a task with the same key was recently
     /// submitted, return its task_id. Otherwise, generate a new task_id
     /// and record it.
-    pub async fn check_or_create_task(&self, req: &VerifyRequest) -> Result<String> {
+    pub async fn check_or_create_task(
+        &self,
+        req: &VerifyRequest,
+        requester: &str,
+    ) -> Result<String> {
         let idempotency_key = req.idempotency_seed()?;
 
-        let mut tasks = self.tasks.lock().await;
-        if let Some(entry) = tasks.get(&idempotency_key) {
+        // Dedup: reuse the existing task_id for an identical (pair, body).
+        if let Some(task_id) = self.idempotency.lock().await.get(&idempotency_key) {
             debug!(
-                task_id = %entry.task_id,
+                task_id = %task_id,
                 pair_id = %req.pair_id,
                 "Task already exists (dedup)"
             );
-            return Ok(entry.task_id.clone());
+            return Ok(task_id.clone());
         }
 
         // Generate new task_id (uuid v4)
@@ -160,9 +184,18 @@ impl A2ARelay {
         let entry = TaskEntry {
             task_id: task_id.clone(),
             request: req.clone(),
-            idempotency_key,
+            idempotency_key: idempotency_key.clone(),
+            requester: requester.to_string(),
+            state: TaskState::Pending,
+            result: None,
         };
-        tasks.insert(entry.idempotency_key.clone(), entry);
+
+        let mut tasks = self.tasks.lock().await;
+        tasks.insert(task_id.clone(), entry);
+        self.idempotency
+            .lock()
+            .await
+            .insert(idempotency_key, task_id.clone());
 
         debug!(
             task_id = %task_id,
@@ -170,6 +203,62 @@ impl A2ARelay {
             "New task created"
         );
         Ok(task_id)
+    }
+
+    /// Claim the next pending task assigned to a given pair. Marks it
+    /// `Running` and returns it to the claiming executor role (Forge).
+    /// Returns `None` when no pending task remains for the pair.
+    pub async fn claim_next_task(&self, pair_id: &str) -> Result<Option<TaskEntry>> {
+        let mut tasks = self.tasks.lock().await;
+        let task_id = tasks
+            .iter()
+            .find(|(_, t)| t.request.pair_id == pair_id && t.state == TaskState::Pending)
+            .map(|(id, _)| id.clone());
+
+        let entry = match task_id {
+            Some(id) => {
+                let entry = tasks.get(&id).unwrap().clone();
+                tasks.get_mut(&id).unwrap().state = TaskState::Running;
+                entry
+            }
+            None => return Ok(None),
+        };
+
+        debug!(task_id = %entry.task_id, pair_id, "Task claimed by executor");
+        Ok(Some(entry))
+    }
+
+    /// Mark a task Completed and store its terminal result, mirroring it
+    /// to Redis per the plan (result must be durable before Sentinel sees
+    /// it). Returns an error if the task is unknown.
+    pub async fn complete_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
+        let mut tasks = self.tasks.lock().await;
+        let entry = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
+        entry.state = TaskState::Completed;
+        entry.result = Some(result.clone());
+
+        // Mirror the terminal result to Redis before releasing the lock so a
+        // concurrent `tasks/get` from Sentinel never observes a completed task
+        // without a durable result.
+        self.mirror_result(&result).await?;
+
+        debug!(task_id, "Task completed and result mirrored");
+        Ok(())
+    }
+
+    /// Get a task's current state and terminal result (if any).
+    pub async fn get_task_state(&self, task_id: &str) -> Option<TaskState> {
+        let tasks = self.tasks.lock().await;
+        tasks.get(task_id).map(|t| t.state)
+    }
+
+    /// Look up a task's request (used by Forge to execute it after claiming)
+    /// and its terminal result once complete.
+    pub async fn get_task(&self, task_id: &str) -> Option<TaskEntry> {
+        let tasks = self.tasks.lock().await;
+        tasks.get(task_id).cloned()
     }
 
     /// Mirror a terminal task result to Redis before acking completion.

@@ -20,6 +20,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Execute a verify task in a sandbox with timeout enforcement.
+///
+/// `task_id` is the relay-assigned task id this execution reports back under;
+/// when `None`, a fresh id is generated (used by the standalone/self-test
+/// path). The returned `VerifyResult.task_id` always equals the supplied id.
 pub async fn execute_verify_task(
     client: &fred::clients::Client,
     tenant: &str,
@@ -27,9 +31,13 @@ pub async fn execute_verify_task(
     argv: &[String],
     timeout_secs: u64,
     workspace_id: &str,
+    task_id_opt: Option<&str>,
 ) -> Result<VerifyResult> {
     let start = Instant::now();
-    let task_id = Uuid::new_v4().to_string();
+    let task_id = match task_id_opt {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => Uuid::new_v4().to_string(),
+    };
 
     info!(
         task_id = %task_id,

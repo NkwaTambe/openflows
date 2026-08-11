@@ -23,11 +23,11 @@ pub async fn submit_verify_request(
     }
 
     // Idempotency: check if task already exists
-    let task_id = relay.check_or_create_task(req).await?;
+    let task_id = relay.check_or_create_task(req, requester_pair_id).await?;
 
-    // TODO (task 2.4): Route to executor (Forge) for the pair
-    // For now, just return the task_id; the executor will pull it via
-    // `tasks/get` in the JSON-RPC handler
+    // The executor (Forge) claims the pending task via `tasks/claim` and
+    // runs it in its own workspace; Sentinel polls `tasks/get` for the
+    // terminal state and mirrors the result to Redis.
 
     Ok(task_id)
 }

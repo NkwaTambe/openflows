@@ -2,9 +2,12 @@
 //! A2A relay server for Sentinel↔Forge delegated verification.
 //!
 //! Nexus runs an HTTP server this module owns. Sentinel and Forge workspaces
-//! open persistent SSE streams to this server (GET /). Sentinel sends JSON-RPC
-//! verify requests via POST /rpc; Nexus routes them to the FORGE subscriber for
-//! the same pair_id.
+//! communicate with it over JSON-RPC HTTP (POST /rpc); the relay routes
+//! verify tasks from Sentinel to the Forge executor for the same pair_id.
+//! v1 uses pull-based task delivery: Sentinel submits via `message/send`,
+//! Forge claims via `tasks/claim`, executes, and reports via `tasks/complete`;
+//! Sentinel polls `tasks/get` for the terminal state. SSE (`GET /`) is
+//! reserved for future streaming/push delivery.
 //!
 //! All terminal results are mirrored to Redis (pair:{pair_id}:verification,
 //! audit:a2a:{task_id}:*), keyed under the tenant namespace.
