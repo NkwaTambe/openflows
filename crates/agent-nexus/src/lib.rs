@@ -977,7 +977,7 @@ Before significant work, read the relevant skill file to understand the workflow
             let worker_role = Self::worker_role(worker_id);
             if let Ok(reg) = self.load_registry() {
                 if let Err(e) = provisioner
-                    .provision_role(&transport, &worker_role, &reg)
+                    .provision_role(&transport, worker_role, &reg)
                     .await
                 {
                     warn!(

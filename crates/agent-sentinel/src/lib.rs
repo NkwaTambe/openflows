@@ -419,7 +419,8 @@ impl Node for SentinelNode {
                             }
 
                             // Mark action as completed and continue
-                            let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                            let action_key =
+                                full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                             store.set(&action_key, json!("completed")).await;
                         } else {
                             info!(

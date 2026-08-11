@@ -22,6 +22,7 @@ use tracing::debug;
 /// JSON-RPC 2.0 request envelope (simplified for A2A).
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcRequest {
+    #[allow(dead_code)]
     pub jsonrpc: String,
     pub method: String,
     pub params: Value,
@@ -58,6 +59,7 @@ pub struct JsonRpcError {
 /// A2A HTTP server state.
 #[derive(Clone)]
 pub struct A2AServerState {
+    #[allow(dead_code)]
     pub relay: Arc<A2ARelay>,
 }
 
@@ -157,10 +159,7 @@ async fn handle_rpc(
 }
 
 /// message/send: Submit a verify request (Sentinel → Nexus)
-async fn handle_message_send(
-    _state: &A2AServerState,
-    _params: &Value,
-) -> anyhow::Result<Value> {
+async fn handle_message_send(_state: &A2AServerState, _params: &Value) -> anyhow::Result<Value> {
     // TODO: Parse params as verify request
     // TODO: Extract pair_id and requester identity from request context
     // TODO: Call submit_verify_request
@@ -171,10 +170,7 @@ async fn handle_message_send(
 }
 
 /// tasks/get: Retrieve task details (pull-based polling)
-async fn handle_tasks_get(
-    _state: &A2AServerState,
-    _params: &Value,
-) -> anyhow::Result<Value> {
+async fn handle_tasks_get(_state: &A2AServerState, _params: &Value) -> anyhow::Result<Value> {
     // TODO: Extract task_id from params
     // TODO: Return task state (pending, completed, etc.) + result if terminal
 
@@ -183,10 +179,7 @@ async fn handle_tasks_get(
 }
 
 /// tasks/cancel: Cancel a running task
-async fn handle_tasks_cancel(
-    _state: &A2AServerState,
-    _params: &Value,
-) -> anyhow::Result<Value> {
+async fn handle_tasks_cancel(_state: &A2AServerState, _params: &Value) -> anyhow::Result<Value> {
     // TODO: Extract task_id from params
     // TODO: Signal executor to kill process
 

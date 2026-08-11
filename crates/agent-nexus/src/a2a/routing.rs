@@ -18,9 +18,9 @@ use tracing::{debug, warn};
 #[derive(Clone)]
 pub struct A2ASession {
     pub pair_id: String,
-    pub role: String,        // "sentinel" or "forge"
+    pub role: String, // "sentinel" or "forge"
     pub workspace_id: String, // For audit; e.g., "forge-T-048"
-    // TODO: event channel for streaming progress back to workspace
+                      // TODO: event channel for streaming progress back to workspace
 }
 
 /// Pair-scoped task entry, keyed by idempotency hash.
@@ -110,10 +110,7 @@ impl A2ARelay {
 
         // Rule 2: Command allowlist
         if !a2a_protocol::is_allowlisted(&req.argv) {
-            return Err(anyhow!(
-                "command not allowlisted: {}",
-                req.argv.join(" ")
-            ));
+            return Err(anyhow!("command not allowlisted: {}", req.argv.join(" ")));
         }
 
         // Rule 3: cwd validation
@@ -122,9 +119,8 @@ impl A2ARelay {
         // in the executor (task 5), since nexus doesn't have workspace FS.
         use a2a_protocol::VerifyCwd;
         match req.cwd {
-            VerifyCwd::Repo | VerifyCwd::Worktree => {}
-            // If serde can't parse VerifyCwd, this is already rejected
-            // by serde deserialization, not by this function.
+            VerifyCwd::Repo | VerifyCwd::Worktree => {} // If serde can't parse VerifyCwd, this is already rejected
+                                                        // by serde deserialization, not by this function.
         }
 
         // Rule 4: timeout_secs sanity check
@@ -222,12 +218,7 @@ impl A2ARelay {
 
     /// List all active sessions (for inspection/monitoring).
     pub async fn list_sessions(&self) -> Vec<A2ASession> {
-        self.sessions
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect()
+        self.sessions.read().await.values().cloned().collect()
     }
 
     /// List all tracked tasks (for inspection/monitoring).

@@ -12,6 +12,7 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 /// A2A relay client for communicating with the nexus-hosted relay.
+#[allow(dead_code)]
 pub struct A2AClient {
     http_client: reqwest::Client,
     relay_url: String,
@@ -21,12 +22,12 @@ pub struct A2AClient {
 
 impl A2AClient {
     /// Create a new A2A client pointing at the nexus relay.
-    /// 
-    /// The relay address is read from A2A_RELAY_ADDR env var 
+    ///
+    /// The relay address is read from A2A_RELAY_ADDR env var
     /// (default: 127.0.0.1:3000).
     pub fn new(pair_id: String, role: String) -> Result<Self> {
-        let relay_addr = std::env::var("A2A_RELAY_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+        let relay_addr =
+            std::env::var("A2A_RELAY_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
         let relay_url = format!("http://{}", relay_addr);
 
         let http_client = reqwest::Client::builder()
@@ -49,10 +50,7 @@ impl A2AClient {
             info!("A2A relay health check passed");
             Ok(())
         } else {
-            Err(anyhow!(
-                "A2A relay unhealthy: {}",
-                response.status()
-            ))
+            Err(anyhow!("A2A relay unhealthy: {}", response.status()))
         }
     }
 
@@ -67,7 +65,8 @@ impl A2AClient {
         });
 
         let url = format!("{}/rpc", self.relay_url);
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .json(&rpc_request)
             .send()
@@ -75,7 +74,7 @@ impl A2AClient {
             .context("Failed to send verify request to relay")?;
 
         let body: Value = response.json().await?;
-        
+
         // Parse JSON-RPC response
         if let Some(error) = body.get("error").and_then(|e| e.as_object()) {
             let msg = error
@@ -108,7 +107,8 @@ impl A2AClient {
         });
 
         let url = format!("{}/rpc", self.relay_url);
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&url)
             .json(&rpc_request)
             .send()
@@ -116,7 +116,7 @@ impl A2AClient {
             .context("Failed to get task status from relay")?;
 
         let body: Value = response.json().await?;
-        
+
         if let Some(error) = body.get("error").and_then(|e| e.as_object()) {
             let msg = error
                 .get("message")
@@ -142,7 +142,8 @@ impl A2AClient {
         });
 
         let url = format!("{}/rpc", self.relay_url);
-        let _response = self.http_client
+        let _response = self
+            .http_client
             .post(&url)
             .json(&rpc_request)
             .send()

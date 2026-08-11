@@ -2,8 +2,9 @@
 //! Integration and unit tests for the A2A relay (task 8).
 
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
-    use a2a_protocol::{VerifyExpect, VerifyKind, VerifyCwd, VerifyRequest};
+    use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyRequest};
 
     #[test]
     fn test_verify_request_idempotency_seed_is_stable() {

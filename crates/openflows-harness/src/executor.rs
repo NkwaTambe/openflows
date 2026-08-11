@@ -52,16 +52,11 @@ pub async fn execute_verify_task(
     let stderr = child.stderr.take().context("Failed to take stderr")?;
 
     // Run the command with timeout
-    let exit_status = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(timeout_secs),
-        async {
+    let exit_status =
+        match tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), async {
             // Read streams synchronously in blocking tasks
-            let stdout_reader = tokio::task::spawn_blocking(move || {
-                read_stream_sync(stdout)
-            });
-            let stderr_reader = tokio::task::spawn_blocking(move || {
-                read_stream_sync(stderr)
-            });
+            let stdout_reader = tokio::task::spawn_blocking(move || read_stream_sync(stdout));
+            let stderr_reader = tokio::task::spawn_blocking(move || read_stream_sync(stderr));
 
             // Wait for child to finish
             let status = child.wait().context("Failed to wait for child")?;
@@ -71,65 +66,62 @@ pub async fn execute_verify_task(
             let stderr_text = stderr_reader.await.context("Stderr reader task failed")??;
 
             Ok::<_, anyhow::Error>((status, stdout_text, stderr_text))
-        },
-    )
-    .await
-    {
-        Ok(Ok((status, stdout_text, stderr_text))) => {
-            (status, stdout_text, stderr_text, false)
-        }
-        Ok(Err(e)) => {
-            warn!(error = %e, "Command execution error");
-            return Err(e);
-        }
-        Err(_) => {
-            // Timeout occurred
-            warn!(task_id = %task_id, "Command timed out");
-            let _ = child.kill();
-            let _ = child.wait();
+        })
+        .await
+        {
+            Ok(Ok((status, stdout_text, stderr_text))) => (status, stdout_text, stderr_text, false),
+            Ok(Err(e)) => {
+                warn!(error = %e, "Command execution error");
+                return Err(e);
+            }
+            Err(_) => {
+                // Timeout occurred
+                warn!(task_id = %task_id, "Command timed out");
+                let _ = child.kill();
+                let _ = child.wait();
 
-            // Build timeout result
-            let result = VerifyResult {
-                task_id: task_id.clone(),
-                exit_code: None,
-                timed_out: true,
-                duration_ms: start.elapsed().as_millis() as u64,
-                stdout_ref: format!("audit:a2a:{}:stdout", task_id),
-                stderr_ref: format!("audit:a2a:{}:stderr", task_id),
-                artifacts: vec![],
-                executor: ExecutorInfo {
-                    role: "forge".to_string(),
-                    workspace: workspace_id.to_string(),
-                },
-            };
+                // Build timeout result
+                let result = VerifyResult {
+                    task_id: task_id.clone(),
+                    exit_code: None,
+                    timed_out: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    stdout_ref: format!("audit:a2a:{}:stdout", task_id),
+                    stderr_ref: format!("audit:a2a:{}:stderr", task_id),
+                    artifacts: vec![],
+                    executor: ExecutorInfo {
+                        role: "forge".to_string(),
+                        workspace: workspace_id.to_string(),
+                    },
+                };
 
-            // Store in Redis
-            let verification_key = format!("ns:{}:pair:{}:verification", tenant, pair_id);
-            let _: Result<(), _> = client
-                .set::<(), _, _>(
-                    &verification_key,
-                    serde_json::to_string(&result)?,
-                    None,
-                    None,
-                    false,
-                )
-                .await;
+                // Store in Redis
+                let verification_key = format!("ns:{}:pair:{}:verification", tenant, pair_id);
+                let _: Result<(), _> = client
+                    .set::<(), _, _>(
+                        &verification_key,
+                        serde_json::to_string(&result)?,
+                        None,
+                        None,
+                        false,
+                    )
+                    .await;
 
-            // Store timeout message in audit trail
-            let stderr_key = format!("ns:{}:audit:a2a:{}:stderr", tenant, task_id);
-            let _: Result<(), _> = client
-                .set::<(), _, _>(
-                    &stderr_key,
-                    format!("[TIMEOUT] Command exceeded {}s limit", timeout_secs),
-                    None,
-                    None,
-                    false,
-                )
-                .await;
+                // Store timeout message in audit trail
+                let stderr_key = format!("ns:{}:audit:a2a:{}:stderr", tenant, task_id);
+                let _: Result<(), _> = client
+                    .set::<(), _, _>(
+                        &stderr_key,
+                        format!("[TIMEOUT] Command exceeded {}s limit", timeout_secs),
+                        None,
+                        None,
+                        false,
+                    )
+                    .await;
 
-            return Ok(result);
-        }
-    };
+                return Ok(result);
+            }
+        };
 
     // Extract exit code
     let exit_code = if exit_status.0.success() {
@@ -182,13 +174,25 @@ pub async fn execute_verify_task(
     // Mirror result to Redis
     let verification_key = format!("ns:{}:pair:{}:verification", tenant, pair_id);
     let _: Result<(), _> = client
-        .set::<(), _, _>(&verification_key, serde_json::to_string(&result)?, None, None, false)
+        .set::<(), _, _>(
+            &verification_key,
+            serde_json::to_string(&result)?,
+            None,
+            None,
+            false,
+        )
         .await;
 
     // Store full result in audit trail
     let result_key = format!("ns:{}:audit:a2a:{}:result", tenant, task_id);
     let _: Result<(), _> = client
-        .set::<(), _, _>(&result_key, serde_json::to_string(&result)?, None, None, false)
+        .set::<(), _, _>(
+            &result_key,
+            serde_json::to_string(&result)?,
+            None,
+            None,
+            false,
+        )
         .await;
 
     info!(

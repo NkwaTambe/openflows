@@ -300,15 +300,22 @@ async fn main() -> Result<()> {
             store.gate_status(&ticket, &phase).await?;
         }
         Commands::Verify {
-            action: VerifyAction::Request {
-                argv,
-                timeout_secs,
-                expect_exit,
-                artifacts,
-            },
+            action:
+                VerifyAction::Request {
+                    argv,
+                    timeout_secs,
+                    expect_exit,
+                    artifacts,
+                },
         } => {
             store
-                .verify_request(&ticket, argv, timeout_secs, expect_exit, artifacts.as_deref())
+                .verify_request(
+                    &ticket,
+                    argv,
+                    timeout_secs,
+                    expect_exit,
+                    artifacts.as_deref(),
+                )
                 .await?;
         }
         Commands::Verify {

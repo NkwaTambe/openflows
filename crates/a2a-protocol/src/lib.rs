@@ -13,7 +13,7 @@ mod verify;
 
 pub use keys::{audit_rejected_key, audit_task_key, verification_key};
 pub use verify::{
-    ExecutorInfo, VerifyArtifact, VerifyExpect, VerifyKind, VerifyCwd, VerifyProgressEvent,
+    ExecutorInfo, VerifyArtifact, VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent,
     VerifyRequest, VerifyResult,
 };
 

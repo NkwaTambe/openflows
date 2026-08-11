@@ -178,7 +178,9 @@ async fn run_controller() -> Result<()> {
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
     // progress, result mirroring to Redis).
-    let _a2a_relay = match agent_nexus::a2a::start_a2a_relay(std::sync::Arc::new(store.clone())).await {
+    let _a2a_relay = match agent_nexus::a2a::start_a2a_relay(std::sync::Arc::new(store.clone()))
+        .await
+    {
         Ok(relay) => {
             tracing::info!("A2A relay started successfully");
             Some(relay)
@@ -382,18 +384,18 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     // keys below. (We must NOT also hand-format `ns:{name}:` prefixes here,
     // which would double the namespace to `ns:{name}:ns:{name}:...` and fail
     // to touch the real ticket keys.)
-    let store = match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(name.clone()))
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("  ✗ Redis error: {}", e);
-            return Ok(());
-        }
-    };
+    let store =
+        match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(name.clone()))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  ✗ Redis error: {}", e);
+                return Ok(());
+            }
+        };
 
-    let mut tickets: Vec<serde_json::Value> =
-        store.get_typed("tickets").await.unwrap_or_default();
+    let mut tickets: Vec<serde_json::Value> = store.get_typed("tickets").await.unwrap_or_default();
 
     let mut reset_count = 0;
 
@@ -427,9 +429,7 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     }
 
     if reset_count > 0 {
-        store
-            .set("tickets", serde_json::to_value(&tickets)?)
-            .await;
+        store.set("tickets", serde_json::to_value(&tickets)?).await;
         println!("  ✓ Reset {} ticket(s) to Open", reset_count);
     } else {
         println!("  (no stale tickets found)");
@@ -590,27 +590,21 @@ async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
     for t in &tenants {
         // Per-tenant scoped store: SharedStore namespaces keys with the
         // tenant, so read plain keys rather than hand-formatted `ns:{t}:` ones.
-        let store = match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(t.clone()))
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("  ⚠ Could not read tenant '{}': {}", t, e);
-                continue;
-            }
-        };
-        let tickets: Vec<config::Ticket> = store
-            .get_typed("tickets")
-            .await
-            .unwrap_or_default();
-        let slots: std::collections::HashMap<String, config::WorkerSlot> = store
-            .get_typed("worker_slots")
-            .await
-            .unwrap_or_default();
-        let pending_prs: Vec<serde_json::Value> = store
-            .get_typed("pending_prs")
-            .await
-            .unwrap_or_default();
+        let store =
+            match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(t.clone()))
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  ⚠ Could not read tenant '{}': {}", t, e);
+                    continue;
+                }
+            };
+        let tickets: Vec<config::Ticket> = store.get_typed("tickets").await.unwrap_or_default();
+        let slots: std::collections::HashMap<String, config::WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let pending_prs: Vec<serde_json::Value> =
+            store.get_typed("pending_prs").await.unwrap_or_default();
 
         let data = serde_json::json!({
             "tenant": t,

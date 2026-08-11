@@ -3,8 +3,8 @@
 //! All keys are prefixed with `ns:{tenant}:` for tenant isolation.
 //! All writes are validated against serde schemas from `config::state`.
 
+use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyRequest};
 use anyhow::{bail, Context, Result};
-use a2a_protocol::{VerifyExpect, VerifyKind, VerifyCwd, VerifyRequest};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -545,7 +545,7 @@ impl HarnessStore {
     ) -> Result<()> {
         // Create A2A client for this pair (ticket == pair_id in current design)
         let client = crate::a2a_client::A2AClient::new(ticket.to_string(), "sentinel".to_string())?;
-        
+
         // Health check first
         client.health_check().await?;
 
@@ -569,9 +569,11 @@ impl HarnessStore {
         };
 
         // Submit request to relay
-        let task_id = client.submit_verify_request(&request).await
+        let task_id = client
+            .submit_verify_request(&request)
+            .await
             .context("Failed to submit verify request")?;
-        
+
         info!(task_id = %task_id, pair_id = ticket, "Verify request submitted");
 
         // TODO (task 5.3): Poll for task completion or subscribe via SSE
@@ -590,19 +592,21 @@ impl HarnessStore {
         }
 
         let client = crate::a2a_client::A2AClient::new(ticket.to_string(), role.to_string())?;
-        
+
         // Health check
         client.health_check().await?;
 
         // Get workspace ID for audit trail
-        let workspace_id = std::env::var("CODER_WORKSPACE_ID")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let workspace_id =
+            std::env::var("CODER_WORKSPACE_ID").unwrap_or_else(|_| "unknown".to_string());
 
         // Get tenant for Redis namespacing
-        let tenant = std::env::var("OPENFLOWS_TENANT")
-            .context("OPENFLOWS_TENANT not set")?;
+        let tenant = std::env::var("OPENFLOWS_TENANT").context("OPENFLOWS_TENANT not set")?;
 
-        println!("✓ Forge verify executor ready (workspace: {}, ticket: {})", workspace_id, ticket);
+        println!(
+            "✓ Forge verify executor ready (workspace: {}, ticket: {})",
+            workspace_id, ticket
+        );
         println!("  Listening for tasks from nexus A2A relay...");
         println!("  - Commands are executed in sandbox with timeout enforcement");
         println!("  - Stdout/stderr captured and streamed");
@@ -620,7 +624,10 @@ impl HarnessStore {
         // For now, demonstrate executor capability with a sample invocation
         if let Ok(test_argv) = std::env::var("VERIFY_TEST_CMD") {
             println!("  [TEST MODE] Executing sample command: {}", test_argv);
-            let argv: Vec<String> = test_argv.split_whitespace().map(|s| s.to_string()).collect();
+            let argv: Vec<String> = test_argv
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect();
             match crate::executor::execute_verify_task(
                 &self.client,
                 &tenant,
@@ -632,9 +639,9 @@ impl HarnessStore {
             .await
             {
                 Ok(result) => {
-                    println!("  [TEST] Task completed: exit_code={:?}, duration={}ms",
-                        result.exit_code,
-                        result.duration_ms
+                    println!(
+                        "  [TEST] Task completed: exit_code={:?}, duration={}ms",
+                        result.exit_code, result.duration_ms
                     );
                 }
                 Err(e) => {
@@ -656,8 +663,9 @@ impl HarnessStore {
         if let Some(id) = pair_id {
             // List results for a specific pair
             let key = self.key(&format!("pair:{}:verification", id));
-            let json_result: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
-            
+            let json_result: Option<String> =
+                self.client.get(&key).await.context("Redis GET failed")?;
+
             match json_result {
                 Some(json) => {
                     // Parse and pretty-print
@@ -668,7 +676,7 @@ impl HarnessStore {
                         }
                         Err(e) => {
                             warn!(error = %e, "Failed to parse verification result");
-                            println!("(unparseable result: {})", json);
+                            println!("(unparsable result: {})", json);
                         }
                     }
                 }
