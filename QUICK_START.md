@@ -194,7 +194,7 @@ Another process or container already holds port 6379. Find the conflicting conta
 
 ### Controller not picking up issues
 
-1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name ,<my-team>`).
+1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
 2. Check the terminal running the controller for errors (locally) — or `tail -f /tmp/openflows-controller.log` in the production flow.
 3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
