@@ -142,7 +142,7 @@ Confirm the Docker services are healthy:
 docker compose ps
 ```
 
-A successful run shows Coder, Redis, and the controller all healthy, and the controller terminal streaming with sync/provisioning activity once you create an issue.
+A successful health check shows Coder and Redis healthy. Verify the controller separately by confirming that its foreground terminal remains running and streams sync/provisioning activity after you create an issue.
 
 > **On `/tmp/openflows-controller.log`:** That log file only exists in the **production** flow, where the controller runs inside a Nexus workspace and its startup script redirects output (`openflows run >/tmp/openflows-controller.log`). Locally, `prod.sh run` runs in the foreground — watch that terminal instead.
 
