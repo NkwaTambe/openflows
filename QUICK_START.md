@@ -89,14 +89,16 @@ This will:
 
 ---
 
-## Step 4 — Coder license, GitHub login & API token
+## Step 4 — Sign in, add a Coder license & get the API token
+
+The bootstrap script creates the initial Coder admin account. By default the credentials are:
 
 Override them with `CODER_ADMIN_USERNAME` / `CODER_ADMIN_EMAIL` / `CODER_ADMIN_PASSWORD` before running bootstrap.
 
 Then:
 
 1. Open **http://localhost:7080**
-2. **Sign in with GitHub only** — configure Coder to use **GitHub OAuth** as the login method (first-time only). Do not create a password-only account.
+2. **Sign in with the admin credentials above** (first-time only). The bundled Coder service authenticates with a username/password — it does **not** come with GitHub OAuth pre-configured. GitHub sign-in is only available if you manually configure a GitHub OAuth provider in Coder afterwards; it is not required to get started.
 3. **Add a Coder license** — create a license from your account at coder.com, then add it at **http://localhost:7080/deployment/licenses/add**. (Coder requires a valid license before some functionality is enabled. For local development you can use Coder's free/developer license — see <https://coder.com/docs/next/admin/licenses>.)
 4. Click your **username** (top-right corner) → **Account** → **Tokens**.
 5. Click **Create Token**, copy the token, and paste it into `.env` as:
