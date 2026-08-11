@@ -317,5 +317,9 @@ async fn handle_tasks_resubscribe(
 /// push-based delivery; returning 501 is harmless because no client depends
 /// on it yet.
 async fn handle_stream() -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "SSE streaming not yet implemented (task delivery uses tasks/claim polling)").into_response()
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        "SSE streaming not yet implemented (task delivery uses tasks/claim polling)",
+    )
+        .into_response()
 }
