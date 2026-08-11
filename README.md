@@ -91,15 +91,16 @@ You can override these before running bootstrap via the `CODER_ADMIN_USERNAME`, 
 Then get your API token so OpenFlows can authenticate to Coder:
 
 1. Open <http://localhost:7080>
-2. Sign in with the admin credentials above (first-time only)
-3. Click your **username** (top-right corner) → **Account** → **Tokens**
-4. Click **Create Token**
-5. Copy the token and paste it into `.env` as:
+2. **Sign in with GitHub only** — configure Coder to use GitHub OAuth as the login method (first-time only). Do not create a password-based account.
+3. **Add a Coder license** — create a license from your account at coder.com, then add it at <http://localhost:7080/deployment/licenses/add>
+4. Click your **username** (top-right corner) → **Account** → **Tokens**
+5. Click **Create Token**
+6. Copy the token and paste it into `.env` as:
    ```bash
    CODER_SESSION_TOKEN=cdr_your_token_here
    ```
 
-> **Creating a Coder license:** Coder requires a valid license before some functionality is enabled. In the Coder dashboard go to **Deploy** → **Licenses** and add a new license. For local development you can use Coder's free/developer license (see <https://coder.com/docs/next/admin/licenses>), or generate one from your Coder product account.
+> **Creating a Coder license:** Coder requires a valid license before some functionality is enabled. In the Coder dashboard go to **Deploy** → **Licenses** and add a new license, by pasting it into <http://localhost:7080/deployment/licenses/add>. For local development you can use Coder's free/developer license (see <https://coder.com/docs/next/admin/licenses>), or generate one from your Coder product account.
 
 #### 5. Add a tenant
 
