@@ -94,7 +94,7 @@ Then get your API token so OpenFlows can authenticate to Coder:
 2. Sign in with the admin credentials above (first-time only)
 3. Click your **username** (top-right corner) → **Account** → **Tokens**
 4. Click **Create Token**
-5. Copy the token (looks like `cdr_xxxxxxxxxxxx`) and paste it into `.env` as:
+5. Copy the token and paste it into `.env` as:
    ```bash
    CODER_SESSION_TOKEN=cdr_your_token_here
    ```
