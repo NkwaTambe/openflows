@@ -105,7 +105,7 @@ Then get your API token so OpenFlows can authenticate to Coder:
 #### 5. Add a tenant
 
 ```bash
-./scripts/prod.sh tenant owner/repo --name my-team
+./scripts/prod.sh tenant <owner/repo> --name <my-team>
 ```
 
 This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller. See [TOKEN_GUIDE.md](TOKEN_GUIDE.md) for the token acquisition walkthrough.
@@ -122,8 +122,8 @@ This **always** resets Redis to a clean slate, then starts the controller. Creat
 #### 7. Verify it's working
 
 ```bash
-# Watch the controller log in a separate terminal
-tail -f /tmp/openflows-controller.log
+# Check the controller log (use `tail -f` in a separate terminal to stream it live)
+tail -n 50 /tmp/openflows-controller.log
 
 # Health check
 ./scripts/prod.sh doctor
