@@ -8,18 +8,25 @@
 
 use super::routing::{A2ARelay, TaskState};
 use super::verify_handler::submit_verify_request;
-use a2a_protocol::{VerifyRequest, VerifyResult};
+use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::Context;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 /// JSON-RPC 2.0 request envelope (simplified for A2A).
@@ -125,6 +132,7 @@ async fn handle_rpc(
         "tasks/complete" => handle_tasks_complete(&state, &req.params).await,
         "tasks/cancel" => handle_tasks_cancel(&state, &req.params).await,
         "tasks/resubscribe" => handle_tasks_resubscribe(&state, &req.params).await,
+        "tasks/push_progress" => handle_tasks_progress(&state, &req.params).await,
         _ => {
             return JsonRpcResponse {
                 jsonrpc: "2.0".into(),
@@ -211,6 +219,7 @@ async fn handle_tasks_get(state: &A2AServerState, params: &Value) -> anyhow::Res
         TaskState::Pending => "pending",
         TaskState::Running => "running",
         TaskState::Completed => "completed",
+        TaskState::Cancelled => "cancelled",
     };
 
     let mut value = json!({
@@ -288,38 +297,147 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
 }
 
 /// tasks/cancel: Cancel a running task
-async fn handle_tasks_cancel(_state: &A2AServerState, _params: &Value) -> anyhow::Result<Value> {
-    // TODO: Extract task_id from params
-    // TODO: Signal executor to kill process
-
-    debug!("tasks/cancel: not yet implemented");
-    Ok(json!({"cancelled": true}))
-}
-
-/// tasks/resubscribe: Resume task after disconnect
-async fn handle_tasks_resubscribe(
-    _state: &A2AServerState,
-    _params: &Value,
-) -> anyhow::Result<Value> {
-    // TODO: Extract task_id from params
-    // TODO: Return buffered events since last ACK
-    // TODO: Restore SSE subscription
-
-    debug!("tasks/resubscribe: not yet implemented");
-    Ok(json!({"events": []}))
-}
-
-/// Server-Sent Events endpoint.
 ///
-/// v1 delivers verify tasks to Forge via pull (the `tasks/claim` /
-/// `tasks/complete` JSON-RPC methods), so this endpoint is not part of the
-/// delivery path. It is retained for streaming progress/results and future
-/// push-based delivery; returning 501 is harmless because no client depends
-/// on it yet.
-async fn handle_stream() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "SSE streaming not yet implemented (task delivery uses tasks/claim polling)",
-    )
-        .into_response()
+/// Sets the cancel flag on the task. For in-process executors (the current
+/// topology), the `verify serve` daemon checks this flag via the cancel token
+/// and kills the child process group when the flag is set.
+async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    let task_id = params
+        .get("task_id")
+        .and_then(|t| t.as_str())
+        .context("tasks/cancel requires string task_id")?;
+
+    // Mark the task as cancelled in the relay state
+    let newly_set = state.relay.mark_cancelled(task_id).await;
+
+    // Transition task state to Cancelled
+    if let Some(entry) = state.relay.get_task(task_id).await {
+        if entry.state == TaskState::Running || entry.state == TaskState::Pending {
+            // Build a synthetic cancelled result and complete the task
+            let cancelled_result = a2a_protocol::VerifyResult {
+                task_id: task_id.to_string(),
+                exit_code: None,
+                timed_out: false,
+                duration_ms: 0,
+                stdout_ref: format!("audit:a2a:{}:stdout", task_id),
+                stderr_ref: format!("audit:a2a:{}:stderr", task_id),
+                artifacts: vec![],
+                executor: a2a_protocol::ExecutorInfo {
+                    role: "forge".to_string(),
+                    workspace: format!("unknown-{}", entry.request.pair_id),
+                },
+            };
+            let _ = state.relay.complete_task(task_id, cancelled_result).await;
+        }
+        debug!(
+            task_id,
+            state = ?entry.state,
+            "Cancel signal sent to task"
+        );
+    }
+
+    Ok(json!({
+        "task_id": task_id,
+        "cancelled": newly_set
+    }))
+}
+
+/// tasks/resubscribe: Resume SSE subscription after disconnect
+///
+/// `params: { "task_id": "...", "last_event_id": 42 }` → returns buffered
+/// events since that sequence number. The caller then reconnects to the SSE
+/// endpoint to receive live events.
+async fn handle_tasks_resubscribe(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    let task_id = params
+        .get("task_id")
+        .and_then(|t| t.as_str())
+        .context("tasks/resubscribe requires string task_id")?;
+
+    let last_event_id = params
+        .get("last_event_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let events = state
+        .relay
+        .replay_events_since(task_id, last_event_id)
+        .await;
+    let current_seq = state.relay.current_event_seq(task_id).await;
+
+    Ok(json!({
+        "task_id": task_id,
+        "events": events,
+        "current_seq": current_seq,
+        "event_count": events.len()
+    }))
+}
+
+/// tasks/push_progress: Forge pushes a progress chunk to the relay
+///
+/// `params: { "task_id": "...", "stream": "stdout", "chunk": "..." }`
+/// The relay buffers the event and broadcasts it to SSE subscribers.
+async fn handle_tasks_progress(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
+    let task_id = params
+        .get("task_id")
+        .and_then(|t| t.as_str())
+        .context("tasks/push_progress requires string task_id")?;
+
+    let event: VerifyProgressEvent = serde_json::from_value(params.clone())
+        .context("tasks/push_progress requires valid VerifyProgressEvent params")?;
+
+    let buffered = state.relay.push_progress_event(task_id, event).await?;
+
+    Ok(json!({
+        "task_id": task_id,
+        "seq": buffered.seq
+    }))
+}
+
+/// Server-Sent Events endpoint for progress streaming.
+///
+/// Query params: `?task_id=<uuid>`
+/// Returns an SSE stream of `VerifyProgressEvent` chunks as the task executes.
+/// On connect, replays any buffered events for the task, then streams live
+/// events until the task completes or the client disconnects.
+async fn handle_stream(
+    State(state): State<A2AServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_id = match params.get("task_id") {
+        Some(id) if !id.is_empty() => id.clone(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Missing or empty task_id query parameter",
+            )
+                .into_response();
+        }
+    };
+
+    // 1. Replay buffered events
+    let buffered = state.relay.replay_events_since(&task_id, 0).await;
+
+    // 2. Subscribe to live broadcast
+    let rx = state.relay.subscribe_to_task(&task_id).await;
+    let broadcast_stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => Some(event),
+        Err(_) => None,
+    });
+
+    // 3. Chain: buffered events first, then live broadcast
+    let replay_stream = stream::iter(buffered);
+    let combined = replay_stream.chain(broadcast_stream);
+
+    // 4. Map to SSE events
+    let sse_stream = combined.map(|event| {
+        let data = serde_json::to_string(&event.event).unwrap_or_default();
+        Ok::<_, Infallible>(
+            Event::default()
+                .data(data)
+                .event("progress")
+                .id(event.seq.to_string()),
+        )
+    });
+
+    Sse::new(sse_stream).into_response()
 }

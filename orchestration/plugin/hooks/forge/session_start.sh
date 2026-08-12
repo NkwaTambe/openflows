@@ -73,8 +73,8 @@ echo ""
 
 echo -e "${BOLD}Workflow:${NC}"
 cat <<'EOF'
-  1. planning  → Review the task and plan the approach
-  2. building  → Implement the solution
+  1. planning  → Review the task, write PLAN.md, set planning, then wait for SENTINEL
+  2. building  → After SENTINEL approval, implement the solution
   3. testing   → Run tests and verify the solution works
   4. review_ready → PR is open and ready for review
   5. blocked   → Stuck? Use this to pause and explain
@@ -86,7 +86,11 @@ Example flow:
   $ # Read the dispatch to understand the task
   $ openflows-harness dispatch read
 
-  $ # Start building
+  $ # Write the implementation plan, then request SENTINEL planning review
+  $ $EDITOR PLAN.md
+  $ openflows-harness status set planning
+
+  $ # After SENTINEL approves the planning gate, start building
   $ openflows-harness status set building
   $ # ...implement...
 

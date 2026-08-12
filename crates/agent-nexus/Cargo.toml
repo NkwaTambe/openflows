@@ -25,3 +25,5 @@ url = { workspace = true }
 axum = { version = "0.8", features = ["http1"] }
 uuid = { version = "1.0", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }

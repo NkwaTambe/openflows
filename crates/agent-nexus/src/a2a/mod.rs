@@ -23,7 +23,7 @@ mod verify_handler;
 mod tests;
 
 pub use http_server::create_router;
-pub use routing::{A2ARelay, A2ASession, TaskEntry};
+pub use routing::{A2ARelay, A2ASession, BufferedEvent, EventBuffer, TaskEntry, TaskState};
 pub use verify_handler::submit_verify_request;
 
 use anyhow::Result;

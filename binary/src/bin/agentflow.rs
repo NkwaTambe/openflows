@@ -178,7 +178,7 @@ async fn run_controller() -> Result<()> {
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
     // progress, result mirroring to Redis).
-    let _a2a_relay = match agent_nexus::a2a::start_a2a_relay(std::sync::Arc::new(store.clone()))
+    let a2a_relay = match agent_nexus::a2a::start_a2a_relay(std::sync::Arc::new(store.clone()))
         .await
     {
         Ok(relay) => {
@@ -209,10 +209,11 @@ async fn run_controller() -> Result<()> {
 
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
-    let nexus = std::sync::Arc::new(openflows::nodes::NexusNode::new(
-        nexus_persona,
-        registry_path.clone(),
-    ));
+    let mut nexus_node = openflows::nodes::NexusNode::new(nexus_persona, registry_path.clone());
+    if let Some(ref relay) = a2a_relay {
+        nexus_node = nexus_node.with_a2a_relay(relay.clone());
+    }
+    let nexus = std::sync::Arc::new(nexus_node);
     let forge_pair = std::sync::Arc::new(openflows::nodes::ForgePairNode::new_with_registry(
         &orch_dir,
         registry_path.clone(),

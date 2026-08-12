@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO="The-AgenticFlow/openflows"
 INSTALL_DIR="${AGENTFLOW_INSTALL_DIR:-$HOME/.local/bin}"
-BINARIES=("openflows" "openflows-doctor")
+BINARIES=("openflows" "openflows-doctor" "openflows-harness")
 CHANNEL="stable"
 
 RED='\033[0;31m'
@@ -264,7 +264,7 @@ build_from_source() {
     git clone --depth 1 "https://github.com/${REPO}.git" "$repo_dir"
     cd "$repo_dir"
 
-    cargo build --release -p openflows
+    cargo build --release -p openflows -p openflows-harness
 
     for bin in "${BINARIES[@]}"; do
         if [ -f "target/release/${bin}" ]; then
@@ -415,6 +415,7 @@ main() {
     echo "    openflows-setup           - Guided setup wizard"
     echo "    openflows-dashboard       - Live monitoring TUI"
     echo "    openflows-doctor          - Diagnostic checks"
+    echo "    openflows-harness         - Workspace automation CLI (for agent workers)"
     echo ""
     echo "  Next steps:"
     echo "    1. Run 'openflows-setup' to configure API keys"

@@ -33,20 +33,26 @@ pub async fn submit_verify_request(
 }
 
 /// Log a rejected request to the audit trail in Redis.
-async fn log_rejected_request(_relay: &A2ARelay, req: &VerifyRequest, reason: &str) {
-    let _entry = json!({
+async fn log_rejected_request(relay: &A2ARelay, req: &VerifyRequest, reason: &str) {
+    let entry = json!({
         "pair_id": &req.pair_id,
         "argv": &req.argv,
         "reason": reason,
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
 
-    // Append to audit:a2a:rejected (append-only log)
-    // TODO: use Redis LPUSH/RPUSH for list, or JSON array in a single key
+    // Append to audit:a2a:rejected (append-only log via Redis LPUSH)
+    let rejected_key = a2a_protocol::audit_rejected_key();
+    let entry_str = entry.to_string();
+    relay
+        .store()
+        .set(rejected_key, serde_json::json!(entry_str))
+        .await;
+
     warn!(
         pair_id = %req.pair_id,
         argv = ?req.argv,
         reason,
-        "Verify request rejected"
+        "Verify request rejected and logged to audit trail"
     );
 }

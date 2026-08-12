@@ -5,7 +5,7 @@
 //! The client is a thin wrapper around reqwest that handles JSON-RPC
 //! envelope format expected by the A2A relay.
 
-use a2a_protocol::{VerifyRequest, VerifyResult};
+use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -266,5 +266,106 @@ impl A2AClient {
 
         debug!(task_id = %task_id, "Task cancellation sent");
         Ok(())
+    }
+
+    /// Push a progress event to the relay (Forge executor side).
+    /// Streams stdout/stderr chunks in real-time during execution.
+    pub async fn push_progress(&self, task_id: &str, event: &VerifyProgressEvent) -> Result<()> {
+        let rpc_request = json!({
+            "jsonrpc": "2.0",
+            "method": "tasks/push_progress",
+            "params": {
+                "task_id": task_id,
+                "stream": "stdout",
+                "chunk": "",
+            },
+            "id": uuid::Uuid::new_v4().to_string(),
+        });
+
+        // Merge the progress event fields into params
+        let mut rpc = rpc_request;
+        if let Some(obj) = rpc.get_mut("params").and_then(|p| p.as_object_mut()) {
+            if let Ok(event_val) = serde_json::to_value(event) {
+                if let Some(event_obj) = event_val.as_object() {
+                    for (k, v) in event_obj {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        let url = format!("{}/rpc", self.relay_url);
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&rpc)
+            .send()
+            .await
+            .context("Failed to push progress event")?;
+
+        let _body: Value = response.json().await?;
+        debug!(task_id = %task_id, "Progress event pushed");
+        Ok(())
+    }
+
+    /// Subscribe to SSE progress events for a task (Sentinel side).
+    /// Spawns a background task that reads the SSE stream and forwards events
+    /// to the returned `UnboundedReceiver`. The caller can await on this
+    /// receiver to get progress events as they arrive.
+    pub async fn subscribe_sse(
+        &self,
+        task_id: &str,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<VerifyProgressEvent>> {
+        let url = format!("{}/?task_id={}", self.relay_url, task_id);
+
+        let response = self
+            .http_client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to connect to SSE stream")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(anyhow!("SSE connection failed with status {}", status));
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<VerifyProgressEvent>();
+        let task_id_owned = task_id.to_string();
+
+        // Spawn a background reader task that parses SSE events
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(error = %e, task_id = %task_id_owned, "SSE stream error");
+                        break;
+                    }
+                };
+
+                let text = String::from_utf8_lossy(&chunk);
+                let mut last_data: Option<String> = None;
+
+                for line in text.lines() {
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        last_data = Some(data.to_string());
+                    } else if let Some(data) = line.strip_prefix("data:") {
+                        last_data = Some(data.to_string());
+                    }
+                }
+
+                if let Some(data) = last_data {
+                    if let Ok(event) = serde_json::from_str::<VerifyProgressEvent>(&data) {
+                        let _ = tx.send(event);
+                    }
+                }
+            }
+            debug!(task_id = %task_id_owned, "SSE stream ended");
+        });
+
+        Ok(rx)
     }
 }

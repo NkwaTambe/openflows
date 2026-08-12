@@ -5,13 +5,14 @@
 //! `(pair_id, role)`. Routes verify requests from Sentinel to the
 //! corresponding Forge executor.
 
-use a2a_protocol::{VerifyRequest, VerifyResult};
+use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::{anyhow, Result};
 use pocketflow_core::SharedStore;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, warn};
 
 /// A2A relay session for a single connected workspace. Holds task queue
@@ -35,6 +36,102 @@ pub enum TaskState {
     Running,
     /// Forge submitted a terminal result; mirrored to Redis.
     Completed,
+    /// Cancelled by Sentinel or Forge.
+    Cancelled,
+}
+
+/// A single buffered progress event with sequence number (for resubscribe).
+#[derive(Debug, Clone, Serialize)]
+pub struct BufferedEvent {
+    pub seq: u64,
+    pub event: VerifyProgressEvent,
+    pub timestamp: i64,
+}
+
+/// Bounded event buffer per task (max 1000 events or ~1 MiB, whichever smaller).
+/// Eviction is FIFO.
+#[derive(Debug, Clone)]
+pub struct EventBuffer {
+    events: VecDeque<BufferedEvent>,
+    next_seq: u64,
+    max_events: usize,
+    max_bytes: usize,
+    current_bytes: usize,
+}
+
+impl EventBuffer {
+    const MAX_EVENTS: usize = 1000;
+    const MAX_BYTES: usize = 1_048_576; // 1 MiB
+
+    pub fn new() -> Self {
+        Self {
+            events: VecDeque::with_capacity(Self::MAX_EVENTS),
+            next_seq: 0,
+            max_events: Self::MAX_EVENTS,
+            max_bytes: Self::MAX_BYTES,
+            current_bytes: 0,
+        }
+    }
+
+    /// Push a progress event into the buffer, evicting oldest events if
+    /// capacity is exceeded.
+    pub fn push(&mut self, event: VerifyProgressEvent) -> BufferedEvent {
+        let event_size = serde_json::to_string(&event).map(|s| s.len()).unwrap_or(0);
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        let buffered = BufferedEvent {
+            seq,
+            event,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+
+        self.events.push_back(buffered.clone());
+        self.current_bytes += event_size;
+
+        // Evict FIFO while over capacity
+        while self.events.len() > self.max_events || self.current_bytes > self.max_bytes {
+            if let Some(evicted) = self.events.pop_front() {
+                let evicted_size = serde_json::to_string(&evicted.event)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                self.current_bytes = self.current_bytes.saturating_sub(evicted_size);
+            }
+        }
+
+        buffered
+    }
+
+    /// Return all events with seq >= `last_seq`.
+    /// Pass `last_seq = 0` to get all events (event sequence numbers start at 0).
+    pub fn events_since(&self, last_seq: u64) -> Vec<BufferedEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.seq >= last_seq)
+            .cloned()
+            .collect()
+    }
+
+    /// Current highest sequence number (0 if no events).
+    pub fn current_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
+    /// Maximum number of events the buffer can hold before FIFO eviction.
+    pub fn max_events(&self) -> usize {
+        self.max_events
+    }
+
+    /// Maximum bytes the buffer can hold before FIFO eviction.
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
+impl Default for EventBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Pair-scoped task entry, keyed by idempotency hash.
@@ -46,7 +143,6 @@ pub struct TaskEntry {
     pub requester: String,
     pub state: TaskState,
     pub result: Option<VerifyResult>,
-    // TODO: progress channel for streaming back to Sentinel
 }
 
 /// Central A2A relay hosted by nexus. Manages pair-scoped routing,
@@ -61,6 +157,12 @@ pub struct A2ARelay {
     // idempotency_key → task_id (dedup: (pair_id, sha256(request_body)))
     // TODO: add TTL or bounded eviction
     idempotency: Arc<Mutex<HashMap<String, String>>>,
+    // task_id → progress event buffer (for resubscribe / SSE replay)
+    event_buffers: Arc<Mutex<HashMap<String, EventBuffer>>>,
+    // task_id → broadcast sender for real-time progress streaming
+    broadcast_senders: Arc<RwLock<HashMap<String, broadcast::Sender<BufferedEvent>>>>,
+    // task_id → cancel flag (set by tasks/cancel)
+    cancel_tokens: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl A2ARelay {
@@ -71,6 +173,9 @@ impl A2ARelay {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            event_buffers: Arc::new(Mutex::new(HashMap::new())),
+            broadcast_senders: Arc::new(RwLock::new(HashMap::new())),
+            cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -197,6 +302,18 @@ impl A2ARelay {
             .await
             .insert(idempotency_key, task_id.clone());
 
+        // Initialize event buffer and broadcast channel for this task
+        self.event_buffers
+            .lock()
+            .await
+            .entry(task_id.clone())
+            .or_default();
+        let (tx, _) = broadcast::channel(256);
+        self.broadcast_senders
+            .write()
+            .await
+            .insert(task_id.clone(), tx);
+
         debug!(
             task_id = %task_id,
             pair_id = %req.pair_id,
@@ -303,6 +420,108 @@ impl A2ARelay {
                 None
             }
         }
+    }
+
+    // ── Progress streaming (SSE) ────────────────────────────────────────────
+
+    /// Push a progress event for a task. Buffers it for resubscribe and
+    /// broadcasts to SSE subscribers.
+    pub async fn push_progress_event(
+        &self,
+        task_id: &str,
+        event: VerifyProgressEvent,
+    ) -> Result<BufferedEvent> {
+        // Buffer the event
+        let mut buffers = self.event_buffers.lock().await;
+        let buffer = buffers.entry(task_id.to_string()).or_default();
+        let buffered = buffer.push(event);
+
+        // Broadcast to SSE subscribers
+        if let Some(tx) = self.broadcast_senders.read().await.get(task_id) {
+            let _ = tx.send(buffered.clone());
+        }
+
+        debug!(
+            task_id,
+            seq = buffered.seq,
+            "Progress event buffered and broadcast"
+        );
+        Ok(buffered)
+    }
+
+    /// Get a broadcast receiver for real-time SSE streaming of a task's
+    /// progress events. Creates a new broadcast channel if one does not
+    /// exist for the task.
+    pub async fn subscribe_to_task(&self, task_id: &str) -> broadcast::Receiver<BufferedEvent> {
+        let senders = self.broadcast_senders.read().await;
+        if let Some(tx) = senders.get(task_id) {
+            return tx.subscribe();
+        }
+        drop(senders);
+
+        // Create new broadcast channel
+        let mut senders = self.broadcast_senders.write().await;
+        let (tx, rx) = broadcast::channel(256);
+        senders.insert(task_id.to_string(), tx);
+        rx
+    }
+
+    /// Replay buffered events for a task since a given sequence number.
+    /// Returns empty vec if the task has no buffer.
+    pub async fn replay_events_since(&self, task_id: &str, last_seq: u64) -> Vec<BufferedEvent> {
+        let buffers = self.event_buffers.lock().await;
+        match buffers.get(task_id) {
+            Some(buffer) => buffer.events_since(last_seq),
+            None => vec![],
+        }
+    }
+
+    /// Get the current event buffer sequence number (0 if no events).
+    pub async fn current_event_seq(&self, task_id: &str) -> u64 {
+        let buffers = self.event_buffers.lock().await;
+        buffers.get(task_id).map(|b| b.current_seq()).unwrap_or(0)
+    }
+
+    // ── Cancel ──────────────────────────────────────────────────────────────
+
+    /// Set the cancel flag for a task. Returns true if the flag was newly
+    /// set, false if it was already set or the task has no cancel token.
+    pub async fn mark_cancelled(&self, task_id: &str) -> bool {
+        let mut tokens = self.cancel_tokens.lock().await;
+        match tokens.get(task_id) {
+            Some(flag) => {
+                let already = flag.swap(true, Ordering::SeqCst);
+                !already
+            }
+            None => {
+                // Create a new flag (for tasks where claim hasn't happened yet)
+                tokens.insert(task_id.to_string(), Arc::new(AtomicBool::new(true)));
+                true
+            }
+        }
+    }
+
+    /// Create a cancel token for a task (called by executor when claiming).
+    pub async fn create_cancel_token(&self, task_id: &str) -> Arc<AtomicBool> {
+        let mut tokens = self.cancel_tokens.lock().await;
+        tokens
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// Check if a task has been cancelled.
+    pub async fn is_cancelled(&self, task_id: &str) -> bool {
+        let tokens = self.cancel_tokens.lock().await;
+        match tokens.get(task_id) {
+            Some(flag) => flag.load(Ordering::SeqCst),
+            None => false,
+        }
+    }
+
+    /// Get a reference to the shared store.
+    pub fn store(&self) -> &Arc<SharedStore> {
+        &self.store
     }
 
     /// List all active sessions (for inspection/monitoring).

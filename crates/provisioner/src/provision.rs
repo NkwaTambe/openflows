@@ -40,26 +40,39 @@ impl Provisioner {
         }
 
         // 1. Provision skills
-        for skill_name in &entry.skills {
-            let skill_dir = self
-                .orchestrator_dir
-                .join("orchestration")
-                .join("plugin")
-                .join("skills")
-                .join(skill_name);
+        // Try to create .agents/skills directory first, proceed without skills if permission denied.
+        // This allows role provisioning to continue even if workspace lacks home directory write access.
+        let skills_dir = ".agents/skills";
 
-            let skill_md = skill_dir.join("SKILL.md");
-            if skill_md.exists() {
-                let target = format!(".agents/skills/{}/SKILL.md", skill_name);
-                transport
-                    .create_dir_all(&format!(".agents/skills/{}", skill_name))
-                    .await?;
-                transport.copy_file(&skill_md, &target).await.map_err(|e| {
-                    anyhow::anyhow!("Failed to provision skill {}: {}", skill_name, e)
-                })?;
-                info!(skill = skill_name, role, "Provisioned skill");
+        if let Err(e) = transport.create_dir_all(skills_dir).await {
+            // Permission denied is common in sandboxed workspaces - log and continue without skills
+            if e.to_string().contains("Permission denied") || e.to_string().contains("mkdir") {
+                warn!(role, skills_dir, error = %e, "Cannot create .agents/skills directory - skills will not be provisioned. Ensure workspace has write access to home directory.");
             } else {
-                warn!(skill = skill_name, "Skill directory not found — skipping");
+                warn!(role, skills_dir, error = %e, "Failed to create skills directory - continuing without skills");
+            }
+        } else {
+            // Successfully created directory, now provision each skill
+            for skill_name in &entry.skills {
+                let skill_dir = self
+                    .orchestrator_dir
+                    .join("orchestration")
+                    .join("plugin")
+                    .join("skills")
+                    .join(skill_name);
+
+                let skill_md = skill_dir.join("SKILL.md");
+                if skill_md.exists() {
+                    let target = format!("{}/{}/SKILL.md", skills_dir, skill_name);
+                    match transport.copy_file(&skill_md, &target).await {
+                        Ok(_) => info!(skill = skill_name, role, "Provisioned skill"),
+                        Err(e) => {
+                            warn!(skill = skill_name, role, error = %e, "Failed to copy skill file - continuing");
+                        }
+                    }
+                } else {
+                    warn!(skill = skill_name, "Skill directory not found — skipping");
+                }
             }
         }
 

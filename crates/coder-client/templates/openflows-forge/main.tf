@@ -16,8 +16,8 @@ variable "dev_binary_host_path" {
 
 variable "harness_version" {
   type        = string
-  default     = "1.1.8"
-  description = "openflows-harness binary version to download"
+  default     = "harness-edge"
+  description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
 }
 
 variable "a2a_relay_addr" {
@@ -92,12 +92,25 @@ resource "coder_agent" "main" {
       # REQUIRED — without it the agent cannot coordinate (dispatch/status/
       # heartbeat), so a missing harness must fail the startup script loudly
       # instead of leaving a silently uncoordinated workspace.
-      HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/v${var.harness_version}/openflows-harness-v${var.harness_version}-x86_64-unknown-linux-musl"
-      log "Downloading openflows-harness v${var.harness_version}..."
+      HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
+      if [ "${var.harness_version}" = "harness-edge" ]; then
+        HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/harness-edge/${HARNESS_ASSET}"
+        log "Downloading openflows-harness (harness-edge/latest build)..."
+      else
+        HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/${var.harness_version}/${HARNESS_ASSET}"
+        log "Downloading openflows-harness v${var.harness_version}..."
+      fi
       for attempt in 1 2 3; do
-        if curl -fsSL --retry 3 "$HARNESS_URL" -o /tmp/openflows-harness; then
-          sudo mv /tmp/openflows-harness "$HARNESS_BIN"
-          sudo chmod +x "$HARNESS_BIN"
+        if curl -fsSL --retry 3 "$HARNESS_URL" -o /tmp/openflows-harness.tar.gz; then
+          tar -xzf /tmp/openflows-harness.tar.gz -C /tmp/ || { log "FATAL: failed to extract harness tarball"; exit 1; }
+          HARNESS_DIR=$(find /tmp/ -maxdepth 1 -type d -name "openflows-harness-*" 2>/dev/null | head -1)
+          if [ -n "$HARNESS_DIR" ] && [ -f "$HARNESS_DIR/openflows-harness" ]; then
+            sudo mv "$HARNESS_DIR/openflows-harness" "$HARNESS_BIN"
+            sudo chmod +x "$HARNESS_BIN"
+            rm -rf /tmp/openflows-harness.tar.gz "$HARNESS_DIR"
+          else
+            log "FATAL: could not find harness binary in extracted tarball"; exit 1
+          fi
           break
         fi
         log "Harness download attempt $attempt failed; retrying in 5s..."

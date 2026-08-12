@@ -42,8 +42,8 @@ variable "coder_url" {
 
 variable "harness_version" {
   type        = string
-  default     = "1.1.8"
-  description = "openflows-harness binary version to download"
+  default     = "harness-edge"
+  description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
 }
 
 variable "a2a_relay_addr" {
@@ -95,13 +95,55 @@ resource "coder_agent" "main" {
       git clone ${var.repo_url} /home/coder/workspace 2>/dev/null || true
     fi
 
-    # Download and install openflows-harness (checksum-verified from GitHub release)
-    HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/v${var.harness_version}/openflows-harness-v${var.harness_version}-x86_64-unknown-linux-musl"
+    # Download and install openflows-harness from GitHub releases.
+    # The harness is REQUIRED for session coordination (dispatch/status/heartbeat,
+    # A2A verify requests), so a missing harness must fail loudly — a silently
+    # uncoordinated workspace is worse than a startup error.
+    # TEMPORARY: Use mounted dev binaries for local testing when available.
     HARNESS_BIN="/usr/local/bin/openflows-harness"
-    echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness v${var.harness_version}..." >&2
-    curl -fsSL "$HARNESS_URL" -o "$HARNESS_BIN" && chmod +x "$HARNESS_BIN" || {
-      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] WARNING: Failed to download openflows-harness — agent will not be able to coordinate" >&2
-    }
+    if [ -f /opt/openflows-dev/openflows-harness ]; then
+      log "Using mounted dev harness binary..."
+      sudo cp /opt/openflows-dev/openflows-harness "$HARNESS_BIN"
+      sudo chmod +x "$HARNESS_BIN"
+    else
+      # Construct download URL based on harness_version:
+      #   harness-edge  → harness-edge pre-release (auto-updated on every main push)
+      #   v1.2.0       → tagged feature release (stable, audited)
+      # Asset naming: both tracks use fixed filename openflows-harness-x86_64-unknown-linux-musl.tar.gz
+      # which GitHub auto-replaces on re-upload with the same name.
+      HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
+      if [ "${var.harness_version}" = "harness-edge" ]; then
+        HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/harness-edge/${HARNESS_ASSET}"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness (harness-edge/latest build)..." >&2
+      else
+        HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/${var.harness_version}/${HARNESS_ASSET}"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness v${var.harness_version}..." >&2
+      fi
+      for attempt in 1 2 3; do
+        if curl -fsSL --retry 3 "$HARNESS_URL" -o /tmp/openflows-harness; then
+          tar -xzf /tmp/openflows-harness -C /tmp/ || {
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: failed to extract harness tarball" >&2
+            exit 1
+          }
+          HARNESS_DIR=$(find /tmp/ -maxdepth 1 -type d -name "openflows-harness-*" 2>/dev/null | head -1)
+          if [ -n "$HARNESS_DIR" ] && [ -f "$HARNESS_DIR/openflows-harness" ]; then
+            sudo mv "$HARNESS_DIR/openflows-harness" "$HARNESS_BIN"
+            sudo chmod +x "$HARNESS_BIN"
+            rm -rf /tmp/openflows-harness "$HARNESS_DIR"
+          else
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: could not find harness binary in extracted tarball" >&2
+            exit 1
+          fi
+          break
+        fi
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Harness download attempt $attempt failed; retrying in 5s..." >&2
+        sleep 5
+      done
+    fi
+    if [ ! -x "$HARNESS_BIN" ]; then
+      echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: openflows-harness could not be installed — agent will not be able to coordinate; failing startup" >&2
+      exit 1
+    fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace)
     export REDIS_URL="${var.redis_url}"

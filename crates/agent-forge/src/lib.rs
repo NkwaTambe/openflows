@@ -122,10 +122,10 @@ impl ForgePairNode {
                         role, "Chat waiting with chat_action=completed|null — forge work done"
                     );
                 }
-                Some("interrupted") => {
+                Some("interrupted") | Some("resume_needed") | Some("resume_failed") => {
                     info!(
                         ticket_id,
-                        role, "Chat waiting after interruption — needs recovery"
+                        role, "Chat waiting after interruption/error — needs same-session resume"
                     );
                 }
                 Some("created") | Some("follow_up_sent") => {
@@ -139,8 +139,11 @@ impl ForgePairNode {
                 _ => {}
             },
             ChatStatus::Error => {
-                warn!(ticket_id, role, "Forge chat entered error status");
-                store.set(&action_key, json!("interrupted")).await;
+                warn!(
+                    ticket_id,
+                    role, "Forge chat entered error status — preserving session for retry"
+                );
+                store.set(&action_key, json!("resume_needed")).await;
             }
             ChatStatus::RequiresAction => {
                 info!(
@@ -156,45 +159,28 @@ impl ForgePairNode {
 
     /// Read the harness-written status for a ticket.
     /// Returns the phase if set (planning, building, testing, review_ready, blocked).
+    ///
+    /// NOTE: the harness writes the status as a JSON *object*
+    /// (`{ "phase": ..., "role": ..., "ts": ... }`), so we deserialize it
+    /// directly into `HarnessStatus` via `store.get_typed`. Deserialising
+    /// through `get_typed::<String>` fails — an object cannot be decoded into
+    /// a `String` — which used to make this always return `None`, so FORGE
+    /// never detected the `planning`/`review_ready` phases and SENTINEL was
+    /// never spawned via the planning-gate routing.
     async fn read_harness_status(store: &SharedStore, ticket_id: &str) -> Option<HarnessStatus> {
         let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
-        let status_json: Option<String> = store.get_typed(&status_key).await;
-
-        if let Some(json_str) = status_json {
-            // Try parsing as HarnessStatus struct first
-            if let Ok(status) = serde_json::from_str::<HarnessStatus>(&json_str) {
-                return Some(status);
-            }
-            // Fallback: maybe it's just a plain JSON object
-            if let Ok(obj) = serde_json::from_str::<Value>(&json_str) {
-                if let Some(phase) = obj.get("phase").and_then(|v| v.as_str()) {
-                    return Some(HarnessStatus {
-                        phase: phase.to_string(),
-                        role: obj
-                            .get("role")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("forge")
-                            .to_string(),
-                        ts: obj.get("ts").and_then(|v| v.as_u64()).unwrap_or(0),
-                    });
-                }
-            }
-        }
-        None
+        store.get_typed(&status_key).await
     }
 
     /// Read the harness-written PR info for a ticket.
     /// This is written when the agent calls `openflows-harness pr opened`.
+    ///
+    /// Like `read_harness_status`, the PR payload is stored as a JSON object,
+    /// so we deserialize directly into `HarnessPrInfo` rather than through
+    /// `get_typed::<String>` (which always failed to decode an object).
     async fn read_harness_pr_info(store: &SharedStore, ticket_id: &str) -> Option<HarnessPrInfo> {
         let pr_key = full_ticket_key_flat(ticket_id, "pr");
-        let pr_json: Option<String> = store.get_typed(&pr_key).await;
-
-        if let Some(json_str) = pr_json {
-            if let Ok(pr_info) = serde_json::from_str::<HarnessPrInfo>(&json_str) {
-                return Some(pr_info);
-            }
-        }
-        None
+        store.get_typed(&pr_key).await
     }
 
     /// Sync harness-written PR info to the global pending_prs list.
@@ -383,7 +369,7 @@ impl BatchNode for ForgePairNode {
 
                         // Only emit a full diagnostic warn when this is the first time we
                         // are seeing this chat in error state. Once chat_action is already
-                        // set to "interrupted", we have already processed it and every
+                        // set to a resume marker, we have already processed it and every
                         // subsequent poll would re-log the same stale data — degrade to
                         // debug to keep logs actionable.
                         if matches!(status, ChatStatus::Error) {
@@ -392,7 +378,15 @@ impl BatchNode for ForgePairNode {
                             let last_action: Option<String> = store.get_typed(&action_key).await;
                             let first_sighting = last_action
                                 .as_deref()
-                                .map(|a| !matches!(a, "interrupted" | "first_error_logged"))
+                                .map(|a| {
+                                    !matches!(
+                                        a,
+                                        "interrupted"
+                                            | "resume_needed"
+                                            | "resume_failed"
+                                            | "first_error_logged"
+                                    )
+                                })
                                 .unwrap_or(true);
 
                             if first_sighting {
@@ -426,7 +420,7 @@ impl BatchNode for ForgePairNode {
                                     last_message_id = last_message_id,
                                     last_message_role = last_message_role,
                                     last_message_bytes = last_message_bytes,
-                                    "Forge chat entered error state — will be re-provisioned automatically"
+                                    "Forge chat entered error state — will be resumed in the same session"
                                 );
                             } else {
                                 debug!(
@@ -564,5 +558,82 @@ impl BatchNode for ForgeNode {
 
     async fn post_batch(&self, store: &SharedStore, results: Vec<Result<Value>>) -> Result<Action> {
         self.inner.post_batch(store, results).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: the harness writes the status as a JSON *object*
+    /// (e.g. `{"phase":"planning","role":"forge","ts":...}`). Reading it back
+    /// through `get_typed::<String>` silently fails (an object cannot decode
+    /// into a `String`), which used to make `read_harness_status` always
+    /// return `None` — FORGE never noticed the `planning`/`review_ready`
+    /// phases, so SENTINEL was never spawned via the planning-gate routing.
+    #[tokio::test]
+    async fn read_harness_status_decodes_object_stored_status() {
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-048";
+
+        // Simulate what openflows-harness `status set planning` stores.
+        store
+            .set(
+                &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
+                json!({
+                    "phase": "planning",
+                    "role": "forge",
+                    "ts": 1717000000u64,
+                }),
+            )
+            .await;
+
+        let status = ForgePairNode::read_harness_status(&store, ticket_id).await;
+        let status = status.expect("read_harness_status should decode the object-stored status");
+        assert_eq!(status.phase, "planning");
+        assert_eq!(status.role, "forge");
+        assert_eq!(status.ts, 1717000000);
+    }
+
+    #[tokio::test]
+    async fn read_harness_status_returns_none_when_phase_missing() {
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-049";
+
+        // An object without a phase should not be returned as a status.
+        store
+            .set(
+                &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
+                json!({ "role": "forge", "ts": 1u64 }),
+            )
+            .await;
+
+        assert!(ForgePairNode::read_harness_status(&store, ticket_id)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_harness_pr_info_decodes_object_stored_pr() {
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-050";
+
+        // Simulate what openflows-harness `pr opened` stores.
+        store
+            .set(
+                &full_ticket_key_flat(ticket_id, "pr"),
+                json!({
+                    "pr_number": 42u64,
+                    "branch": "forge-1/T-050",
+                    "title": "Implement feature",
+                }),
+            )
+            .await;
+
+        let pr = ForgePairNode::read_harness_pr_info(&store, ticket_id).await;
+        let pr = pr.expect("read_harness_pr_info should decode the object-stored PR");
+        assert_eq!(pr.pr_number, 42);
+        assert_eq!(pr.branch, "forge-1/T-050");
+        assert_eq!(pr.title, "Implement feature");
     }
 }

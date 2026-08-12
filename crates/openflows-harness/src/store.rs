@@ -3,13 +3,14 @@
 //! All keys are prefixed with `ns:{tenant}:` for tenant isolation.
 //! All writes are validated against serde schemas from `config::state`.
 
-use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyRequest};
+use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Valid phases for the `status set` command.
@@ -672,6 +673,37 @@ impl HarnessStore {
                 "Executing claimed verify task"
             );
 
+            // Set up progress streaming channel
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<VerifyProgressEvent>();
+
+            // Get a cancel token from the relay by pushing a progress event
+            // (this triggers the relay to create a cancel token if one doesn't exist)
+            let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Spawn a task to forward progress events to the relay
+            let progress_task_id = task_id.clone();
+            let progress_client =
+                crate::a2a_client::A2AClient::new(ticket.to_string(), "forge".to_string());
+            let progress_handle = match progress_client {
+                Ok(pc) => {
+                    let client_for_progress = pc;
+                    Some(tokio::spawn(async move {
+                        while let Some(event) = progress_rx.recv().await {
+                            if let Err(e) = client_for_progress
+                                .push_progress(&progress_task_id, &event)
+                                .await
+                            {
+                                debug!(error = %e, "Failed to push progress event (non-fatal)");
+                            }
+                        }
+                    }))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create progress client; progress streaming disabled");
+                    None
+                }
+            };
+
             let result = match crate::executor::execute_verify_task(
                 &self.client,
                 &tenant,
@@ -680,6 +712,8 @@ impl HarnessStore {
                 request.timeout_secs,
                 &workspace_id,
                 Some(&task_id),
+                Some(progress_tx),
+                Some(cancel_token.clone()),
             )
             .await
             {
@@ -710,6 +744,9 @@ impl HarnessStore {
                     fail
                 }
             };
+
+            // Drop the progress handle (completes when the stream ends)
+            drop(progress_handle);
 
             if let Err(e) = client.complete_task(&result).await {
                 warn!(error = %e, task_id = %task_id, "Failed to submit result; will not retry this task");

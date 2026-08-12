@@ -102,22 +102,10 @@ impl Node for SentinelNode {
 
             // ── Check for PR review verdicts ──
             let review_key = full_ticket_key(&ticket.id, "review", "sentinel");
-            let review_json: Option<String> = store.get_typed(&review_key).await;
-            let has_review = review_json.is_some();
+            let review_payload: Option<ReviewPayload> = store.get_typed(&review_key).await;
+            let has_review = review_payload.is_some();
 
-            if let Some(review_json) = review_json {
-                let review: ReviewPayload = match serde_json::from_str(&review_json) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(
-                            ticket_id = %ticket.id,
-                            error = %e,
-                            "Failed to parse sentinel review payload"
-                        );
-                        continue;
-                    }
-                };
-
+            if let Some(review) = review_payload {
                 reviewable.push(json!({
                     "ticket_id": ticket.id,
                     "worker_id": worker_id,
@@ -141,9 +129,7 @@ impl Node for SentinelNode {
 
             if phase == Some("planning") {
                 // Check if gate already approved
-                let tenant =
-                    std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
-                let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket.id);
+                let gate_key = format!("ticket:{}:gate:planning", ticket.id);
                 let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
 
                 if gate_approval.is_none() {
@@ -321,9 +307,9 @@ impl Node for SentinelNode {
                     );
 
                     let review_key = full_ticket_key(ticket_id, "review", "sentinel");
-                    let review_json: Option<String> = store.get_typed(&review_key).await;
-                    let report = review_json
-                        .and_then(|j| serde_json::from_str::<ReviewPayload>(&j).ok())
+                    let report = store
+                        .get_typed::<ReviewPayload>(&review_key)
+                        .await
                         .map(|r| r.report)
                         .unwrap_or_default();
 
@@ -368,16 +354,14 @@ impl Node for SentinelNode {
                     // Check if the planning gate has been approved since prep() ran.
                     // The SENTINEL chat runs `openflows-harness gate approve --phase planning`
                     // inside the workspace, which writes to SharedStore.
-                    let tenant =
-                        std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
-                    let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket_id);
+                    let gate_key = format!("ticket:{}:gate:planning", ticket_id);
                     let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
 
                     if gate_approval.is_some() {
                         // TASK 4: Check if PLAN artifact exists before approving gate.
                         // Per issue #143: "Sentinel gate policy: hard-fail (never approve)
                         // when PLAN.md / pair:{id}:plan is missing or unreadable."
-                        let plan_key = format!("ns:{}:pair:{}:plan", tenant, ticket_id);
+                        let plan_key = format!("pair:{}:plan", ticket_id);
                         let plan_exists: bool = store.get(&plan_key).await.is_some();
 
                         if !plan_exists {
