@@ -20,10 +20,15 @@
 
 ## Checklist
 
-- [ ] I have linked the related issue, if applicable.
-- [ ] I have described the changes clearly.
-- [ ] I have run the relevant checks or explained why they were not applicable.
-- [ ] I have added notes for reviewers, if needed.
+Please make sure these boxes are checked before submitting your pull request.
+
+- [ ] My commit messages are descriptive and scoped to this change.
+- [ ] This PR is focused on one issue or one coherent change.
+- [ ] I ran `cargo fmt` or confirmed formatting was not applicable.
+- [ ] I ran `cargo clippy` or explained why it was not applicable.
+- [ ] I added or updated tests for new behavior or bug fixes, or explained why tests were not needed.
+- [ ] I updated documentation for user-facing, operational, or architectural changes.
+- [ ] I proposed an ADR or called out reviewer attention for architectural changes.
 
 ## Notes for Reviewers
 
