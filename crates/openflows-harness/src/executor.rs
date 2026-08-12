@@ -39,6 +39,7 @@ use uuid::Uuid;
 /// `cancel_token` is an optional atomic flag; when set to true (by
 /// `tasks/cancel`), the executor stops reading output and kills the process
 /// group.
+#[allow(clippy::too_many_arguments)] // All args are distinct inputs to the verify-execution pipeline.
 pub async fn execute_verify_task(
     client: &fred::clients::Client,
     tenant: &str,
@@ -99,7 +100,7 @@ pub async fn execute_verify_task(
             // Check for cancellation
             if let Some(ref cancel) = cancel_token {
                 if cancel.load(Ordering::SeqCst) {
-                    let _ = kill_process_group(child_pid);
+                    kill_process_group(child_pid);
                     let _ = child.wait();
                     return Err(anyhow::anyhow!("Task cancelled before execution started"));
                 }

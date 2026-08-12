@@ -2253,7 +2253,9 @@ Use `openflows-harness` for all coordination:
 
         // Check ~/Sandbox/{repo_name}
         if let Ok(home) = std::env::var("HOME") {
-            let sandbox_path = std::path::PathBuf::from(&home).join("Sandbox").join(repo_name);
+            let sandbox_path = std::path::PathBuf::from(&home)
+                .join("Sandbox")
+                .join(repo_name);
             if sandbox_path.exists() {
                 return sandbox_path;
             }

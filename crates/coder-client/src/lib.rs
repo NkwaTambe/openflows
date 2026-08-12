@@ -25,10 +25,8 @@ pub mod mock_chat_server;
 pub use types::*;
 
 use anyhow::{bail, Context, Result};
-#[cfg(feature = "chats-api")]
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "chats-api")]
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -54,7 +52,8 @@ pub struct CoderClient {
     cached_models: Arc<RwLock<Option<Vec<crate::types::ModelInfo>>>>,
     /// Cached default organization ID.
     /// Lazily populated on first access to reduce API call overhead.
-    #[cfg(feature = "chats-api")]
+    /// Not gated behind `chats-api`: `get_default_organization_id` is used by
+    /// agent-nexus regardless of that feature, and the field is unconditional.
     cached_org_id: Arc<RwLock<Option<String>>>,
 }
 
@@ -144,7 +143,6 @@ impl CoderClient {
             session_token: None,
             #[cfg(feature = "chats-api")]
             cached_models: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "chats-api")]
             cached_org_id: Arc::new(RwLock::new(None)),
         }
     }
@@ -197,7 +195,6 @@ impl CoderClient {
             session_token: None,
             #[cfg(feature = "chats-api")]
             cached_models: Arc::new(RwLock::new(None)),
-            #[cfg(feature = "chats-api")]
             cached_org_id: Arc::new(RwLock::new(None)),
         }
     }
@@ -212,7 +209,6 @@ impl CoderClient {
             session_token: self.session_token.clone(),
             #[cfg(feature = "chats-api")]
             cached_models: self.cached_models.clone(),
-            #[cfg(feature = "chats-api")]
             cached_org_id: self.cached_org_id.clone(),
         }
     }

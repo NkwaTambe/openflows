@@ -419,10 +419,7 @@ async fn handle_stream(
 
     // 2. Subscribe to live broadcast
     let rx = state.relay.subscribe_to_task(&task_id).await;
-    let broadcast_stream = BroadcastStream::new(rx).filter_map(|result| match result {
-        Ok(event) => Some(event),
-        Err(_) => None,
-    });
+    let broadcast_stream = BroadcastStream::new(rx).filter_map(Result::ok);
 
     // 3. Chain: buffered events first, then live broadcast
     let replay_stream = stream::iter(buffered);
