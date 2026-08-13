@@ -760,6 +760,52 @@ impl HarnessStore {
         }
     }
 
+    /// Write a plan artifact (FORGE → Redis at `pair:{id}:plan`).
+    ///
+    /// FORGE writes PLAN.md as a local file in its workspace, then calls this
+    /// to persist it directly to Redis SharedStore so SENTINEL (and NEXUS)
+    /// can read it without relying on Coder API filesystem access.
+    pub async fn plan_write(&self, ticket: &str, file_path: &Path) -> Result<()> {
+        let content =
+            std::fs::read_to_string(file_path).context(format!(
+                "Failed to read plan file: {}",
+                file_path.display()
+            ))?;
+
+        let key = self.key(&format!("pair:{}:plan", ticket));
+        let _: Result<(), _> = self
+            .client
+            .set::<(), _, _>(&key, content, None, None, false)
+            .await;
+
+        println!("Wrote: {}", key);
+        info!(key = %key, "plan written to SharedStore");
+        Ok(())
+    }
+
+    /// Read a plan artifact from Redis (`pair:{id}:plan`) and print to stdout.
+    ///
+    /// SENTINEL uses this to retrieve the FORGE plan during planning gate review.
+    /// Prints the plan content as raw markdown; prints nothing if unset.
+    pub async fn plan_read(&self, ticket: &str) -> Result<()> {
+        let key = self.key(&format!("pair:{}:plan", ticket));
+        let val: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
+        match val {
+            Some(content) => {
+                print!("{}", content);
+            }
+            None => {
+                bail!(
+                    "No plan found for ticket {}. FORGE must write a plan via \
+                     `openflows-harness plan write --file PLAN.md` first.",
+                    ticket
+                );
+            }
+        }
+        debug!(key = %key, "plan read");
+        Ok(())
+    }
+
     /// List recent verification results (humans/audit, task 3 of issue #143).
     pub async fn verify_list(&self, pair_id: Option<&str>) -> Result<()> {
         if let Some(id) = pair_id {

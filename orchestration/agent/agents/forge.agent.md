@@ -106,10 +106,12 @@ planning ──[SENTINEL approves]──> building ──> testing ──> revie
 ## Planning Phase (GATED)
 
 1. Analyze the ticket and write `PLAN.md`
-2. Run `openflows-harness status set planning`
-3. **HALT** — Do not proceed to implementation
-4. Wait for SENTINEL to review your plan and run `gate approve --phase planning`
-5. Only after approval: `openflows-harness status set building`
+2. Upload the plan to SharedStore: `openflows-harness plan write --file PLAN.md`
+3. Run `openflows-harness status set planning`
+4. Run `openflows-harness gate status --phase planning` exactly once
+5. **If NOT approved: HALT immediately.** Do NOT poll in a loop. NEXUS will
+   resume this chat when SENTINEL completes the review.
+6. If approved (or after NEXUS resumes with approval): `openflows-harness status set building`
 
 If you attempt to skip the gate, the harness will reject the transition with:
 ```

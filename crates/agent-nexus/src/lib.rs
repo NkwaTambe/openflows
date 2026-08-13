@@ -1240,6 +1240,45 @@ Before significant work, read the relevant skill file to understand the workflow
                             return;
                         }
 
+                        // If the forge has just cleared the planning gate (phase is
+                        // still `planning` but the gate is now approved), send a
+                        // gate-specific resume message so FORGE knows it can proceed.
+                        let planning_gate_just_approved =
+                            Self::ticket_phase(store, ticket_id).await.as_deref() == Some("planning")
+                                && Self::gate_approved(store, ticket_id, "planning").await;
+
+                        if planning_gate_just_approved
+                            && Self::should_resume_existing_chat(status, last_action.as_deref())
+                        {
+                            match self
+                                .resume_chat_planning_approved(&client, &chat, ticket_id)
+                                .await
+                            {
+                                Ok(message) => {
+                                    info!(
+                                        chat_id = %chat.id,
+                                        worker_id,
+                                        ticket_id,
+                                        message_id = %message.id,
+                                        "Notified forge that planning gate is approved, resuming chat"
+                                    );
+                                    store.set(&action_key, json!("planning_approved")).await;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        chat_id = %chat.id,
+                                        worker_id,
+                                        ticket_id,
+                                        error = %e,
+                                        "Failed to send planning-gate approval notification; \
+                                         falling back to generic resume"
+                                    );
+                                    store.set(&action_key, json!("resume_failed")).await;
+                                }
+                            }
+                            return;
+                        }
+
                         if Self::should_resume_existing_chat(status, last_action.as_deref()) {
                             match self.resume_chat(&client, &chat, ticket_id).await {
                                 Ok(message) => {
@@ -1557,6 +1596,31 @@ Use `openflows-harness` for all coordination:
             .await
     }
 
+    /// Send a planning-gate-specific resume message when SENTINEL has approved
+    /// the plan. This notifies FORGE that it can proceed to implementation
+    /// without polling — NEXUS is the orchestrator that delivers the verdict.
+    async fn resume_chat_planning_approved(
+        &self,
+        client: &CoderClient,
+        chat: &coder_client::types::Chat,
+        ticket_id: &str,
+    ) -> anyhow::Result<coder_client::types::ChatMessage> {
+        let follow_up_prompt = format!(
+            "SENTINEL has approved your planning gate for ticket {ticket_id}. \
+             The plan is sound and you are authorized to proceed with implementation.\n\n\
+             Run the following to move to the building phase:\n\
+             `openflows-harness status set building`\n\n\
+             Then begin implementation with Segment 1.",
+            ticket_id = ticket_id,
+        );
+        client
+            .send_chat_message(
+                &chat.id,
+                vec![coder_client::types::ChatInputPart::text(follow_up_prompt)],
+            )
+            .await
+    }
+
     async fn create_chat_for_ticket_id(
         &self,
         store: &SharedStore,
@@ -1768,49 +1832,16 @@ Use `openflows-harness` for all coordination:
                         }
                     }
 
-                    let forge_workspace_id = slots.values().find_map(|slot| {
-                        if Self::worker_role(&slot.id) != "forge" {
-                            return None;
-                        }
-                        let ticket_matches = match &slot.status {
-                            WorkerStatus::Assigned { ticket_id, .. }
-                            | WorkerStatus::Working { ticket_id, .. } => ticket_id == &ticket.id,
-                            _ => false,
-                        };
-                        if ticket_matches {
-                            slot.workspace_id.clone()
-                        } else {
-                            None
-                        }
-                    });
-                    let plan_content = if let Some(forge_workspace_id) = forge_workspace_id {
-                        match client
-                            .workspace_read_file(&forge_workspace_id, "PLAN.md")
-                            .await
-                        {
-                            Ok(plan) => {
-                                store
-                                    .set(&format!("pair:{}:plan", ticket.id), json!(plan.clone()))
-                                    .await;
-                                Some(plan)
-                            }
-                            Err(e) => {
-                                warn!(
-                                    ticket_id = %ticket.id,
-                                    forge_workspace_id = %forge_workspace_id,
-                                    error = %e,
-                                    "Could not read Forge PLAN.md for Sentinel dispatch"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        warn!(
-                            ticket_id = %ticket.id,
-                            "Could not find Forge workspace for planning gate dispatch"
-                        );
-                        None
-                    };
+                    // Read the plan directly from Redis SharedStore.
+                    // FORGE writes it via `openflows-harness plan write --file PLAN.md`
+                    // before signaling `status set planning`. This eliminates the fragile
+                    // Coder API filesystem bridge — the plan lives in SharedStore alongside
+                    // all other pair artifacts and is cleaned up when the workspace is
+                    // destroyed.
+                    let plan_key = format!("pair:{}:plan", ticket.id);
+                    let plan_content: Option<String> = store
+                        .get_typed(&plan_key)
+                        .await;
 
                     // Build dispatch payload for Sentinel plan review.
                     // Include the PLAN.md content hint so SENTINEL knows this is a
@@ -1843,19 +1874,19 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = format!(
-                        "## Planning Gate Review — Ticket {}\n\n\
+                         "## Planning Gate Review — Ticket {}\n\n\
                          FORGE has written a plan and is waiting for your approval before \
                          proceeding to implementation.\n\n\
                          **Your task:**\n\
-                         1. Read the copied Forge plan from `openflows-harness dispatch read`\n\
+                         1. Read the Forge plan via `openflows-harness plan read` (or from the \
+                         dispatch payload via `openflows-harness dispatch read`)\n\
                          2. Evaluate whether the plan correctly addresses the ticket requirements\n\
                          3. If the plan is sound, approve the planning gate:\n\
                             `openflows-harness gate approve --phase planning --notes \"Plan approved. \
                          Proceed with implementation.\"`\n\
                          4. If the plan has issues, provide specific actionable feedback and do NOT \
                          approve the gate\n\n\
-                         Use `openflows-harness dispatch read` for ticket context and the copied \
-                         Forge plan content.\n\n\
+                         Use `openflows-harness dispatch read` for ticket context.\n\n\
                          **Ticket:** {} — {}\n",
                         ticket.id,
                         ticket.id,

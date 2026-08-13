@@ -74,6 +74,12 @@ enum Commands {
         #[command(subcommand)]
         action: GateAction,
     },
+    /// Read/write plan artifacts (FORGE writes, SENTINEL reads)
+    #[command(name = "plan")]
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
     /// Delegated verification via A2A relay (issue #143)
     #[command(name = "verify")]
     Verify {
@@ -174,6 +180,18 @@ enum GateAction {
         #[arg(long)]
         phase: String,
     },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Write a plan to SharedStore (FORGE)
+    Write {
+        /// Path to the PLAN.md file to upload
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read a plan from SharedStore (SENTINEL)
+    Read,
 }
 
 #[derive(Subcommand)]
@@ -286,6 +304,16 @@ async fn main() -> Result<()> {
             action: HeartbeatAction::Stop,
         } => {
             store.heartbeat_stop(&ticket, &role).await?;
+        }
+        Commands::Plan {
+            action: PlanAction::Write { file },
+        } => {
+            store.plan_write(&ticket, &file).await?;
+        }
+        Commands::Plan {
+            action: PlanAction::Read,
+        } => {
+            store.plan_read(&ticket).await?;
         }
         Commands::Gate {
             action: GateAction::Approve { phase, notes },
