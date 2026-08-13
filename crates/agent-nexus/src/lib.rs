@@ -1582,13 +1582,30 @@ Use `openflows-harness` for all coordination:
     async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
-            None => return,
+            None => {
+                info!("poll_harness_status: no Coder client available — cannot spawn Sentinel");
+                return;
+            }
         };
 
         let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
             Some(s) => s,
-            None => return,
+            None => {
+                info!("poll_harness_status: no worker slots stored — cannot spawn Sentinel");
+                return;
+            }
         };
+
+        let ticket_count = tickets.len();
+        let active_count = tickets
+            .iter()
+            .filter(|t| matches!(&t.status, TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }))
+            .count();
+        info!(
+            total = ticket_count,
+            active = active_count,
+            "poll_harness_status: scanning tickets for harness phase"
+        );
 
         for ticket in tickets {
             // Check tickets that are currently being worked on.
@@ -1623,6 +1640,10 @@ Use `openflows-harness` for all coordination:
 
             match phase {
                 Some("planning") => {
+                    info!(
+                        ticket_id = %ticket.id,
+                        "Detected planning phase — attempting to spawn Sentinel for plan review"
+                    );
                     // ── Planning Gate: SENTINEL must review the plan and approve the gate ──
                     // FORGE halts at planning and waits for SENTINEL to run
                     // `openflows-harness gate approve --phase planning`. If no SENTINEL
@@ -1630,7 +1651,7 @@ Use `openflows-harness` for all coordination:
 
                     // Check if gate already approved — if so, FORGE will transition on its own
                     if Self::gate_approved(store, &ticket.id, "planning").await {
-                        debug!(
+                        info!(
                             ticket_id = %ticket.id,
                             "Planning gate already approved — SENTINEL review not needed"
                         );
@@ -1642,6 +1663,13 @@ Use `openflows-harness` for all coordination:
                         full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
                     let existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
+                    // Diagnostic: show what the sentinel chat and action keys resolve to
+                    info!(
+                        ticket_id = %ticket.id,
+                        chat_key = %sentinel_chat_key,
+                        has_existing_chat = existing_sentinel_chat.is_some(),
+                        "Checked for existing sentinel chat; proceeding to idle-slot check"
+                    );
                     let sentinel_action_key =
                         full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
 

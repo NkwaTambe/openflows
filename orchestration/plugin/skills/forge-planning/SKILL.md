@@ -88,9 +88,46 @@ A segment that is too large:
 - [Question 2]
 ```
 
+## Planning Gate Protocol (MANDATORY)
+
+After writing PLAN.md, you MUST wait for SENTINEL to approve the planning
+gate before writing any code.  Do NOT skip this step — the controller
+will not spawn SENTINEL until you signal that planning is complete.
+
+### 1. Signal planning complete
+
+```bash
+openflows-harness status set planning
+```
+
+This tells the controller you have finished planning and SENTINEL should
+spawn to review your plan.
+
+### 2. Poll for gate approval
+
+```bash
+# Check if SENTINEL has approved the planning gate yet
+openflows-harness gate status --phase planning
+```
+
+- If it prints `✗ Gate 'planning' not yet approved`: WAIT. Poll again in
+  ~30 seconds. SENTINEL may still be spawning.
+- If it prints `✓ Gate 'planning' approved`: you may proceed to
+  implementation (step 3 below).
+- **Never proceed without gate approval.**  The gate is your
+  authorisation to write code.
+
+### 3. After gate approval
+
+```bash
+openflows-harness status set building
+```
+
+Then begin implementation with Segment 1.
+
 ## Contract negotiation
 
-SENTINEL will review your plan.
+SENTINEL may write CONTRACT.md after reviewing your plan.
 
 If SENTINEL objects:
 1. Read the objection carefully in `CONTRACT.md`
