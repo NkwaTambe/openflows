@@ -94,10 +94,10 @@ resource "coder_agent" "main" {
       # instead of leaving a silently uncoordinated workspace.
       HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
       if [ "${var.harness_version}" = "harness-edge" ]; then
-        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/${HARNESS_ASSET}"
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/$${HARNESS_ASSET}"
         log "Downloading openflows-harness (harness-edge/latest build)..."
       else
-        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/${HARNESS_ASSET}"
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/$${HARNESS_ASSET}"
         log "Downloading openflows-harness v${var.harness_version}..."
       fi
       for attempt in 1 2 3; do

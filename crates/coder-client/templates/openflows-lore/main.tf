@@ -102,10 +102,10 @@ resource "coder_agent" "main" {
       # Asset naming: both harness-edge and tagged releases use fixed basename
       HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
       if [ "${var.harness_version}" = "harness-edge" ]; then
-        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/${HARNESS_ASSET}"
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/$${HARNESS_ASSET}"
         echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness (harness-edge/latest build)..." >&2
       else
-        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/${HARNESS_ASSET}"
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/$${HARNESS_ASSET}"
         echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness v${var.harness_version}..." >&2
       fi
       for attempt in 1 2 3; do
