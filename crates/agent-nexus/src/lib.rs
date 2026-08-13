@@ -1240,46 +1240,6 @@ Before significant work, read the relevant skill file to understand the workflow
                             return;
                         }
 
-                        // If the forge has just cleared the planning gate (phase is
-                        // still `planning` but the gate is now approved), send a
-                        // gate-specific resume message so FORGE knows it can proceed.
-                        let planning_gate_just_approved =
-                            Self::ticket_phase(store, ticket_id).await.as_deref()
-                                == Some("planning")
-                                && Self::gate_approved(store, ticket_id, "planning").await;
-
-                        if planning_gate_just_approved
-                            && Self::should_resume_existing_chat(status, last_action.as_deref())
-                        {
-                            match self
-                                .resume_chat_planning_approved(&client, &chat, ticket_id)
-                                .await
-                            {
-                                Ok(message) => {
-                                    info!(
-                                        chat_id = %chat.id,
-                                        worker_id,
-                                        ticket_id,
-                                        message_id = %message.id,
-                                        "Notified forge that planning gate is approved, resuming chat"
-                                    );
-                                    store.set(&action_key, json!("planning_approved")).await;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        chat_id = %chat.id,
-                                        worker_id,
-                                        ticket_id,
-                                        error = %e,
-                                        "Failed to send planning-gate approval notification; \
-                                         falling back to generic resume"
-                                    );
-                                    store.set(&action_key, json!("resume_failed")).await;
-                                }
-                            }
-                            return;
-                        }
-
                         if Self::should_resume_existing_chat(status, last_action.as_deref()) {
                             match self.resume_chat(&client, &chat, ticket_id).await {
                                 Ok(message) => {
@@ -1719,14 +1679,119 @@ Use `openflows-harness` for all coordination:
                     // `openflows-harness gate approve --phase planning`. If no SENTINEL
                     // chat exists for this ticket, spawn one so it can review the plan.
 
-                    // Check if gate already approved — if so, FORGE will transition on its own
+                    // Check if gate already approved — if so, notify FORGE to resume.
                     if Self::gate_approved(store, &ticket.id, "planning").await {
-                        info!(
-                            ticket_id = %ticket.id,
-                            "Planning gate already approved — SENTINEL review not needed"
+                        // Deduplication: skip if we already notified FORGE about
+                        // this gate approval on a previous poll cycle.
+                        let notification_key = format!(
+                            "ticket:{}:planning_notified",
+                            ticket.id
                         );
+                        let already_notified: Option<bool> =
+                            store.get_typed(&notification_key).await;
+                        if already_notified.unwrap_or(false) {
+                            debug!(
+                                ticket_id = %ticket.id,
+                                "Already notified FORGE of planning gate approval; skipping"
+                            );
+                            continue;
+                        }
+
+                        // Get the forge worker_id for this ticket so we can find
+                        // its Coder chat and inject a resume message.
+                        let forge_worker_id = match &ticket.status {
+                            TicketStatus::Assigned { worker_id }
+                            | TicketStatus::InProgress { worker_id } => worker_id.clone(),
+                            _ => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    "Planning gate approved but ticket has unexpected status; \
+                                     cannot notify FORGE"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let forge_chat_key =
+                            full_ticket_key(&ticket.id, KEY_TICKET_CHAT, &forge_worker_id);
+                        let forge_chat_id: Option<String> =
+                            store.get_typed(&forge_chat_key).await;
+
+                        if let Some(ref forge_chat_id) = forge_chat_id {
+                            match client.get_chat(forge_chat_id).await {
+                                Ok(chat) => {
+                                    let status = chat.status();
+                                    // Only send a resume if the forge chat is in a
+                                    // state where it can accept new messages —
+                                    // Waiting or Error. A Running chat is actively
+                                    // generating; we wait for it to finish.
+                                    if matches!(status, ChatStatus::Waiting | ChatStatus::Error) {
+                                        match self
+                                            .resume_chat_planning_approved(
+                                                &client, &chat, &ticket.id,
+                                            )
+                                            .await
+                                        {
+                                            Ok(message) => {
+                                                info!(
+                                                    ticket_id = %ticket.id,
+                                                    chat_id = %forge_chat_id,
+                                                    message_id = %message.id,
+                                                    "Notified forge that planning gate is approved"
+                                                );
+                                                // Track that we notified so we don't spam
+                                                // on every poll cycle.
+                                                let notification_key = format!(
+                                                    "ticket:{}:planning_notified",
+                                                    ticket.id
+                                                );
+                                                store
+                                                    .set(&notification_key, json!(true))
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    ticket_id = %ticket.id,
+                                                    chat_id = %forge_chat_id,
+                                                    error = %e,
+                                                    "Failed to notify forge of planning gate approval"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        debug!(
+                                            ticket_id = %ticket.id,
+                                            chat_id = %forge_chat_id,
+                                            chat_status = ?status,
+                                            "Forge chat is not in a resumable state; \
+                                             waiting for chat to go to Waiting"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        chat_id = %forge_chat_id,
+                                        error = %e,
+                                        "Failed to get forge chat for planning gate notification"
+                                    );
+                                }
+                            }
+                        } else {
+                            debug!(
+                                ticket_id = %ticket.id,
+                                "No forge chat ID found; forge may not have been provisioned yet"
+                            );
+                        }
+
                         continue;
                     }
+
+                    // Gate is NOT yet approved — this is a fresh (or still pending)
+                    // planning cycle. Clear any stale notification flag from a
+                    // previous cycle so we don't suppress a future notification.
+                    let notification_key = format!("ticket:{}:planning_notified", ticket.id);
+                    store.del(&notification_key).await;
 
                     // Check if SENTINEL chat already exists for plan review
                     let sentinel_chat_key =
