@@ -245,12 +245,15 @@ impl A2AClient {
     }
 
     /// Cancel a running task (Sentinel-side).
+    /// The client's pair_id is sent with the request so the relay can
+    /// verify that the cancelling workspace owns the task (pair-scoped).
     pub async fn cancel_task(&self, task_id: &str) -> Result<()> {
         let rpc_request = json!({
             "jsonrpc": "2.0",
             "method": "tasks/cancel",
             "params": {
                 "task_id": task_id,
+                "pair_id": self.pair_id,
             },
             "id": uuid::Uuid::new_v4().to_string(),
         });

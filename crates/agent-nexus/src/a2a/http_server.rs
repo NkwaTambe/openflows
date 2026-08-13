@@ -306,6 +306,22 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
         .get("task_id")
         .and_then(|t| t.as_str())
         .context("tasks/cancel requires string task_id")?;
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/cancel requires string pair_id")?;
+
+    // Guard: the caller must belong to the same pair as the task.
+    // A workspace in pair T-047 cannot cancel a task from pair T-048.
+    if let Some(entry) = state.relay.get_task(task_id).await {
+        if entry.request.pair_id != pair_id {
+            return Err(anyhow::anyhow!(
+                "tasks/cancel pair_id mismatch: task belongs to {} but caller claims {}",
+                entry.request.pair_id,
+                pair_id
+            ));
+        }
+    }
 
     // Mark the task as cancelled in the relay state
     let newly_set = state.relay.mark_cancelled(task_id).await;
