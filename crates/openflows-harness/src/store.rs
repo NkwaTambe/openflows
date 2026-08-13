@@ -766,11 +766,8 @@ impl HarnessStore {
     /// to persist it directly to Redis SharedStore so SENTINEL (and NEXUS)
     /// can read it without relying on Coder API filesystem access.
     pub async fn plan_write(&self, ticket: &str, file_path: &Path) -> Result<()> {
-        let content =
-            std::fs::read_to_string(file_path).context(format!(
-                "Failed to read plan file: {}",
-                file_path.display()
-            ))?;
+        let content = std::fs::read_to_string(file_path)
+            .context(format!("Failed to read plan file: {}", file_path.display()))?;
 
         let key = self.key(&format!("pair:{}:plan", ticket));
         let _: Result<(), _> = self

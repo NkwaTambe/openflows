@@ -1244,7 +1244,8 @@ Before significant work, read the relevant skill file to understand the workflow
                         // still `planning` but the gate is now approved), send a
                         // gate-specific resume message so FORGE knows it can proceed.
                         let planning_gate_just_approved =
-                            Self::ticket_phase(store, ticket_id).await.as_deref() == Some("planning")
+                            Self::ticket_phase(store, ticket_id).await.as_deref()
+                                == Some("planning")
                                 && Self::gate_approved(store, ticket_id, "planning").await;
 
                         if planning_gate_just_approved
@@ -1839,9 +1840,7 @@ Use `openflows-harness` for all coordination:
                     // all other pair artifacts and is cleaned up when the workspace is
                     // destroyed.
                     let plan_key = format!("pair:{}:plan", ticket.id);
-                    let plan_content: Option<String> = store
-                        .get_typed(&plan_key)
-                        .await;
+                    let plan_content: Option<String> = store.get_typed(&plan_key).await;
 
                     // Build dispatch payload for Sentinel plan review.
                     // Include the PLAN.md content hint so SENTINEL knows this is a
