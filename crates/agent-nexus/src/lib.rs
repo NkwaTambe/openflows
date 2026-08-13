@@ -1599,7 +1599,12 @@ Use `openflows-harness` for all coordination:
         let ticket_count = tickets.len();
         let active_count = tickets
             .iter()
-            .filter(|t| matches!(&t.status, TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }))
+            .filter(|t| {
+                matches!(
+                    &t.status,
+                    TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+                )
+            })
             .count();
         info!(
             total = ticket_count,
