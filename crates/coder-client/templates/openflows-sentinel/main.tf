@@ -52,6 +52,16 @@ variable "a2a_relay_addr" {
   description = "Address of the nexus A2A relay (JSON-RPC verify transport, issue #143). Workspaces resolve the nexus container over the shared docker network by its service name."
 }
 
+# TEMPORARY: Host path to the .dev-binaries directory on the Docker host.
+# Set via TF_VAR_dev_binary_host_path before running `coder templates push`.
+# The mounted dev harness is used when available (the current fallback when no
+# GitHub Release asset exists); remove when switching to GitHub releases only.
+variable "dev_binary_host_path" {
+  description = "Absolute host path to the .dev-binaries directory"
+  type        = string
+  default     = ""
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -62,6 +72,13 @@ resource "coder_agent" "main" {
     set -e
 
     log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
+
+    # Ensure the workspace dir is owned by the coder user so the agent and
+    # the provisioner (skills/standards writes) can create files there.
+    # The volume is initialized root-owned inside codercom/enterprise-base.
+    sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
+    mkdir -p /home/coder/workspace
+    sudo chown -R coder:coder /home/coder/workspace
 
     # Setup git credentials: get token from workspace owner via Coder API
     # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
@@ -113,10 +130,10 @@ resource "coder_agent" "main" {
       # which GitHub auto-replaces on re-upload with the same name.
       HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
       if [ "${var.harness_version}" = "harness-edge" ]; then
-        HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/harness-edge/${HARNESS_ASSET}"
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/${HARNESS_ASSET}"
         echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness (harness-edge/latest build)..." >&2
       else
-        HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/${var.harness_version}/${HARNESS_ASSET}"
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/${HARNESS_ASSET}"
         echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Downloading openflows-harness v${var.harness_version}..." >&2
       fi
       for attempt in 1 2 3; do
@@ -167,6 +184,18 @@ resource "docker_container" "workspace" {
   volumes {
     container_path = "/home/coder/workspace"
     volume_name    = docker_volume.workspace.name
+  }
+
+  # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases).
+  # The sentinel startup script prefers the mounted /opt/openflows-dev/openflows-harness
+  # when present; this is what keeps the harness available until a hosted release exists.
+  dynamic "volumes" {
+    for_each = var.dev_binary_host_path != "" ? [1] : []
+    content {
+      container_path = "/opt/openflows-dev"
+      host_path      = var.dev_binary_host_path
+      read_only      = true
+    }
   }
 
   env = [
