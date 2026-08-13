@@ -234,6 +234,15 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
+  # Mount shared orchestration files (agent definitions, skills, standards).
+  # This volume is created by the Nexus workspace.  Sentinel reads the
+  # forge-written PLAN.md (and other planning gate artifacts) from here.
+  volumes {
+    container_path = "/home/coder/.openflows/orchestration"
+    volume_name    = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+    read_only      = true
+  }
+
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases).
   # The sentinel startup script prefers the mounted /opt/openflows-dev/openflows-harness
   # when present; this is what keeps the harness available until a hosted release exists.
