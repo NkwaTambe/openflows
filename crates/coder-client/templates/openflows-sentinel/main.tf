@@ -62,6 +62,52 @@ variable "dev_binary_host_path" {
   default     = ""
 }
 
+# Workspace-level parameters (set per-workspace via Coder API rich_parameter_values).
+# These coder_parameter data sources mirror the Terraform variables so Coder BOTH
+# (a) makes them available as rich parameters at workspace creation time, AND
+# (b) lets the startup script interpolate them for env-injection by Coder's agent.
+data "coder_parameter" "role" {
+  name        = "role"
+  description = "Agent role name"
+  default     = "sentinel"
+  type        = "string"
+}
+
+data "coder_parameter" "ticket_id" {
+  name        = "ticket_id"
+  description = "Ticket identifier"
+  default     = ""
+  type        = "string"
+}
+
+data "coder_parameter" "redis_url" {
+  name        = "redis_url"
+  description = "Redis SharedStore URL"
+  default     = "redis://redis:6379"
+  type        = "string"
+}
+
+data "coder_parameter" "repo_url" {
+  name        = "repo_url"
+  description = "Git repository URL to clone into the workspace"
+  default     = ""
+  type        = "string"
+}
+
+data "coder_parameter" "tenant" {
+  name        = "tenant"
+  description = "OpenFlows tenant identifier"
+  default     = ""
+  type        = "string"
+}
+
+data "coder_parameter" "coder_url" {
+  name        = "coder_url"
+  description = "Coder server URL for API calls"
+  default     = ""
+  type        = "string"
+}
+
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
@@ -82,7 +128,7 @@ resource "coder_agent" "main" {
 
     # Setup git credentials: get token from workspace owner via Coder API
     # The agent token is injected by Coder as CODER_AGENT_TOKEN env var
-    CODER_URL="${var.coder_url}"
+    CODER_URL="${data.coder_parameter.coder_url.value}"
     OWNER_ID="${data.coder_workspace_owner.me.id}"
     
     if [ -n "$CODER_URL" ] && [ -n "$CODER_AGENT_TOKEN" ] && [ -n "$OWNER_ID" ]; then
@@ -162,11 +208,13 @@ resource "coder_agent" "main" {
       exit 1
     fi
 
-    # Start heartbeat daemon (the ONLY Redis client in the workspace)
-    export REDIS_URL="${var.redis_url}"
-    export OPENFLOWS_TENANT="${var.tenant}"
-    export OPENFLOWS_TICKET="${var.ticket_id}"
-    export OPENFLOWS_ROLE="${var.role}"
+    # Start heartbeat daemon (the ONLY Redis client in the workspace).
+    # Use the BASE role so the controller can find the heartbeat under the
+    # base-role key (not the worker id — sentinel always matches base role).
+    export REDIS_URL="${data.coder_parameter.redis_url.value}"
+    export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
+    export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
+    export OPENFLOWS_ROLE="sentinel"
     export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
@@ -199,10 +247,10 @@ resource "docker_container" "workspace" {
   }
 
   env = [
-    "REDIS_URL=${var.redis_url}",
-    "OPENFLOWS_TENANT=${var.tenant}",
-    "OPENFLOWS_TICKET=${var.ticket_id}",
-    "OPENFLOWS_ROLE=${var.role}",
+    "REDIS_URL=${data.coder_parameter.redis_url.value}",
+    "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
+    "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
+    "OPENFLOWS_ROLE=sentinel",
     "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
