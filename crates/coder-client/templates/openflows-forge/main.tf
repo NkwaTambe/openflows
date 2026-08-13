@@ -128,13 +128,13 @@ resource "coder_agent" "main" {
     # until the flow artifacts (status/handoff/PR) exist.
     ROLE="${data.coder_parameter.role.value}"
     ROLE_BASE="$${ROLE%-*}"   # forge-1 -> forge
-    HOOKS_SRC="/home/coder/.openflows/orchestration/plugin/hooks/$ROLE_BASE"
+    HOOKS_SRC="/home/coder/.openflows/artifacts/plugin/hooks/$ROLE_BASE"
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
       mkdir -p "$HOOKS_DIR"
       cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
       chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
-      log "Installed $ROLE_BASE hooks from orchestration volume"
+      log "Installed $ROLE_BASE hooks from artifacts volume"
     else
       log "WARNING: no hooks found for role $ROLE_BASE at $HOOKS_SRC"
     fi
@@ -292,11 +292,11 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount shared orchestration files (agent definitions, skills, standards)
+  # Mount shared artifact files (agent definitions, skills, standards, plans)
   # This volume is created by the Nexus workspace
   volumes {
-    container_path = "/home/coder/.openflows/orchestration"
-    volume_name    = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+    container_path = "/home/coder/.openflows/artifacts"
+    volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
     read_only      = true
   }
 

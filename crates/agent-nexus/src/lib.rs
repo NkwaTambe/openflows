@@ -293,8 +293,8 @@ impl NexusNode {
     }
 
     fn load_agent_persona(&self, role: &str) -> Option<String> {
-        let orch_dir = std::env::var("ORCHESTRATOR_DIR").ok()?;
-        let persona_path = std::path::PathBuf::from(orch_dir)
+        let artifacts_dir = std::env::var("ARTIFACTS_DIR").ok()?;
+        let persona_path = std::path::PathBuf::from(artifacts_dir)
             .join("orchestration")
             .join("agent")
             .join("agents")
@@ -983,8 +983,8 @@ Before significant work, read the relevant skill file to understand the workflow
         // ── Provision configuration into the workspace ──────────────────
         // Copy skills, standards, and persona files via SSH so the agent
         // has everything it needs when it starts working.
-        if let Ok(orch_dir) = std::env::var("ORCHESTRATOR_DIR") {
-            let orch_path = std::path::PathBuf::from(orch_dir);
+        if let Ok(artifacts_dir) = std::env::var("ARTIFACTS_DIR") {
+            let orch_path = std::path::PathBuf::from(artifacts_dir);
             let transport = CoderTransport::new(client.clone(), &workspace.id);
             let provisioner = Provisioner::new(&orch_path);
             let worker_role = Self::worker_role(worker_id);

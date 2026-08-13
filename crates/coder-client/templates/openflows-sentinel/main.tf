@@ -234,12 +234,12 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount shared orchestration files (agent definitions, skills, standards).
+  # Mount shared artifact files (agent definitions, skills, standards, plans).
   # This volume is created by the Nexus workspace.  Sentinel reads the
   # forge-written PLAN.md (and other planning gate artifacts) from here.
   volumes {
-    container_path = "/home/coder/.openflows/orchestration"
-    volume_name    = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+    container_path = "/home/coder/.openflows/artifacts"
+    volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
     read_only      = true
   }
 

@@ -201,7 +201,7 @@ async fn run_controller() -> Result<()> {
     let registry_json = serde_json::to_string_pretty(&registry)?;
     std::env::set_var("OPENFLOWS_REGISTRY_PATH", &registry_path);
     std::env::set_var("OPENFLOWS_REGISTRY_JSON", &registry_json);
-    std::env::set_var("ORCHESTRATOR_DIR", resolver.orchestrator_dir());
+    std::env::set_var("ARTIFACTS_DIR", resolver.orchestrator_dir());
 
     store
         .set("registry_json", serde_json::json!(registry_json))

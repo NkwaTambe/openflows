@@ -87,7 +87,7 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    # Fix orchestration directory ownership (shared volume is created as root)
+    # Fix artifacts directory ownership (shared volume is created as root)
     sudo chown -R coder:coder /home/coder/.openflows
 
     # TEMPORARY: Use mounted dev binary for local testing
@@ -159,9 +159,10 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Shared orchestration volume - Nexus writes, forge/sentinel/etc read
-resource "docker_volume" "orchestration" {
-  name = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+# Shared artifacts volume — Nexus writes (skills, standards, personas),
+# forge/sentinel read (and forge writes PLAN.md for sentinel review).
+resource "docker_volume" "artifacts" {
+  name = "openflows-artifacts-${data.coder_parameter.tenant.value}"
 }
 
 resource "docker_container" "workspace" {
@@ -173,10 +174,10 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Orchestration files volume (written by Nexus, read by other agents)
+  # Artifacts volume (written by Nexus, read by forge/sentinel/lore/vessel)
   volumes {
-    container_path = "/home/coder/.openflows/orchestration"
-    volume_name    = docker_volume.orchestration.name
+    container_path = "/home/coder/.openflows/artifacts"
+    volume_name    = docker_volume.artifacts.name
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
@@ -204,8 +205,8 @@ resource "docker_container" "workspace" {
     # reach it over the shared docker network (issue #143). Workspaces address
     # it via the `openflows-nexus` network alias below.
     "A2A_RELAY_ADDR=0.0.0.0:3000",
-    # Path to orchestration files containing agent personas and skills
-    "ORCHESTRATOR_DIR=/home/coder/.openflows/orchestration",
+    # Path to shared artifacts (agent personas, skills, standards, plans)
+    "ARTIFACTS_DIR=/home/coder/.openflows/artifacts",
   ]
 
   networks_advanced {
