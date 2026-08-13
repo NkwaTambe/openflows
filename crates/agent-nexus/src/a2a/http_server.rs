@@ -188,10 +188,15 @@ async fn handle_message_send(state: &A2AServerState, params: &Value) -> anyhow::
     let req: VerifyRequest =
         serde_json::from_value(raw.clone()).context("params are not a valid VerifyRequest")?;
 
-    // AuthZ: a Sentinel may only submit for its own pair. In the current
-    // in-network deployment the relay trusts the pair_id on the request; the
-    // workspace token binding (plan task 2) is enforced by the executor role
-    // check done on the Forge side. We use pair_id as requester identity.
+    // AuthZ (v1): the Docker network boundary is the trust model for this
+    // deployment.  pair_id is caller-supplied (self-declared) — a malicious
+    // workspace on the shared network could impersonate another pair.  The
+    // executor role check on claim (tasks/claim rejects non-Forge roles) and
+    // the unguessable UUIDv7 task IDs provide layers of defence, but these
+    // are NOT cryptographic guarantees.
+    //
+    // TODO(v2): bind pair-scope to a workspace identity token (plan task 2)
+    // so the relay can verify ownership without trusting self-declared values.
     let requester_pair_id = req.pair_id.clone();
 
     let task_id = submit_verify_request(&state.relay, &req, &requester_pair_id).await?;
@@ -311,8 +316,13 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
         .and_then(|p| p.as_str())
         .context("tasks/cancel requires string pair_id")?;
 
-    // Guard: the caller must belong to the same pair as the task.
-    // A workspace in pair T-047 cannot cancel a task from pair T-048.
+    // Guard (best-effort, v1): the pair_id here is self-declared by the
+    // caller — a workspace that knows another pair's task ID can supply
+    // the owning pair_id to bypass this check.  The real defence is the
+    // Docker network boundary + unguessable UUIDv7 task IDs.
+    //
+    // TODO(v2): replace with workspace-identity-backed ownership verification
+    // when the relay gains signed workspace credentials (plan task 2).
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.request.pair_id != pair_id {
             return Err(anyhow::anyhow!(

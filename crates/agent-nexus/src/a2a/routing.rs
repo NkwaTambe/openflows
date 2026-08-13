@@ -224,7 +224,16 @@ impl A2ARelay {
         req: &VerifyRequest,
         requester_pair_id: &str,
     ) -> Result<()> {
-        // Rule 1: Pair IDs must match
+        // Rule 1: Requester and request must agree on pair_id. In v1 the
+        // requester is caller-supplied (self-declared) — this check prevents
+        // accidental mismatches between a misconfigured client's pair_id and
+        // the pair_id it writes into the request body.  It is NOT a
+        // cryptographic authorization: a workspace on the Docker network
+        // can supply any value here.
+        //
+        // TODO(v2): verify requester_pair_id against a workspace identity
+        // token (plan task 2) so the relay can enforce pair-scoped access
+        // without trusting self-declared values.
         if req.pair_id != requester_pair_id {
             return Err(anyhow!(
                 "pair_id mismatch: request says {}, requester is {}",
