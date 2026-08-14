@@ -444,7 +444,9 @@ impl A2ARelay {
         let stale_keys: Vec<String> = {
             let ts = self.idempotency_ts.lock().await;
             ts.iter()
-                .filter(|(_, instant)| now.duration_since(**instant).as_secs() > IDEMPOTENCY_TTL_SECS)
+                .filter(|(_, instant)| {
+                    now.duration_since(**instant).as_secs() > IDEMPOTENCY_TTL_SECS
+                })
                 .map(|(k, _)| k.clone())
                 .collect()
         };

@@ -679,8 +679,7 @@ impl HarnessStore {
 
             // Get a cancel token — starts local and is synced to the relay's
             // cancel state by a background polling task below.
-            let cancel_token =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             // Spawn a background poller that checks the relay for cancellation
             // and sets the local token so the executor kills the child process.
