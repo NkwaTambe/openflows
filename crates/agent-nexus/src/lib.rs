@@ -1683,10 +1683,7 @@ Use `openflows-harness` for all coordination:
                     if Self::gate_approved(store, &ticket.id, "planning").await {
                         // Deduplication: skip if we already notified FORGE about
                         // this gate approval on a previous poll cycle.
-                        let notification_key = format!(
-                            "ticket:{}:planning_notified",
-                            ticket.id
-                        );
+                        let notification_key = format!("ticket:{}:planning_notified", ticket.id);
                         let already_notified: Option<bool> =
                             store.get_typed(&notification_key).await;
                         if already_notified.unwrap_or(false) {
@@ -1714,8 +1711,7 @@ Use `openflows-harness` for all coordination:
 
                         let forge_chat_key =
                             full_ticket_key(&ticket.id, KEY_TICKET_CHAT, &forge_worker_id);
-                        let forge_chat_id: Option<String> =
-                            store.get_typed(&forge_chat_key).await;
+                        let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
 
                         if let Some(ref forge_chat_id) = forge_chat_id {
                             match client.get_chat(forge_chat_id).await {
@@ -1745,9 +1741,7 @@ Use `openflows-harness` for all coordination:
                                                     "ticket:{}:planning_notified",
                                                     ticket.id
                                                 );
-                                                store
-                                                    .set(&notification_key, json!(true))
-                                                    .await;
+                                                store.set(&notification_key, json!(true)).await;
                                             }
                                             Err(e) => {
                                                 warn!(
