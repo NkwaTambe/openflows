@@ -298,6 +298,11 @@ impl Node for SentinelNode {
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
 
+                    // Consume the review verdict so it is not replayed on the
+                    // next poll cycle.
+                    let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                    store.del(&review_key).await;
+
                     any_approved = true;
                 }
                 "reject" => {
@@ -313,12 +318,17 @@ impl Node for SentinelNode {
                         .map(|r| r.report)
                         .unwrap_or_default();
 
-                    let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
+                    // Look up the FORGE chat via the assigned worker_id, not the
+                    // literal role string "forge". The chat key is stored as
+                    // `ticket:{id}:chat:{worker_id}` (e.g. `forge-1`).
+                    let worker_id = verdict["worker_id"].as_str().unwrap_or("");
+                    let forge_chat_key =
+                        full_ticket_key(ticket_id, KEY_TICKET_CHAT, worker_id);
                     let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
 
-                    if let (Some(ref client), Some(chat_id)) = (&client, forge_chat_id) {
+                    if let (Some(ref client), Some(ref chat_id)) = (&client, &forge_chat_id) {
                         if let Err(e) =
-                            Self::send_rejection_follow_up(client, &chat_id, ticket_id, &report)
+                            Self::send_rejection_follow_up(client, chat_id, ticket_id, &report)
                                 .await
                         {
                             warn!(
@@ -327,6 +337,14 @@ impl Node for SentinelNode {
                                 "Failed to send rejection follow-up to forge"
                             );
                         }
+                    } else {
+                        warn!(
+                            ticket_id,
+                            worker_id,
+                            has_client = client.is_some(),
+                            has_chat_id = forge_chat_id.is_some(),
+                            "Cannot send rejection follow-up — missing Coder client or forge chat"
+                        );
                     }
 
                     let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
@@ -346,6 +364,10 @@ impl Node for SentinelNode {
 
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
+
+                    // Consume the review verdict so it is not replayed on the
+                    // next poll cycle.
+                    store.del(&review_key).await;
 
                     any_rejected = true;
                 }
