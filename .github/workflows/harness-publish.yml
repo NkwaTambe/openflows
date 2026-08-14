@@ -135,6 +135,8 @@ jobs:
     needs: [resolve-version, build]
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -171,8 +173,6 @@ jobs:
           fi
 
       - name: Upload harness tarball to harness-edge
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # Fixed asset name — same for every upload. --clobber auto-replaces prior asset.
           ASSET_NAME="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
