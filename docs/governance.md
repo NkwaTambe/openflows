@@ -22,6 +22,9 @@ OpenFlows inherits Coder's governance controls and adds typed-contract enforceme
 | **Role permission modes** | `registry.json` → `plan_mode` | SENTINEL and NEXUS run in plan mode (review-only). FORGE, VESSEL, LORE run in normal mode. |
 | **Scoped tenant tokens** | Bootstrap creates per-tenant tokens | The Controller uses a scoped session token (workspace + chat CRUD only, never admin). |
 | **Recovery limits** | `NexusNode::reconcile()` | Max 3 recovery attempts per ticket before `awaiting_human` escalation. |
+| **A2A Command Allowlist** | `a2a-protocol::DEFAULT_COMMAND_ALLOWLIST` | Only safe verification commands allowed: `cargo test`, `npm test`, `make test`, `bun test`. Sentinel cannot execute arbitrary code. |
+| **A2A Timeout Enforcement** | `executor::execute_verify_task()` | All A2A tasks have a maximum timeout of 3600s (1 hour, configurable). Timeout = task failure, never satisfies expectations. |
+| **A2A Output Bounding** | `executor::truncate_to_tail()` | Stdout/stderr limited to 10KB tail per stream. Prevents memory explosion, keeps audit trail bounded. |
 
 ## Network Policy
 

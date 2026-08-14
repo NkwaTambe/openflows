@@ -10,7 +10,7 @@
 //!   OPENFLOWS_TICKET   — Current ticket ID (e.g., "T-42")
 //!   OPENFLOWS_ROLE     — Current role (forge, sentinel, vessel, lore)
 
-mod store;
+use openflows_harness::store;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -73,6 +73,18 @@ enum Commands {
     Gate {
         #[command(subcommand)]
         action: GateAction,
+    },
+    /// Read/write plan artifacts (FORGE writes, SENTINEL reads)
+    #[command(name = "plan")]
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+    /// Delegated verification via A2A relay (issue #143)
+    #[command(name = "verify")]
+    Verify {
+        #[command(subcommand)]
+        action: VerifyAction,
     },
 }
 
@@ -170,6 +182,45 @@ enum GateAction {
     },
 }
 
+#[derive(Subcommand)]
+enum PlanAction {
+    /// Write a plan to SharedStore (FORGE)
+    Write {
+        /// Path to the PLAN.md file to upload
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read a plan from SharedStore (SENTINEL)
+    Read,
+}
+
+#[derive(Subcommand)]
+enum VerifyAction {
+    /// Submit a verify request (SENTINEL-side, task 3 of issue #143)
+    Request {
+        /// Command argv to execute (must be allowlisted)
+        #[arg(long)]
+        argv: Vec<String>,
+        /// Command execution timeout in seconds
+        #[arg(long, default_value = "600")]
+        timeout_secs: u64,
+        /// Expected exit code (if None, any exit code is acceptable)
+        #[arg(long)]
+        expect_exit: Option<i32>,
+        /// Optional comma-separated list of artifact paths to hash
+        #[arg(long)]
+        artifacts: Option<String>,
+    },
+    /// Long-running executor (FORGE-side, task 3 of issue #143)
+    Serve,
+    /// List recent verification results (humans/audit)
+    List {
+        /// Filter by pair ID (optional)
+        #[arg(long)]
+        pair_id: Option<String>,
+    },
+}
+
 fn require_env(name: &str) -> Result<String> {
     std::env::var(name).context(format!(
         "{} is not set. This must be injected by the workspace template.",
@@ -254,6 +305,16 @@ async fn main() -> Result<()> {
         } => {
             store.heartbeat_stop(&ticket, &role).await?;
         }
+        Commands::Plan {
+            action: PlanAction::Write { file },
+        } => {
+            store.plan_write(&ticket, &file).await?;
+        }
+        Commands::Plan {
+            action: PlanAction::Read,
+        } => {
+            store.plan_read(&ticket).await?;
+        }
         Commands::Gate {
             action: GateAction::Approve { phase, notes },
         } => {
@@ -265,6 +326,35 @@ async fn main() -> Result<()> {
             action: GateAction::Status { phase },
         } => {
             store.gate_status(&ticket, &phase).await?;
+        }
+        Commands::Verify {
+            action:
+                VerifyAction::Request {
+                    argv,
+                    timeout_secs,
+                    expect_exit,
+                    artifacts,
+                },
+        } => {
+            store
+                .verify_request(
+                    &ticket,
+                    argv,
+                    timeout_secs,
+                    expect_exit,
+                    artifacts.as_deref(),
+                )
+                .await?;
+        }
+        Commands::Verify {
+            action: VerifyAction::Serve,
+        } => {
+            store.verify_serve(&ticket, &role).await?;
+        }
+        Commands::Verify {
+            action: VerifyAction::List { pair_id },
+        } => {
+            store.verify_list(pair_id.as_deref()).await?;
         }
     }
 

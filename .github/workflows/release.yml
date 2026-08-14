@@ -165,6 +165,20 @@ jobs:
           cd dist
           sha256sum "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
 
+      # Copy harness standalone as a tarball and upload as a direct release asset.
+      # Uses PREDICTABLE fixed asset name so GitHub auto-replaces it on each publish.
+      - name: Copy standalone harness (linux-musl only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          mkdir -p "dist/_harness_tmp"
+          cp "target/${{ matrix.target }}/release/openflows-harness" "dist/_harness_tmp/"
+          chmod +x "dist/_harness_tmp/openflows-harness"
+          # Fixed asset name: same for every release (GitHub replaces existing asset)
+          tar -czf "dist/openflows-harness-x86_64-unknown-linux-musl.tar.gz" \
+            -C dist "_harness_tmp/openflows-harness"
+          rm -rf "dist/_harness_tmp"
+          echo "Standalone harness tarball created"
+
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -288,6 +302,35 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Upload the harness standalone asset via gh CLI — same predictable fixed asset name
+      # that harness-publish.yml uses. Since it always uses the same basename and both
+      # workflows upload to the same named release tag, GitHub silently OVERWRITES the old
+      # asset — no delete step needed.
+      - name: Upload harness standalone asset
+        run: |
+          if [ "${{ needs.resolve-version.outputs.is_prerelease }}" == "true" ]; then
+            echo "Pre-release: standalone harness uploaded to harness-edge by harness-publish.yml instead."
+          else
+            # Find the standalone harness tarball. It's in the x86_64-unknown-linux-musl
+            # build dir; the release job downloads all artifacts into dist/.
+            STANDALONE="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
+            if [ -f "dist/${STANDALONE}" ]; then
+              echo "Uploading openflows-harness standalone to ${{ needs.resolve-version.outputs.version }}..."
+              gh release upload "${{ needs.resolve-version.outputs.version }}" \
+                "dist/${STANDALONE}" \
+                --repo "${{ github.repository }}"
+              echo ""
+              echo "Standalone harness published to:"
+              echo "  https://github.com/${{ github.repository }}/releases/tag/${{ needs.resolve-version.outputs.version }}"
+              echo "  Direct URL: https://github.com/${{ github.repository }}/releases/download/${{ needs.resolve-version.outputs.version }}/${STANDALONE}"
+            else
+              echo "WARNING: standalone harness tarball not found in dist/. Finding harness files:"
+              find dist/ -name "openflows-harness*" -ls 2>/dev/null || true
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-npm:
     name: Publish to npm

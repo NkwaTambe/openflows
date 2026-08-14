@@ -17,3 +17,6 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 config = { path = "../config" }
 coder-client = { path = "../coder-client" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

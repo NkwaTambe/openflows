@@ -24,6 +24,11 @@ status=$(openflows-harness status get 2>/dev/null || echo '{}')
 phase=$(printf '%s' "$status" | sed -n 's/.*"phase"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
 
 case "$phase" in
+  planning)
+    # Planning is an intentional gate: FORGE should stop after writing PLAN.md
+    # and let SENTINEL review/approve before implementation begins.
+    exit 0
+    ;;
   review_ready|blocked)
     # Terminal-enough states: sentinel/human takes over from here.
     exit 0

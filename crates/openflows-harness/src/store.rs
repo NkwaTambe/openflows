@@ -3,13 +3,16 @@
 //! All keys are prefixed with `ns:{tenant}:` for tenant isolation.
 //! All writes are validated against serde schemas from `config::state`.
 
+use a2a_protocol::{VerifyCwd, VerifyExpect, VerifyKind, VerifyProgressEvent, VerifyRequest};
 use anyhow::{bail, Context, Result};
 use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, HeartbeatRecord};
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 /// Valid phases for the `status set` command.
 const VALID_PHASES: &[&str] = &["planning", "building", "testing", "review_ready", "blocked"];
@@ -529,6 +532,334 @@ impl HarnessStore {
         let _: Result<i64, _> = self.client.del(&key).await;
         println!("Deleted: {}", key);
         info!(key = %key, "heartbeat stopped");
+        Ok(())
+    }
+
+    /// Submit a verify request (SENTINEL-side, task 3 of issue #143).
+    /// Sends A2A request to nexus relay, streams progress, writes final result to stdout as JSON.
+    pub async fn verify_request(
+        &self,
+        ticket: &str,
+        argv: Vec<String>,
+        timeout_secs: u64,
+        expect_exit: Option<i32>,
+        artifacts: Option<&str>,
+    ) -> Result<()> {
+        // Create A2A client for this pair (ticket == pair_id in current design)
+        let client = crate::a2a_client::A2AClient::new(ticket.to_string(), "sentinel".to_string())?;
+
+        // Health check first
+        client.health_check().await?;
+
+        // Parse artifacts list if provided
+        let artifact_list: Vec<String> = artifacts
+            .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default();
+
+        // Build VerifyRequest
+        let request = VerifyRequest {
+            pair_id: ticket.to_string(),
+            kind: VerifyKind::Command,
+            cwd: VerifyCwd::Repo, // Could be configurable
+            argv,
+            timeout_secs,
+            env_allowlist: vec![], // Could be configurable
+            expect: VerifyExpect {
+                exit_code: expect_exit,
+                artifacts: artifact_list,
+            },
+        };
+
+        // Submit request to relay
+        let task_id = client
+            .submit_verify_request(&request)
+            .await
+            .context("Failed to submit verify request")?;
+
+        info!(task_id = %task_id, pair_id = ticket, "Verify request submitted");
+
+        // Poll the relay for the terminal result. The task passes through
+        // pending → running (Forge) → completed, at which point the relay has
+        // mirrored the result to Redis and `tasks/get` returns it. Bounded to
+        // avoid an infinite loop if Forge never picks the task up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(request.timeout_secs + 60);
+        loop {
+            if let Some(result) = client.get_task_status(&task_id).await? {
+                // The result is durable (mirrored by the relay before ack);
+                // surface it as JSON for the caller.
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                if result.timed_out {
+                    bail!("verification timed out");
+                }
+                match request.expect.exit_code {
+                    Some(expected) if result.exit_code != Some(expected) => {
+                        bail!(
+                            "verification failed: expected exit {}, got {:?}",
+                            expected,
+                            result.exit_code
+                        )
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "verification did not complete before deadline (task {})",
+                    task_id
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+        }
+    }
+
+    /// Long-running executor (FORGE-side, task 5 of issue #143).
+    /// Subscribes to verify tasks from nexus relay, executes them in sandbox, returns results.
+    /// This is the core executor implementation with full sandbox isolation.
+    pub async fn verify_serve(&self, ticket: &str, role: &str) -> Result<()> {
+        // Verify this is Forge role
+        if !role.eq_ignore_ascii_case("forge") {
+            bail!("verify serve requires FORGE role, got {}", role);
+        }
+
+        let client = crate::a2a_client::A2AClient::new(ticket.to_string(), role.to_string())?;
+
+        // Health check
+        client.health_check().await?;
+
+        // Get workspace ID for audit trail
+        let workspace_id =
+            std::env::var("CODER_WORKSPACE_ID").unwrap_or_else(|_| "unknown".to_string());
+
+        // Get tenant for Redis namespacing
+        let tenant = std::env::var("OPENFLOWS_TENANT").context("OPENFLOWS_TENANT not set")?;
+
+        println!(
+            "✓ Forge verify executor ready (workspace: {}, ticket: {})",
+            workspace_id, ticket
+        );
+        println!("  Listening for tasks from nexus A2A relay... (Ctrl+C to stop)");
+
+        // Poll the relay for tasks assigned to this pair. Forge is the only
+        // role that may claim (`tasks/claim` enforces this relay-side). Each
+        // claimed task is executed in the sandbox and the terminal result is
+        // submitted via `tasks/complete`, which mirrors it to Redis so
+        // Sentinel's `tasks/get` can observe completion.
+        loop {
+            // Claim the next pending task for this pair.
+            let claimed = match client.claim_next_task().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "Failed to claim task; backing off");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            let (task_id, request) = match claimed {
+                Some(t) => t,
+                None => {
+                    // No work: brief pause before polling again.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+
+            info!(
+                task_id = %task_id,
+                pair_id = ticket,
+                argv = ?request.argv,
+                "Executing claimed verify task"
+            );
+
+            // Set up progress streaming channel
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<VerifyProgressEvent>();
+
+            // Get a cancel token — starts local and is synced to the relay's
+            // cancel state by a background polling task below.
+            let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Spawn a background poller that checks the relay for cancellation
+            // and sets the local token so the executor kills the child process.
+            let cancel_token_for_poller = cancel_token.clone();
+            let poller_task_id = task_id.clone();
+            let poller_client =
+                crate::a2a_client::A2AClient::new(ticket.to_string(), "forge".to_string());
+            if let Ok(poller) = poller_client {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        match poller.get_task_status_str(&poller_task_id).await {
+                            Ok(status) if status == "cancelled" => {
+                                cancel_token_for_poller.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            Ok(status) if status == "completed" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+
+            // Spawn a task to forward progress events to the relay
+            let progress_task_id = task_id.clone();
+            let progress_client =
+                crate::a2a_client::A2AClient::new(ticket.to_string(), "forge".to_string());
+            let progress_handle = match progress_client {
+                Ok(pc) => {
+                    let client_for_progress = pc;
+                    Some(tokio::spawn(async move {
+                        while let Some(event) = progress_rx.recv().await {
+                            if let Err(e) = client_for_progress
+                                .push_progress(&progress_task_id, &event)
+                                .await
+                            {
+                                debug!(error = %e, "Failed to push progress event (non-fatal)");
+                            }
+                        }
+                    }))
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to create progress client; progress streaming disabled");
+                    None
+                }
+            };
+
+            let result = match crate::executor::execute_verify_task(
+                &self.client,
+                &tenant,
+                &request.pair_id,
+                &request.argv,
+                request.timeout_secs,
+                &workspace_id,
+                Some(&task_id),
+                Some(progress_tx),
+                Some(cancel_token.clone()),
+            )
+            .await
+            {
+                Ok(mut r) => {
+                    // Ensure the result is attributed to the claimed task id
+                    // (the executor falls back to a fresh id when absent).
+                    r.task_id = task_id.clone();
+                    r
+                }
+                Err(e) => {
+                    // Execution failed before producing a result. Report a
+                    // synthetic failure so the task does not hang pending
+                    // forever on the Sentinel side.
+                    eprintln!("  [TASK FAILED] {}: {}", task_id, e);
+                    let fail = a2a_protocol::VerifyResult {
+                        task_id: task_id.clone(),
+                        exit_code: None,
+                        timed_out: false,
+                        duration_ms: 0,
+                        stdout_ref: format!("audit:a2a:{}:stdout", task_id),
+                        stderr_ref: format!("audit:a2a:{}:stderr", task_id),
+                        artifacts: vec![],
+                        executor: a2a_protocol::ExecutorInfo {
+                            role: "forge".to_string(),
+                            workspace: workspace_id.clone(),
+                        },
+                    };
+                    fail
+                }
+            };
+
+            // Drop the progress handle (completes when the stream ends)
+            drop(progress_handle);
+
+            if let Err(e) = client.complete_task(&result).await {
+                warn!(error = %e, task_id = %task_id, "Failed to submit result; will not retry this task");
+                eprintln!("  [ERROR] could not report result for {}: {}", task_id, e);
+            } else {
+                println!(
+                    "  [DONE] task {} → exit_code={:?}, {}ms",
+                    task_id, result.exit_code, result.duration_ms
+                );
+            }
+        }
+    }
+
+    /// Write a plan artifact (FORGE → Redis at `pair:{id}:plan`).
+    ///
+    /// FORGE writes PLAN.md as a local file in its workspace, then calls this
+    /// to persist it directly to Redis SharedStore so SENTINEL (and NEXUS)
+    /// can read it without relying on Coder API filesystem access.
+    pub async fn plan_write(&self, ticket: &str, file_path: &Path) -> Result<()> {
+        let content = std::fs::read_to_string(file_path)
+            .context(format!("Failed to read plan file: {}", file_path.display()))?;
+
+        let key = self.key(&format!("pair:{}:plan", ticket));
+        let _: Result<(), _> = self
+            .client
+            .set::<(), _, _>(&key, content, None, None, false)
+            .await;
+
+        println!("Wrote: {}", key);
+        info!(key = %key, "plan written to SharedStore");
+        Ok(())
+    }
+
+    /// Read a plan artifact from Redis (`pair:{id}:plan`) and print to stdout.
+    ///
+    /// SENTINEL uses this to retrieve the FORGE plan during planning gate review.
+    /// Prints the plan content as raw markdown; prints nothing if unset.
+    pub async fn plan_read(&self, ticket: &str) -> Result<()> {
+        let key = self.key(&format!("pair:{}:plan", ticket));
+        let val: Option<String> = self.client.get(&key).await.context("Redis GET failed")?;
+        match val {
+            Some(content) => {
+                print!("{}", content);
+            }
+            None => {
+                bail!(
+                    "No plan found for ticket {}. FORGE must write a plan via \
+                     `openflows-harness plan write --file PLAN.md` first.",
+                    ticket
+                );
+            }
+        }
+        debug!(key = %key, "plan read");
+        Ok(())
+    }
+
+    /// List recent verification results (humans/audit, task 3 of issue #143).
+    pub async fn verify_list(&self, pair_id: Option<&str>) -> Result<()> {
+        if let Some(id) = pair_id {
+            // List results for a specific pair
+            let key = self.key(&format!("pair:{}:verification", id));
+            let json_result: Option<String> =
+                self.client.get(&key).await.context("Redis GET failed")?;
+
+            match json_result {
+                Some(json) => {
+                    // Parse and pretty-print
+                    match serde_json::from_str::<serde_json::Value>(&json) {
+                        Ok(result) => {
+                            println!("Verification result for {}:", id);
+                            println!("{}", serde_json::to_string_pretty(&result)?);
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse verification result");
+                            println!("(unparsable result: {})", json);
+                        }
+                    }
+                }
+                None => {
+                    println!("No verification results for {}", id);
+                }
+            }
+        } else {
+            // Enumerate all pair:*:verification keys (requires scan)
+            // For now, just note that this requires Redis SCAN
+            println!("✓ Verification results (enumeration requires Redis SCAN):");
+            println!("  Use --pair-id <ID> to view specific results");
+            println!("  Results stored under: pair:{{pair_id}}:verification");
+        }
         Ok(())
     }
 }

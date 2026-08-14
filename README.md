@@ -1,5 +1,5 @@
 # OpenFlows — Autonomous AI Development Team on Coder
-<img src="image-1.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
+<img src="./assets/home.png" alt="OpenFlows demo" style="width: 100%; max-width: 1200px; height: auto; display: block; margin: 0 auto;">
 
 > Official site: [openflows.dev](https://openflows.dev)
 
@@ -47,6 +47,40 @@ FORGE writes plan (PLAN.md) → Sets status to 'planning' → HALTS
 - Only the `planning` → `building` transition is gated; subsequent phases are unconstrained
 
 This ensures every issue is carefully planned before coding begins, catching scope creep and spec mismatches early.
+
+### A2A Delegated Verification (Issue #143)
+
+SENTINEL needs to verify acceptance criteria without direct access to FORGE's workspace. OpenFlows provides a secure A2A relay for this:
+
+```
+SENTINEL reads CONTRACT.md → Wants to run acceptance tests
+            ↓
+SENTINEL calls: openflows-harness verify request --argv "cargo test --features acceptance" --timeout-secs 300 --expect-exit 0
+            ↓
+Nexus A2A Relay (HTTP on port 3000)
+  - Validates pair_id, command (allowlist only: cargo test, npm test, make test, bun test)
+  - Deduplicates requests (pair_id + sha256 hash)
+  - Routes to FORGE's verify serve executor
+            ↓
+FORGE executor runs in sandbox:
+  - Spawns process with timeout enforcement (default 600s max)
+  - Captures stdout/stderr (bounded 10KB tail per stream)
+  - Enforces resource limits
+            ↓
+Result mirrored to Redis → SENTINEL polls and checks exit code
+            ↓
+If exit_code == 0: acceptance satisfied ✅
+If timeout/failure: acceptance failed ❌
+```
+
+**Key guarantees:**
+- ✅ SENTINEL cannot execute arbitrary code (allowlist enforced at relay)
+- ✅ Commands always have a timeout (prevents hanging)
+- ✅ Output is bounded (prevents memory explosion)
+- ✅ Results are durable (persisted to Redis before ACK)
+- ✅ Full audit trail (all commands logged to `audit:a2a:*` keys)
+
+See [`docs/architecture/a2a-verification.md`](docs/architecture/a2a-verification.md) for full protocol and error handling.
 
 ### Coder governs *where* agents run — OpenFlows governs *how* they coordinate
 
@@ -111,6 +145,9 @@ See [`docs/extending.md`](docs/extending.md) for details.
 | [docs/tenancy.md](docs/tenancy.md) | Multi-tenant model and Redis namespacing |
 | [docs/governance.md](docs/governance.md) | AI governance controls and network policy |
 | [docs/extending.md](docs/extending.md) | Adding skills, MCP servers, and models |
+| [docs/architecture/a2a-verification.md](docs/architecture/a2a-verification.md) | A2A delegated verification protocol and executor sandbox |
+| [docs/ORCHESTRATOR.md](docs/ORCHESTRATOR.md) | Nexus orchestrator, agents, and A2A relay architecture |
+| [docs/AGENT_BOOTSTRAP.md](docs/AGENT_BOOTSTRAP.md) | Session bootstrap, hook system, and executor setup |
 
 ## License
 

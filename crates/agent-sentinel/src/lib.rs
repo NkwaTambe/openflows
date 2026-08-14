@@ -102,22 +102,10 @@ impl Node for SentinelNode {
 
             // ── Check for PR review verdicts ──
             let review_key = full_ticket_key(&ticket.id, "review", "sentinel");
-            let review_json: Option<String> = store.get_typed(&review_key).await;
-            let has_review = review_json.is_some();
+            let review_payload: Option<ReviewPayload> = store.get_typed(&review_key).await;
+            let has_review = review_payload.is_some();
 
-            if let Some(review_json) = review_json {
-                let review: ReviewPayload = match serde_json::from_str(&review_json) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        warn!(
-                            ticket_id = %ticket.id,
-                            error = %e,
-                            "Failed to parse sentinel review payload"
-                        );
-                        continue;
-                    }
-                };
-
+            if let Some(review) = review_payload {
                 reviewable.push(json!({
                     "ticket_id": ticket.id,
                     "worker_id": worker_id,
@@ -141,9 +129,7 @@ impl Node for SentinelNode {
 
             if phase == Some("planning") {
                 // Check if gate already approved
-                let tenant =
-                    std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
-                let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket.id);
+                let gate_key = format!("ticket:{}:gate:planning", ticket.id);
                 let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
 
                 if gate_approval.is_none() {
@@ -312,6 +298,11 @@ impl Node for SentinelNode {
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
 
+                    // Consume the review verdict so it is not replayed on the
+                    // next poll cycle.
+                    let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                    store.del(&review_key).await;
+
                     any_approved = true;
                 }
                 "reject" => {
@@ -321,18 +312,22 @@ impl Node for SentinelNode {
                     );
 
                     let review_key = full_ticket_key(ticket_id, "review", "sentinel");
-                    let review_json: Option<String> = store.get_typed(&review_key).await;
-                    let report = review_json
-                        .and_then(|j| serde_json::from_str::<ReviewPayload>(&j).ok())
+                    let report = store
+                        .get_typed::<ReviewPayload>(&review_key)
+                        .await
                         .map(|r| r.report)
                         .unwrap_or_default();
 
-                    let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "forge");
+                    // Look up the FORGE chat via the assigned worker_id, not the
+                    // literal role string "forge". The chat key is stored as
+                    // `ticket:{id}:chat:{worker_id}` (e.g. `forge-1`).
+                    let worker_id = verdict["worker_id"].as_str().unwrap_or("");
+                    let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, worker_id);
                     let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
 
-                    if let (Some(ref client), Some(chat_id)) = (&client, forge_chat_id) {
+                    if let (Some(ref client), Some(ref chat_id)) = (&client, &forge_chat_id) {
                         if let Err(e) =
-                            Self::send_rejection_follow_up(client, &chat_id, ticket_id, &report)
+                            Self::send_rejection_follow_up(client, chat_id, ticket_id, &report)
                                 .await
                         {
                             warn!(
@@ -341,6 +336,14 @@ impl Node for SentinelNode {
                                 "Failed to send rejection follow-up to forge"
                             );
                         }
+                    } else {
+                        warn!(
+                            ticket_id,
+                            worker_id,
+                            has_client = client.is_some(),
+                            has_chat_id = forge_chat_id.is_some(),
+                            "Cannot send rejection follow-up — missing Coder client or forge chat"
+                        );
                     }
 
                     let sentinel_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
@@ -361,6 +364,10 @@ impl Node for SentinelNode {
                     let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
                     store.set(&action_key, json!("completed")).await;
 
+                    // Consume the review verdict so it is not replayed on the
+                    // next poll cycle.
+                    store.del(&review_key).await;
+
                     any_rejected = true;
                 }
                 "planning_gate_pending" => {
@@ -368,48 +375,96 @@ impl Node for SentinelNode {
                     // Check if the planning gate has been approved since prep() ran.
                     // The SENTINEL chat runs `openflows-harness gate approve --phase planning`
                     // inside the workspace, which writes to SharedStore.
-                    let tenant =
-                        std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
-                    let gate_key = format!("ns:{}:ticket:{}:gate:planning", tenant, ticket_id);
+                    let gate_key = format!("ticket:{}:gate:planning", ticket_id);
                     let gate_approval: Option<serde_json::Value> = store.get_typed(&gate_key).await;
 
                     if gate_approval.is_some() {
-                        info!(
-                            ticket_id,
-                            "Sentinel: planning gate APPROVED — FORGE can proceed to building"
-                        );
+                        // TASK 4: Check if PLAN artifact exists before approving gate.
+                        // Per issue #143: "Sentinel gate policy: hard-fail (never approve)
+                        // when PLAN.md / pair:{id}:plan is missing or unreadable."
+                        let plan_key = format!("pair:{}:plan", ticket_id);
+                        let plan_exists: bool = store.get(&plan_key).await.is_some();
 
-                        // Archive the sentinel chat since gate review is complete
-                        let sentinel_chat_key =
-                            full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
-                        if let Some(ref client) = &client {
-                            if let Some(sentinel_chat_id) =
-                                store.get_typed::<String>(&sentinel_chat_key).await
-                            {
-                                if let Err(e) = client.archive_chat(&sentinel_chat_id).await {
-                                    warn!(
-                                        ticket_id,
-                                        error = %e,
-                                        "Failed to archive sentinel chat after planning gate approval"
-                                    );
+                        if !plan_exists {
+                            // Plan is missing — refuse to approve gate
+                            warn!(
+                                ticket_id,
+                                "Sentinel: gate BLOCKED — PLAN artifact missing or unreadable \
+                                 (issue #143 task 4)"
+                            );
+
+                            // Emit blocked verdict via review payload
+                            let review_payload = ReviewPayload {
+                                verdict: "blocked".to_string(),
+                                report: "Gate approval blocked: PLAN.md missing or unreadable. \
+                                         Sentinel cannot approve acceptance criteria without the plan."
+                                    .to_string(),
+                                pr_number: None,
+                            };
+                            let review_key = full_ticket_key(ticket_id, "review", "sentinel");
+                            store
+                                .set(&review_key, serde_json::to_value(&review_payload).unwrap())
+                                .await;
+
+                            // Archive the sentinel chat
+                            let sentinel_chat_key =
+                                full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                            if let Some(ref client) = &client {
+                                if let Some(sentinel_chat_id) =
+                                    store.get_typed::<String>(&sentinel_chat_key).await
+                                {
+                                    if let Err(e) = client.archive_chat(&sentinel_chat_id).await {
+                                        warn!(
+                                            ticket_id,
+                                            error = %e,
+                                            "Failed to archive sentinel chat after gate refusal"
+                                        );
+                                    }
                                 }
                             }
-                        }
 
-                        // Release the sentinel slot so it's available for future reviews
-                        let worker_id = verdict["worker_id"].as_str().unwrap_or("");
-                        if !worker_id.is_empty() {
-                            let mut slots: HashMap<String, WorkerSlot> =
-                                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                            if let Some(slot) = slots.get_mut(worker_id) {
-                                slot.status = WorkerStatus::Idle;
+                            // Mark action as completed and continue
+                            let action_key =
+                                full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                            store.set(&action_key, json!("completed")).await;
+                        } else {
+                            info!(
+                                ticket_id,
+                                "Sentinel: planning gate APPROVED — FORGE can proceed to building"
+                            );
+
+                            // Archive the sentinel chat since gate review is complete
+                            let sentinel_chat_key =
+                                full_ticket_key(ticket_id, KEY_TICKET_CHAT, "sentinel");
+                            if let Some(ref client) = &client {
+                                if let Some(sentinel_chat_id) =
+                                    store.get_typed::<String>(&sentinel_chat_key).await
+                                {
+                                    if let Err(e) = client.archive_chat(&sentinel_chat_id).await {
+                                        warn!(
+                                            ticket_id,
+                                            error = %e,
+                                            "Failed to archive sentinel chat after planning gate approval"
+                                        );
+                                    }
+                                }
                             }
-                            store
-                                .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
-                                .await;
-                        }
 
-                        any_planning_approved = true;
+                            // Release the sentinel slot so it's available for future reviews
+                            let worker_id = verdict["worker_id"].as_str().unwrap_or("");
+                            if !worker_id.is_empty() {
+                                let mut slots: HashMap<String, WorkerSlot> =
+                                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                                if let Some(slot) = slots.get_mut(worker_id) {
+                                    slot.status = WorkerStatus::Idle;
+                                }
+                                store
+                                    .set(KEY_WORKER_SLOTS, serde_json::to_value(slots)?)
+                                    .await;
+                            }
+
+                            any_planning_approved = true;
+                        }
                     } else {
                         info!(
                             ticket_id,

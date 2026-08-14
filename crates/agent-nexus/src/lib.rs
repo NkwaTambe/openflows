@@ -16,12 +16,15 @@ use config::{
 };
 use openflows_notifier::{NotificationMessage, NotificationService};
 use pocketflow_core::{node::PAUSE_SIGNAL, Action, Node, SharedStore};
+use provisioner::{transport::CoderTransport, Provisioner};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+pub mod a2a;
 
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
 /// (Inlined from the deleted agent-client crate.)
@@ -70,6 +73,10 @@ fn is_ci_setup_ticket(ticket: &Ticket) -> bool {
 
 fn has_ci_setup_ticket(tickets: &[Ticket]) -> bool {
     tickets.iter().any(is_ci_setup_ticket)
+}
+
+fn is_synthetic_ci_setup_ticket(ticket: &Ticket) -> bool {
+    ticket.id == CI_SETUP_TICKET_ID || ticket.id.starts_with("T-CI-")
 }
 
 fn ci_setup_ticket_active(tickets: &[Ticket]) -> bool {
@@ -240,6 +247,7 @@ pub struct FlowRecovery {
 pub struct NexusNode {
     pub persona_path: PathBuf,
     pub registry_path: PathBuf,
+    pub a2a_relay: Option<std::sync::Arc<crate::a2a::A2ARelay>>,
 }
 
 impl NexusNode {
@@ -247,7 +255,15 @@ impl NexusNode {
         Self {
             persona_path: persona_path.into(),
             registry_path: registry_path.into(),
+            a2a_relay: None,
         }
+    }
+
+    /// Attach an A2A relay reference so NexusNode can check relay health
+    /// and surface pending verify tasks in orchestration decisions.
+    pub fn with_a2a_relay(mut self, relay: std::sync::Arc<crate::a2a::A2ARelay>) -> Self {
+        self.a2a_relay = Some(relay);
+        self
     }
 
     fn resolve_github_token(&self) -> Result<String> {
@@ -277,8 +293,8 @@ impl NexusNode {
     }
 
     fn load_agent_persona(&self, role: &str) -> Option<String> {
-        let orch_dir = std::env::var("ORCHESTRATOR_DIR").ok()?;
-        let persona_path = std::path::PathBuf::from(orch_dir)
+        let artifacts_dir = std::env::var("ARTIFACTS_DIR").ok()?;
+        let persona_path = std::path::PathBuf::from(artifacts_dir)
             .join("orchestration")
             .join("agent")
             .join("agents")
@@ -963,6 +979,38 @@ Before significant work, read the relevant skill file to understand the workflow
             workspace_id = %workspace.id,
             "Coder workspace provisioned"
         );
+
+        // ── Provision configuration into the workspace ──────────────────
+        // Copy skills, standards, and persona files via SSH so the agent
+        // has everything it needs when it starts working.
+        if let Ok(artifacts_dir) = std::env::var("ARTIFACTS_DIR") {
+            let orch_path = std::path::PathBuf::from(artifacts_dir);
+            let transport = CoderTransport::new(client.clone(), &workspace.id);
+            let provisioner = Provisioner::new(&orch_path);
+            let worker_role = Self::worker_role(worker_id);
+            if let Ok(reg) = self.load_registry() {
+                if let Err(e) = provisioner
+                    .provision_role(&transport, worker_role, &reg)
+                    .await
+                {
+                    warn!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        role = %worker_role,
+                        error = %e,
+                        "Failed to provision workspace configuration — continuing anyway"
+                    );
+                } else {
+                    info!(
+                        worker_id,
+                        workspace_id = %workspace.id,
+                        role = %worker_role,
+                        "Provisioned workspace configuration (skills, standards, persona)"
+                    );
+                }
+            }
+        }
+
         Ok(Some(workspace.id))
     }
 
@@ -1056,6 +1104,8 @@ Before significant work, read the relevant skill file to understand the workflow
         ticket: &Ticket,
     ) {
         let ticket_id = &ticket.id;
+        debug!(worker_id, ticket_id, "create_chat_for_assignment: starting");
+
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
             None => {
@@ -1107,6 +1157,12 @@ Before significant work, read the relevant skill file to understand the workflow
         let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
 
         let existing_chat_id: Option<String> = store.get_typed(&chat_key).await;
+        debug!(
+            worker_id,
+            ticket_id,
+            existing = ?existing_chat_id,
+            "Checking for existing chat in Redis"
+        );
         if let Some(existing_chat_id) = existing_chat_id {
             // Distinguish "the chat no longer exists" (404 → None → rotate) from
             // a transient API failure (timeout / rate limit / 5xx → Err → keep
@@ -1134,56 +1190,25 @@ Before significant work, read the relevant skill file to understand the workflow
                 Ok(Some(chat)) => {
                     let status = chat.status();
 
-                    if status == ChatStatus::Waiting {
-                        let last_action: Option<String> = store.get_typed(&action_key).await;
-                        if matches!(last_action.as_deref(), None | Some("completed")) {
-                            // Send a minimal follow-up that leverages harness state
-                            // instead of a generic "continue" prompt. The agent uses
-                            // openflows-harness to understand where it left off.
-                            let follow_up_prompt = format!(
-                                "Resume work on ticket {}. Check your phase with \
-                                 `openflows-harness status get` and dispatch with \
-                                 `openflows-harness dispatch read`. Continue from there.",
-                                ticket_id
-                            );
-                            if let Ok(message) = client
-                                .send_chat_message(
-                                    &chat.id,
-                                    vec![coder_client::types::ChatInputPart::text(
-                                        follow_up_prompt,
-                                    )],
-                                )
-                                .await
-                            {
-                                info!(
-                                    chat_id = %chat.id,
-                                    worker_id,
-                                    ticket_id,
-                                    message_id = %message.id,
-                                    "Sent harness-aware follow-up message to resume work"
-                                );
-                                store.set(&action_key, json!("follow_up_sent")).await;
-                                return;
-                            }
-                        }
-                    }
-
-                    // If the chat is in an error state, it is stale — rotate it so the
-                    // code below falls through and provisions a fresh chat bound to the
-                    // current workspace. Without this, a dead chat ID can persist in Redis
-                    // across workspace re-provisioning and retry cycles, silently starving
-                    // the ticket of an active chat while the LLM continues re-polling it.
-                    if status == ChatStatus::Error {
-                        debug!(
+                    // The chat must be bound to the workspace currently provisioned
+                    // for this worker. If the stored chat points at a different (old,
+                    // deleted, or re-provisioned) workspace ID, the workspace agent
+                    // it is bound to no longer exists and the chat can never connect —
+                    // it will sit in `waiting`/`error` forever while the real workspace
+                    // runs idle. Treat a workspace mismatch as stale and rotate the
+                    // chat so it is recreated against the current workspace below.
+                    let workspace_mismatch = chat.workspace_id != workspace_id;
+                    if workspace_mismatch {
+                        info!(
                             chat_id = %chat.id,
                             worker_id,
                             ticket_id,
-                            status = ?status,
-                            "Stored chat is in error state — deleting stale chat_id to create replacement"
+                            stored_workspace_id = %chat.workspace_id,
+                            current_workspace_id = %workspace_id,
+                            "Stored chat bound to a different/stale workspace — rotating chat to bind to the current workspace"
                         );
-                        // DELETE the keys (not store an empty string — see the
-                        // 404 branch above for why an empty value would loop
-                        // forever on the next poll).
+                        // DELETE the keys (not store an empty string — see the 404 branch
+                        // above for why an empty value would loop forever on the next poll).
                         store.del(&chat_key).await;
                         store.del(&action_key).await;
                         // Also clear the chat_id from the dispatch payload so mid-flight
@@ -1200,8 +1225,49 @@ Before significant work, read the relevant skill file to understand the workflow
                                     .await;
                             }
                         }
-                        // Fall through to create a new chat below.
-                    } else {
+                    }
+
+                    if !workspace_mismatch {
+                        let last_action: Option<String> = store.get_typed(&action_key).await;
+                        if Self::is_waiting_for_planning_gate(store, ticket_id).await {
+                            debug!(
+                                chat_id = %chat.id,
+                                worker_id,
+                                ticket_id,
+                                status = ?status,
+                                "Forge is waiting on planning gate; not sending resume prompt"
+                            );
+                            return;
+                        }
+
+                        if Self::should_resume_existing_chat(status, last_action.as_deref()) {
+                            match self.resume_chat(&client, &chat, ticket_id).await {
+                                Ok(message) => {
+                                    info!(
+                                        chat_id = %chat.id,
+                                        worker_id,
+                                        ticket_id,
+                                        message_id = %message.id,
+                                        previous_status = ?status,
+                                        "Sent harness-aware follow-up message to resume existing chat"
+                                    );
+                                    store.set(&action_key, json!("follow_up_sent")).await;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        chat_id = %chat.id,
+                                        worker_id,
+                                        ticket_id,
+                                        previous_status = ?status,
+                                        error = %e,
+                                        "Failed to resume existing chat; keeping chat_id for retry"
+                                    );
+                                    store.set(&action_key, json!("resume_failed")).await;
+                                }
+                            }
+                            return;
+                        }
+
                         debug!(
                             chat_id = %chat.id,
                             worker_id,
@@ -1211,6 +1277,8 @@ Before significant work, read the relevant skill file to understand the workflow
                         );
                         return;
                     }
+                    // When `workspace_mismatch` is true and the chat was not handled as
+                    // error/waiting above, fall through to create a fresh chat below.
                 }
                 Err(e) => {
                     // Transient failure (timeout / rate limit / 5xx). DO NOT clear the
@@ -1242,16 +1310,17 @@ Before significant work, read the relevant skill file to understand the workflow
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
 
         // Resolve the default organization ID required by the Coder chats API.
+        // Fail fast if unavailable rather than proceeding with broken state.
         let organization_id = match client.get_default_organization_id().await {
             Ok(id) => Some(id),
             Err(e) => {
-                warn!(
+                error!(
                     worker_id,
                     ticket_id,
                     error = %e,
-                    "Failed to resolve default organization ID; chat creation may fail"
+                    "CRITICAL: Failed to resolve default organization ID; chat creation cannot proceed. Ensure Coder has a default organization configured."
                 );
-                None
+                return;
             }
         };
 
@@ -1297,18 +1366,28 @@ Use `openflows-harness` for all coordination:
 | `handoff write --contract F --notes N` | Prepare for next agent |
 
 ### Phase Workflow
-1. `planning` → Analyze task, write PLAN.md, set `status set planning`
-2. `building` → Implement, set `status set building`
+1. Analyze task, write PLAN.md, then set `status set planning` and wait for SENTINEL approval
+2. `building` → After SENTINEL approval, implement and set `status set building`
 3. `testing` → Run tests, verify, set `status set testing`
 4. `review_ready` | OPEN PR, request review, set `status set review_ready`
 5. `blocked` → Stuck? Set status and explain
 "#;
 
-        // Build comprehensive initial prompt with all context
+        // Build comprehensive initial prompt with all context.
+        //
+        // The full persona is provisioned into the workspace as `AGENTS.md`
+        // (see `provisioner::Provisioner::provision_role`), which Coder Agents
+        // reads and injects into the system prompt for every conversation in
+        // that workspace — so we keep the persona out of the first user
+        // message to keep it light and reliable. We still reference the
+        // workspace files explicitly and keep the task/skills/dispatch/coordination
+        // context inline so the orchestrator drives the ticket on message one.
         let base_prompt = match persona {
-            Some(p) => format!(
-                "{}\n\n{}\n\n{}\n\n{}\n\n{}",
-                p, ticket_content, skills_content, dispatch_info, coordination_info
+            Some(_) => format!(
+                "You are the **{}** agent.\n\nYour full persona, skills, and standards are \
+                 provisioned in this workspace as `AGENTS.md` and `{}.agent.md` — read them \
+                 for your identity, capabilities, and protocols.\n\n{}\n\n{}\n\n{}\n\n{}",
+                role, role, ticket_content, skills_content, dispatch_info, coordination_info
             ),
             None => format!(
                 "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized agent.\n\n{}\n\n{}\n\n{}\n\n{}",
@@ -1317,8 +1396,16 @@ Use `openflows-harness` for all coordination:
         };
 
         let initial_prompt = format!(
-            "{}\n\n**Begin work immediately.** Set `openflows-harness status set planning`, then start analyzing the task.\n",
+            "{}\n\n**Begin work immediately.** Analyze the task, write `PLAN.md`, then run `openflows-harness status set planning` and wait for SENTINEL gate approval before implementation.\n",
             base_prompt
+        );
+
+        info!(
+            worker_id,
+            ticket_id,
+            workspace_id = %workspace_id,
+            model_config_id = ?model_config_id,
+            "Creating Coder Chat for ticket assignment"
         );
 
         let chat_req = CreateChatRequest {
@@ -1329,59 +1416,170 @@ Use `openflows-harness` for all coordination:
             labels: Some(labels),
         };
 
-        match client.create_chat(&chat_req).await {
-            Ok(chat) => {
-                // Also check the initial chat status for diagnostics
-                let chat_status = chat.status();
-                let workspace_id_str = &chat.workspace_id;
-                let owner_id = &chat.owner_id;
+        // Create the chat with a bounded retry so a transient failure of the
+        // first request does not silently starve the ticket and force a manual
+        // "continue". The persona is now served server-side via the workspace's
+        // `AGENTS.md` (see Provisioner::provision_role), so the first message is
+        // smaller and materially less likely to trip a failure in the first place.
+        const CREATE_CHAT_MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 1u32;
+        let created = loop {
+            match client.create_chat(&chat_req).await {
+                Ok(chat) => break Some(chat),
+                Err(e) => {
+                    warn!(
+                        worker_id,
+                        ticket_id,
+                        attempt,
+                        max_attempts = CREATE_CHAT_MAX_ATTEMPTS,
+                        error = %e,
+                        "Failed to create Chat for ticket assignment — will retry"
+                    );
+                    if attempt >= CREATE_CHAT_MAX_ATTEMPTS {
+                        debug!(
+                            worker_id,
+                            ticket_id,
+                            "Gave up creating chat this cycle; keys left unset so the next poll recreates it"
+                        );
+                        break None;
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+                }
+            }
+        };
 
-                info!(
+        let Some(chat) = created else {
+            return;
+        };
+
+        // Also check the initial chat status for diagnostics.
+        let chat_status = chat.status();
+        let workspace_id_str = &chat.workspace_id;
+        let owner_id = &chat.owner_id;
+
+        info!(
+            chat_id = %chat.id,
+            worker_id,
+            ticket_id,
+            workspace_id = %workspace_id_str,
+            owner_id = %owner_id,
+            initial_status = ?chat_status,
+            "Created Chat for ticket assignment"
+        );
+
+        // If the chat immediately enters error state, try to nudge it back with
+        // the same harness-aware resume prompt used on the `Waiting` path. Even
+        // if the nudge fails, keep the chat ID so the next poll retries this same
+        // Coder session instead of spawning a duplicate session.
+        if matches!(chat_status, ChatStatus::Error) {
+            const CHAT_RESUME_MAX_ATTEMPTS: u32 = 3;
+            let mut resumed = false;
+            for resume_attempt in 1u32..=CHAT_RESUME_MAX_ATTEMPTS {
+                match self.resume_chat(&client, &chat, ticket_id).await {
+                    Ok(_) => {
+                        info!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            resume_attempt,
+                            "Recovered chat from initial error state"
+                        );
+                        resumed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            chat_id = %chat.id,
+                            worker_id,
+                            ticket_id,
+                            resume_attempt,
+                            max_attempts = CHAT_RESUME_MAX_ATTEMPTS,
+                            error = %e,
+                            "Chat in error state — resume attempt failed"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            2 * resume_attempt as u64,
+                        ))
+                        .await;
+                    }
+                }
+            }
+            if !resumed {
+                warn!(
                     chat_id = %chat.id,
-                    worker_id,
                     ticket_id,
                     workspace_id = %workspace_id_str,
                     owner_id = %owner_id,
-                    initial_status = ?chat_status,
-                    "Created Chat for ticket assignment"
-                );
-
-                // If chat immediately enters error state, log additional diagnostic info
-                if matches!(chat_status, ChatStatus::Error) {
-                    warn!(
-                        chat_id = %chat.id,
-                        ticket_id,
-                        workspace_id = %workspace_id_str,
-                        owner_id = %owner_id,
-                        status_raw = %chat.status_raw,
-                        "Chat immediately entered error status - check Coder Agents configuration"
-                    );
-                }
-
-                // Store chat ID in SharedStore
-                store.set(&chat_key, json!(chat.id)).await;
-
-                // Store chat_action as "started" for tracking
-                store.set(&action_key, json!("started")).await;
-
-                // Update dispatch payload with actual chat ID
-                let mut updated_dispatch = dispatch_payload.clone();
-                updated_dispatch["chat_id"] = json!(chat.id);
-                store.set(&dispatch_key, updated_dispatch).await;
-
-                // Store workspace_id mapping
-                let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
-                store.set(&ws_key, json!(workspace_id)).await;
-            }
-            Err(e) => {
-                warn!(
-                    worker_id,
-                    ticket_id,
-                    error = %e,
-                    "Failed to create Chat for ticket assignment"
+                    status_raw = %chat.status_raw,
+                    "Chat immediately entered error status and did not recover - keeping chat_id so the next poll retries the same session."
                 );
             }
         }
+
+        // Store chat ID in SharedStore
+        store.set(&chat_key, json!(chat.id)).await;
+
+        // Store chat_action as "started" for tracking
+        store.set(&action_key, json!("started")).await;
+
+        // Update dispatch payload with actual chat ID
+        let mut updated_dispatch = dispatch_payload.clone();
+        updated_dispatch["chat_id"] = json!(chat.id);
+        store.set(&dispatch_key, updated_dispatch).await;
+
+        // Store workspace_id mapping
+        let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
+        store.set(&ws_key, json!(workspace_id)).await;
+    }
+
+    /// Send a harness-aware resume prompt to a chat that is stuck.
+    ///
+    /// Reuses the harness-state-driven follow-up so the agent resumes from where
+    /// it left off instead of receiving a generic "continue".
+    async fn resume_chat(
+        &self,
+        client: &CoderClient,
+        chat: &coder_client::types::Chat,
+        ticket_id: &str,
+    ) -> anyhow::Result<coder_client::types::ChatMessage> {
+        let follow_up_prompt = format!(
+            "Resume work on ticket {}. Check your phase with \
+             `openflows-harness status get` and dispatch with \
+             `openflows-harness dispatch read`. Continue from there.",
+            ticket_id
+        );
+        client
+            .send_chat_message(
+                &chat.id,
+                vec![coder_client::types::ChatInputPart::text(follow_up_prompt)],
+            )
+            .await
+    }
+
+    /// Send a planning-gate-specific resume message when SENTINEL has approved
+    /// the plan. This notifies FORGE that it can proceed to implementation
+    /// without polling — NEXUS is the orchestrator that delivers the verdict.
+    async fn resume_chat_planning_approved(
+        &self,
+        client: &CoderClient,
+        chat: &coder_client::types::Chat,
+        ticket_id: &str,
+    ) -> anyhow::Result<coder_client::types::ChatMessage> {
+        let follow_up_prompt = format!(
+            "SENTINEL has approved your planning gate for ticket {ticket_id}. \
+             The plan is sound and you are authorized to proceed with implementation.\n\n\
+             Run the following to move to the building phase:\n\
+             `openflows-harness status set building`\n\n\
+             Then begin implementation with Segment 1.",
+            ticket_id = ticket_id,
+        );
+        client
+            .send_chat_message(
+                &chat.id,
+                vec![coder_client::types::ChatInputPart::text(follow_up_prompt)],
+            )
+            .await
     }
 
     async fn create_chat_for_ticket_id(
@@ -1409,13 +1607,35 @@ Use `openflows-harness` for all coordination:
     async fn poll_harness_status_and_spawn_agents(&self, store: &SharedStore, tickets: &[Ticket]) {
         let client = match Self::coder_client_from_store(store).await {
             Some(c) => c,
-            None => return,
+            None => {
+                info!("poll_harness_status: no Coder client available — cannot spawn Sentinel");
+                return;
+            }
         };
 
         let slots: HashMap<String, WorkerSlot> = match store.get_typed(KEY_WORKER_SLOTS).await {
             Some(s) => s,
-            None => return,
+            None => {
+                info!("poll_harness_status: no worker slots stored — cannot spawn Sentinel");
+                return;
+            }
         };
+
+        let ticket_count = tickets.len();
+        let active_count = tickets
+            .iter()
+            .filter(|t| {
+                matches!(
+                    &t.status,
+                    TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+                )
+            })
+            .count();
+        info!(
+            total = ticket_count,
+            active = active_count,
+            "poll_harness_status: scanning tickets for harness phase"
+        );
 
         for ticket in tickets {
             // Check tickets that are currently being worked on.
@@ -1438,40 +1658,203 @@ Use `openflows-harness` for all coordination:
                 .and_then(|v| v.get("phase"))
                 .and_then(|v| v.as_str());
 
+            // Diagnostic: surface what harness phase NEXUS observes per active
+            // ticket, so we can confirm when the SENTINEL-spawn trigger fires.
+            if let Some(phase) = phase {
+                debug!(
+                    ticket_id = %ticket.id,
+                    phase,
+                    "Polling harness status for active ticket"
+                );
+            }
+
             match phase {
                 Some("planning") => {
+                    info!(
+                        ticket_id = %ticket.id,
+                        "Detected planning phase — attempting to spawn Sentinel for plan review"
+                    );
                     // ── Planning Gate: SENTINEL must review the plan and approve the gate ──
                     // FORGE halts at planning and waits for SENTINEL to run
                     // `openflows-harness gate approve --phase planning`. If no SENTINEL
                     // chat exists for this ticket, spawn one so it can review the plan.
 
-                    // Check if gate already approved — if so, FORGE will transition on its own
-                    let gate_key = format!(
-                        "ns:{}:ticket:{}:gate:planning",
-                        std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
-                        ticket.id
-                    );
-                    let gate_approval: Option<Value> = store.get_typed(&gate_key).await;
-                    if gate_approval.is_some() {
-                        debug!(
-                            ticket_id = %ticket.id,
-                            "Planning gate already approved — SENTINEL review not needed"
-                        );
+                    // Check if gate already approved — if so, notify FORGE to resume.
+                    if Self::gate_approved(store, &ticket.id, "planning").await {
+                        // Deduplication: skip if we already notified FORGE about
+                        // this gate approval on a previous poll cycle.
+                        let notification_key = format!("ticket:{}:planning_notified", ticket.id);
+                        let already_notified: Option<bool> =
+                            store.get_typed(&notification_key).await;
+                        if already_notified.unwrap_or(false) {
+                            debug!(
+                                ticket_id = %ticket.id,
+                                "Already notified FORGE of planning gate approval; skipping"
+                            );
+                            continue;
+                        }
+
+                        // Get the forge worker_id for this ticket so we can find
+                        // its Coder chat and inject a resume message.
+                        let forge_worker_id = match &ticket.status {
+                            TicketStatus::Assigned { worker_id }
+                            | TicketStatus::InProgress { worker_id } => worker_id.clone(),
+                            _ => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    "Planning gate approved but ticket has unexpected status; \
+                                     cannot notify FORGE"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let forge_chat_key =
+                            full_ticket_key(&ticket.id, KEY_TICKET_CHAT, &forge_worker_id);
+                        let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
+
+                        if let Some(ref forge_chat_id) = forge_chat_id {
+                            match client.get_chat(forge_chat_id).await {
+                                Ok(chat) => {
+                                    let status = chat.status();
+                                    // Only send a resume if the forge chat is in a
+                                    // state where it can accept new messages —
+                                    // Waiting or Error. A Running chat is actively
+                                    // generating; we wait for it to finish.
+                                    if matches!(status, ChatStatus::Waiting | ChatStatus::Error) {
+                                        match self
+                                            .resume_chat_planning_approved(
+                                                &client, &chat, &ticket.id,
+                                            )
+                                            .await
+                                        {
+                                            Ok(message) => {
+                                                info!(
+                                                    ticket_id = %ticket.id,
+                                                    chat_id = %forge_chat_id,
+                                                    message_id = %message.id,
+                                                    "Notified forge that planning gate is approved"
+                                                );
+                                                // Track that we notified so we don't spam
+                                                // on every poll cycle.
+                                                let notification_key = format!(
+                                                    "ticket:{}:planning_notified",
+                                                    ticket.id
+                                                );
+                                                store.set(&notification_key, json!(true)).await;
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    ticket_id = %ticket.id,
+                                                    chat_id = %forge_chat_id,
+                                                    error = %e,
+                                                    "Failed to notify forge of planning gate approval"
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        debug!(
+                                            ticket_id = %ticket.id,
+                                            chat_id = %forge_chat_id,
+                                            chat_status = ?status,
+                                            "Forge chat is not in a resumable state; \
+                                             waiting for chat to go to Waiting"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        chat_id = %forge_chat_id,
+                                        error = %e,
+                                        "Failed to get forge chat for planning gate notification"
+                                    );
+                                }
+                            }
+                        } else {
+                            debug!(
+                                ticket_id = %ticket.id,
+                                "No forge chat ID found; forge may not have been provisioned yet"
+                            );
+                        }
+
                         continue;
                     }
 
-                    // Check if SENTINEL chat already exists for plan review
+                    // Gate is NOT yet approved — this is a fresh (or still pending)
+                    // planning cycle. Clear any stale notification flag from a
+                    // previous cycle so we don't suppress a future notification.
+                    let notification_key = format!("ticket:{}:planning_notified", ticket.id);
+                    store.del(&notification_key).await;
+
+                    // Check if SENTINEL chat already exists for plan review.
                     let sentinel_chat_key =
                         full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
-                    let existing_sentinel_chat: Option<String> =
+                    let sentinel_action_key =
+                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                    let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
-                    if existing_sentinel_chat.is_some() {
-                        debug!(
-                            ticket_id = %ticket.id,
-                            "Sentinel chat already exists for planning ticket — review in progress"
-                        );
-                        continue;
+
+                    // If a sentinel chat already exists, verify it is actually
+                    // viable — not orphaned (no agent connected, sitting in
+                    // Waiting forever).  An orphaned chat happens when the Coder
+                    // Agent never connects to the provisioned workspace, or the
+                    // workspace agent crashes after chat creation.
+                    if let Some(ref chat_id) = existing_sentinel_chat {
+                        match client.get_chat_opt(chat_id).await {
+                            Ok(Some(chat)) => {
+                                let status = chat.status();
+                                if matches!(status, ChatStatus::Waiting) {
+                                    // Chat is waiting but no agent has ever
+                                    // responded.  Check if a gate approval
+                                    // has been written — if not, the chat
+                                    // never did its job and is stale.
+                                    let gate_key = format!("ticket:{}:gate:planning", ticket.id);
+                                    let gate_approved: Option<serde_json::Value> =
+                                        store.get_typed(&gate_key).await;
+                                    if gate_approved.is_none() {
+                                        warn!(
+                                            ticket_id = %ticket.id,
+                                            chat_id = %chat_id,
+                                            "Sentinel chat is orphaned (Waiting with no gate \
+                                             approval) — clearing stale chat to re-spawn"
+                                        );
+                                        store.del(&sentinel_chat_key).await;
+                                        store.del(&sentinel_action_key).await;
+                                        existing_sentinel_chat = None;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // Chat no longer exists on Coder — stale key.
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    "Stored sentinel chat no longer exists — clearing key"
+                                );
+                                store.del(&sentinel_chat_key).await;
+                                store.del(&sentinel_action_key).await;
+                                existing_sentinel_chat = None;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    error = %e,
+                                    "Failed to verify sentinel chat; will retry next poll"
+                                );
+                                continue;
+                            }
+                        }
                     }
+
+                    // Diagnostic: show what the sentinel chat and action keys resolve to
+                    info!(
+                        ticket_id = %ticket.id,
+                        chat_key = %sentinel_chat_key,
+                        has_existing_chat = existing_sentinel_chat.is_some(),
+                        "Checked for existing sentinel chat; proceeding to idle-slot check"
+                    );
 
                     // Find an idle sentinel worker slot
                     let sentinel_slot = slots.iter().find(|(id, slot)| {
@@ -1510,6 +1893,68 @@ Use `openflows-harness` for all coordination:
                         }
                     };
 
+                    if let Some(existing_chat_id) = existing_sentinel_chat {
+                        match client.get_chat_opt(&existing_chat_id).await {
+                            Ok(Some(chat)) if chat.workspace_id == workspace_id => {
+                                let mut updated_slots: HashMap<String, WorkerSlot> =
+                                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                                if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
+                                    slot.status = WorkerStatus::Assigned {
+                                        ticket_id: ticket.id.clone(),
+                                        issue_url: ticket.issue_url.clone(),
+                                    };
+                                    slot.workspace_id = Some(workspace_id.clone());
+                                }
+                                store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
+                                debug!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %existing_chat_id,
+                                    "Sentinel chat already exists for planning ticket — review in progress"
+                                );
+                                store.set(&sentinel_action_key, json!("started")).await;
+                                continue;
+                            }
+                            Ok(Some(chat)) => {
+                                info!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %existing_chat_id,
+                                    stored_workspace_id = %chat.workspace_id,
+                                    current_workspace_id = %workspace_id,
+                                    "Stored Sentinel chat is bound to a stale workspace — clearing before respawn"
+                                );
+                                store.del(&sentinel_chat_key).await;
+                                store.del(&sentinel_action_key).await;
+                            }
+                            Ok(None) => {
+                                info!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %existing_chat_id,
+                                    "Stored Sentinel chat no longer exists — clearing before respawn"
+                                );
+                                store.del(&sentinel_chat_key).await;
+                                store.del(&sentinel_action_key).await;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %existing_chat_id,
+                                    error = %e,
+                                    "Could not verify existing Sentinel chat; will retry next poll"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Read the plan directly from Redis SharedStore.
+                    // FORGE writes it via `openflows-harness plan write --file PLAN.md`
+                    // before signaling `status set planning`. This eliminates the fragile
+                    // Coder API filesystem bridge — the plan lives in SharedStore alongside
+                    // all other pair artifacts and is cleaned up when the workspace is
+                    // destroyed.
+                    let plan_key = format!("pair:{}:plan", ticket.id);
+                    let plan_content: Option<String> = store.get_typed(&plan_key).await;
+
                     // Build dispatch payload for Sentinel plan review.
                     // Include the PLAN.md content hint so SENTINEL knows this is a
                     // planning-gate review, not a PR review.
@@ -1520,6 +1965,7 @@ Use `openflows-harness` for all coordination:
                         "body": ticket.body,
                         "branch": ticket.branch,
                         "review_type": "planning_gate",
+                        "plan": plan_content,
                         "instructions": format!(
                             "Review the plan for ticket {}. Read PLAN.md and evaluate whether it \
                              correctly addresses the ticket requirements. If the plan is sound, \
@@ -1531,18 +1977,6 @@ Use `openflows-harness` for all coordination:
                     });
                     store.set(&dispatch_key, dispatch_payload).await;
 
-                    // Update sentinel slot to Assigned
-                    let mut updated_slots: HashMap<String, WorkerSlot> =
-                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                    if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
-                        slot.status = WorkerStatus::Assigned {
-                            ticket_id: ticket.id.clone(),
-                            issue_url: ticket.issue_url.clone(),
-                        };
-                        slot.workspace_id = Some(workspace_id.clone());
-                    }
-                    store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
-
                     // Create sentinel chat with plan review context
                     let mut labels = serde_json::Map::new();
                     labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
@@ -1552,11 +1986,12 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = format!(
-                        "## Planning Gate Review — Ticket {}\n\n\
+                         "## Planning Gate Review — Ticket {}\n\n\
                          FORGE has written a plan and is waiting for your approval before \
                          proceeding to implementation.\n\n\
                          **Your task:**\n\
-                         1. Read `PLAN.md` in the workspace\n\
+                         1. Read the Forge plan via `openflows-harness plan read` (or from the \
+                         dispatch payload via `openflows-harness dispatch read`)\n\
                          2. Evaluate whether the plan correctly addresses the ticket requirements\n\
                          3. If the plan is sound, approve the planning gate:\n\
                             `openflows-harness gate approve --phase planning --notes \"Plan approved. \
@@ -1570,8 +2005,22 @@ Use `openflows-harness` for all coordination:
                         ticket.title,
                     );
 
+                    // Resolve organization_id first - fail fast if unavailable
+                    let organization_id = match client.get_default_organization_id().await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                error = %e,
+                                "CRITICAL: Failed to resolve organization_id for Sentinel chat - cannot proceed. Ensure Coder is configured with a default organization."
+                            );
+                            continue;
+                        }
+                    };
+
                     let chat_req = coder_client::types::CreateChatRequest {
-                        organization_id: None,
+                        organization_id: Some(organization_id),
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![coder_client::types::ChatInputPart::text(
@@ -1584,7 +2033,18 @@ Use `openflows-harness` for all coordination:
 
                     match chat_result {
                         Ok(chat) => {
+                            let mut updated_slots: HashMap<String, WorkerSlot> =
+                                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                            if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
+                                slot.status = WorkerStatus::Assigned {
+                                    ticket_id: ticket.id.clone(),
+                                    issue_url: ticket.issue_url.clone(),
+                                };
+                                slot.workspace_id = Some(workspace_id.clone());
+                            }
+                            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
                             store.set(&sentinel_chat_key, json!(chat.id)).await;
+                            store.set(&sentinel_action_key, json!("started")).await;
                             info!(
                                 ticket_id = %ticket.id,
                                 sentinel_worker_id,
@@ -1605,11 +2065,65 @@ Use `openflows-harness` for all coordination:
                 Some("review_ready") => {
                     // ── PR Review: SENTINEL reviews completed work ──
 
-                    // Check if Sentinel chat already exists for this ticket
+                    // Check if Sentinel chat already exists for this ticket.
+                    // If the chat is orphaned (Waiting with no review written),
+                    // clear it so a fresh one can be spawned.
                     let sentinel_chat_key =
                         full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
-                    let existing_sentinel_chat: Option<String> =
+                    let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
+
+                    if let Some(ref chat_id) = existing_sentinel_chat {
+                        match client.get_chat_opt(chat_id).await {
+                            Ok(Some(chat)) if matches!(chat.status(), ChatStatus::Waiting) => {
+                                let review_key =
+                                    full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
+                                let existing_review: Option<Value> =
+                                    store.get_typed(&review_key).await;
+                                if existing_review.is_none() {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        chat_id = %chat_id,
+                                        "Sentinel chat is orphaned (Waiting with no review) \
+                                         — clearing stale chat to re-spawn"
+                                    );
+                                    store.del(&sentinel_chat_key).await;
+                                    let action_key = full_ticket_key(
+                                        &ticket.id,
+                                        KEY_TICKET_CHAT_ACTION,
+                                        "sentinel",
+                                    );
+                                    store.del(&action_key).await;
+                                    existing_sentinel_chat = None;
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    "Stored sentinel chat no longer exists — clearing key"
+                                );
+                                store.del(&sentinel_chat_key).await;
+                                let action_key =
+                                    full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                                store.del(&action_key).await;
+                                existing_sentinel_chat = None;
+                            }
+                            Ok(Some(_)) => {
+                                // Chat exists and is not orphaned — legitimate existing chat.
+                            }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    error = %e,
+                                    "Failed to verify sentinel chat; will retry next poll"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     if existing_sentinel_chat.is_some() {
                         debug!(ticket_id = %ticket.id, "Sentinel chat already exists, skipping spawn");
                         continue;
@@ -1679,18 +2193,6 @@ Use `openflows-harness` for all coordination:
                     });
                     store.set(&dispatch_key, dispatch_payload).await;
 
-                    // Update sentinel slot to Assigned
-                    let mut updated_slots: HashMap<String, WorkerSlot> =
-                        store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                    if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
-                        slot.status = WorkerStatus::Assigned {
-                            ticket_id: ticket.id.clone(),
-                            issue_url: ticket.issue_url.clone(),
-                        };
-                        slot.workspace_id = Some(workspace_id.clone());
-                    }
-                    store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
-
                     // Create sentinel chat
                     let mut labels = serde_json::Map::new();
                     labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
@@ -1698,8 +2200,22 @@ Use `openflows-harness` for all coordination:
                     labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
                     labels.insert("review_type".to_string(), json!("pr_review"));
 
+                    // Resolve organization_id first - fail fast if unavailable
+                    let organization_id = match client.get_default_organization_id().await {
+                        Ok(id) => id,
+                        Err(e) => {
+                            error!(
+                                ticket_id = %ticket.id,
+                                sentinel_worker_id,
+                                error = %e,
+                                "CRITICAL: Failed to resolve organization_id for Sentinel PR review chat - cannot proceed"
+                            );
+                            continue;
+                        }
+                    };
+
                     let chat_req = coder_client::types::CreateChatRequest {
-                        organization_id: None,
+                        organization_id: Some(organization_id),
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
                         content: vec![],
@@ -1710,6 +2226,16 @@ Use `openflows-harness` for all coordination:
 
                     match chat_result {
                         Ok(chat) => {
+                            let mut updated_slots: HashMap<String, WorkerSlot> =
+                                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                            if let Some(slot) = updated_slots.get_mut(&sentinel_worker_id) {
+                                slot.status = WorkerStatus::Assigned {
+                                    ticket_id: ticket.id.clone(),
+                                    issue_url: ticket.issue_url.clone(),
+                                };
+                                slot.workspace_id = Some(workspace_id.clone());
+                            }
+                            store.set(KEY_WORKER_SLOTS, json!(updated_slots)).await;
                             store.set(&sentinel_chat_key, json!(chat.id)).await;
                             info!(
                                 ticket_id = %ticket.id,
@@ -1837,8 +2363,22 @@ Use `openflows-harness` for all coordination:
             labels.insert(CHAT_LABEL_ROLE.to_string(), json!("lore"));
             labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
 
+            // Resolve organization_id first - fail fast if unavailable
+            let organization_id = match client.get_default_organization_id().await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!(
+                        ticket_id = %ticket.id,
+                        lore_worker_id,
+                        error = %e,
+                        "CRITICAL: Failed to resolve organization_id for Lore chat - cannot proceed"
+                    );
+                    continue;
+                }
+            };
+
             let chat_req = coder_client::types::CreateChatRequest {
-                organization_id: None,
+                organization_id: Some(organization_id),
                 workspace_id: workspace_id.clone(),
                 model_config_id: None,
                 content: vec![],
@@ -1875,14 +2415,24 @@ Use `openflows-harness` for all coordination:
         owner: &str,
         repo_name: &str,
     ) -> CiReadiness {
-        let current: Option<CiReadiness> = store.get_typed(KEY_CI_READINESS).await;
-        if let Some(ref readiness) = current {
-            if matches!(readiness, CiReadiness::SetupInProgress) {
-                return CiReadiness::SetupInProgress;
-            }
+        if owner.is_empty() || repo_name.is_empty() {
+            return CiReadiness::Ready;
         }
 
-        if owner.is_empty() || repo_name.is_empty() {
+        // Check local CI first - supports current directory AND workspace directories
+        if Self::local_repo_matches(owner, repo_name) && Self::local_ci_config_exists() {
+            info!("Local CI configuration found for repository — CI is ready");
+            store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
+            return CiReadiness::Ready;
+        }
+
+        // Also check workspace directories (e.g., ~/Sandbox/{repo}/.github/workflows)
+        if Self::check_workspace_ci_config(owner, repo_name) {
+            info!(
+                workspace_path = %Self::detect_workspace_path(owner, repo_name).display(),
+                "CI configuration found in workspace directory — CI is ready"
+            );
+            store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
             return CiReadiness::Ready;
         }
 
@@ -1894,6 +2444,7 @@ Use `openflows-harness` for all coordination:
                     Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
                     Ok(_) | Err(_) => {
                         warn!("GitHub token not configured, assuming CI is ready");
+                        store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
                         return CiReadiness::Ready;
                     }
                 },
@@ -1904,6 +2455,7 @@ Use `openflows-harness` for all coordination:
         match client.has_workflows(owner, repo_name).await {
             Ok(true) => {
                 info!("CI workflows found in repository — CI is ready");
+                store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
                 CiReadiness::Ready
             }
             Ok(false) => {
@@ -1912,9 +2464,128 @@ Use `openflows-harness` for all coordination:
             }
             Err(e) => {
                 warn!(error = %e, "Failed to check CI workflows, assuming ready");
+                store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
                 CiReadiness::Ready
             }
         }
+    }
+
+    /// Detect the workspace path for a given repository.
+    /// Checks common workspace locations like ~/Sandbox/{repo_name}
+    fn detect_workspace_path(_owner: &str, repo_name: &str) -> std::path::PathBuf {
+        // Check for WORKSPACE_ROOT environment variable first
+        if let Ok(workspace_root) = std::env::var("WORKSPACE_ROOT") {
+            let path = std::path::PathBuf::from(workspace_root).join(repo_name);
+            if path.exists() {
+                return path;
+            }
+        }
+
+        // Check ~/Sandbox/{repo_name}
+        if let Ok(home) = std::env::var("HOME") {
+            let sandbox_path = std::path::PathBuf::from(&home)
+                .join("Sandbox")
+                .join(repo_name);
+            if sandbox_path.exists() {
+                return sandbox_path;
+            }
+        }
+
+        // Fall back to current directory
+        std::path::PathBuf::from(".")
+    }
+
+    /// Check if CI configuration exists in workspace directories.
+    fn check_workspace_ci_config(owner: &str, repo_name: &str) -> bool {
+        let workspace_path = Self::detect_workspace_path(owner, repo_name);
+
+        // Check specific CI config locations in workspace
+        let ci_configs: Vec<std::path::PathBuf> = vec![
+            workspace_path.join(".github/workflows"),
+            workspace_path.join(".circleci/config.yml"),
+            workspace_path.join(".circleci/config.yaml"),
+            workspace_path.join(".gitlab-ci.yml"),
+            workspace_path.join(".gitlab-ci.yaml"),
+            workspace_path.join("Jenkinsfile"),
+        ];
+
+        for ci_path in ci_configs {
+            if ci_path.is_dir() {
+                // For directories, check if they contain workflow files
+                if let Ok(entries) = std::fs::read_dir(&ci_path) {
+                    if entries.flatten().any(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| ext == "yml" || ext == "yaml")
+                            .unwrap_or(false)
+                    }) {
+                        return true;
+                    }
+                }
+            } else if ci_path.is_file() {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn local_repo_matches(owner: &str, repo_name: &str) -> bool {
+        let expected = format!(
+            "{}/{}",
+            owner.to_ascii_lowercase(),
+            repo_name.to_ascii_lowercase()
+        );
+        let output = std::process::Command::new("git")
+            .args(["config", "--get", "remote.origin.url"])
+            .output();
+        let Ok(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let remote = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_end_matches(".git")
+            .to_ascii_lowercase();
+        remote.ends_with(&expected)
+            || remote.ends_with(&format!("/{}", expected))
+            || remote.ends_with(&format!(":{}", expected))
+    }
+
+    fn local_ci_config_exists() -> bool {
+        let workflow_dir = std::path::Path::new(".github/workflows");
+        if let Ok(entries) = std::fs::read_dir(workflow_dir) {
+            if entries.flatten().any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| matches!(ext, "yml" | "yaml"))
+                    .unwrap_or(false)
+            }) {
+                return true;
+            }
+        }
+
+        [
+            ".circleci/config.yml",
+            ".circleci/config.yaml",
+            ".gitlab-ci.yml",
+            ".gitlab-ci.yaml",
+            "Jenkinsfile",
+            "azure-pipelines.yml",
+            "azure-pipelines.yaml",
+            "bitbucket-pipelines.yml",
+            "bitbucket-pipelines.yaml",
+            ".buildkite/pipeline.yml",
+            ".buildkite/pipeline.yaml",
+        ]
+        .iter()
+        .any(|path| std::path::Path::new(path).is_file())
     }
 
     /// Post a diagnostic comment on a GitHub issue only if no comment with the
@@ -2182,6 +2853,12 @@ Use `openflows-harness` for all coordination:
         });
     }
 
+    fn remove_stale_ci_setup_tickets(tickets: &mut Vec<Ticket>) -> usize {
+        let before = tickets.len();
+        tickets.retain(|ticket| !is_synthetic_ci_setup_ticket(ticket));
+        before.saturating_sub(tickets.len())
+    }
+
     fn prioritize_ci_first(tickets: &mut [Ticket]) {
         tickets.sort_by(|a, b| {
             let a_is_ci = is_ci_setup_ticket(a) as u8;
@@ -2405,6 +3082,44 @@ Use `openflows-harness` for all coordination:
             .unwrap_or(worker_id)
     }
 
+    fn should_resume_existing_chat(status: ChatStatus, last_action: Option<&str>) -> bool {
+        match status {
+            ChatStatus::Error => true,
+            ChatStatus::Waiting => matches!(
+                last_action,
+                None | Some("completed")
+                    | Some("interrupted")
+                    | Some("resume_needed")
+                    | Some("resume_failed")
+            ),
+            _ => false,
+        }
+    }
+
+    fn ticket_gate_key(ticket_id: &str, phase: &str) -> String {
+        format!("ticket:{}:gate:{}", ticket_id, phase)
+    }
+
+    async fn ticket_phase(store: &SharedStore, ticket_id: &str) -> Option<String> {
+        let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
+        store
+            .get(&status_key)
+            .await
+            .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(String::from))
+    }
+
+    async fn gate_approved(store: &SharedStore, ticket_id: &str, phase: &str) -> bool {
+        store
+            .get(&Self::ticket_gate_key(ticket_id, phase))
+            .await
+            .is_some()
+    }
+
+    async fn is_waiting_for_planning_gate(store: &SharedStore, ticket_id: &str) -> bool {
+        Self::ticket_phase(store, ticket_id).await.as_deref() == Some("planning")
+            && !Self::gate_approved(store, ticket_id, "planning").await
+    }
+
     async fn workspace_link_for_worker(
         &self,
         store: &SharedStore,
@@ -2598,21 +3313,25 @@ Use `openflows-harness` for all coordination:
 
             match chat.status() {
                 ChatStatus::Error => {
-                    recovery.crashed_chats.push(CrashedChat {
-                        chat_id: chat.id.clone(),
+                    store.set(&action_key, json!("resume_needed")).await;
+                    debug!(
+                        chat_id = %chat.id,
+                        ticket_id,
+                        role,
                         worker_id,
-                        ticket_id: ticket_id.to_string(),
-                        reason: "chat entered error status".to_string(),
-                    });
+                        "Chat is in error state; preserving session for same-chat resume"
+                    );
                 }
                 ChatStatus::Waiting => {
                     if last_action.as_deref() == Some("interrupted") {
-                        recovery.crashed_chats.push(CrashedChat {
-                            chat_id: chat.id.clone(),
+                        store.set(&action_key, json!("resume_needed")).await;
+                        debug!(
+                            chat_id = %chat.id,
+                            ticket_id,
+                            role,
                             worker_id,
-                            ticket_id: ticket_id.to_string(),
-                            reason: "chat was interrupted after a workspace crash".to_string(),
-                        });
+                            "Chat waiting after interruption; preserving session for same-chat resume"
+                        );
                     } else if !matches!(
                         last_action.as_deref(),
                         Some("follow_up_sent") | Some("completed")
@@ -2785,15 +3504,42 @@ Use `openflows-harness` for all coordination:
                 KEY_TICKET_CHAT_ACTION,
                 Self::worker_role(&crashed_chat.worker_id),
             );
-            store.set(&action_key, json!("interrupted")).await;
-
-            if let Err(e) = client.interrupt_chat(&crashed_chat.chat_id).await {
-                warn!(
-                    chat_id = %crashed_chat.chat_id,
-                    ticket_id = %crashed_chat.ticket_id,
-                    error = %e,
-                    "Failed to interrupt crashed chat"
-                );
+            match client.get_chat(&crashed_chat.chat_id).await {
+                Ok(chat) => match self
+                    .resume_chat(&client, &chat, &crashed_chat.ticket_id)
+                    .await
+                {
+                    Ok(message) => {
+                        info!(
+                            chat_id = %crashed_chat.chat_id,
+                            ticket_id = %crashed_chat.ticket_id,
+                            message_id = %message.id,
+                            reason = %crashed_chat.reason,
+                            "Resumed crashed chat in the existing session"
+                        );
+                        store.set(&action_key, json!("follow_up_sent")).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            chat_id = %crashed_chat.chat_id,
+                            ticket_id = %crashed_chat.ticket_id,
+                            error = %e,
+                            reason = %crashed_chat.reason,
+                            "Failed to resume crashed chat; keeping chat_id for retry"
+                        );
+                        store.set(&action_key, json!("resume_failed")).await;
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        chat_id = %crashed_chat.chat_id,
+                        ticket_id = %crashed_chat.ticket_id,
+                        error = %e,
+                        reason = %crashed_chat.reason,
+                        "Failed to inspect crashed chat; keeping chat_id for retry"
+                    );
+                    store.set(&action_key, json!("resume_failed")).await;
+                }
             }
         }
 
@@ -3040,6 +3786,17 @@ impl Node for NexusNode {
             store.set(KEY_TICKETS, json!(tickets)).await;
         }
 
+        if matches!(ci_readiness, CiReadiness::Ready) {
+            let removed = Self::remove_stale_ci_setup_tickets(&mut tickets);
+            if removed > 0 {
+                info!(
+                    removed,
+                    "Removed stale synthetic CI setup ticket(s) because CI is ready"
+                );
+                store.set(KEY_TICKETS, json!(tickets)).await;
+            }
+        }
+
         self.ensure_ci_setup_ticket(store, &mut tickets, &ci_readiness);
         Self::prioritize_ci_first(&mut tickets);
 
@@ -3190,14 +3947,10 @@ impl Node for NexusNode {
             tickets.iter().filter(|t| t.is_assignable()).collect()
         };
 
-        // Use the freshest slot state so exec sees workers released or
-        // provisioned during this pass instead of waiting an extra poll.
-        let worker_slots = store.get(KEY_WORKER_SLOTS).await.unwrap_or(json!({}));
-
         Ok(json!({
             "tickets": tickets,
             "assignable_tickets": assignable_tickets,
-            "worker_slots": worker_slots,
+            "worker_slots": store.get(KEY_WORKER_SLOTS).await.unwrap_or(json!({})),
             "open_prs": open_prs,
             "command_gate": command_gate,
             "repository": repository,
@@ -3224,6 +3977,33 @@ impl Node for NexusNode {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        let sentinel_active = context
+            .get("worker_slots")
+            .and_then(|v| v.as_object())
+            .map(|slots| {
+                slots
+                    .values()
+                    .filter_map(|v| serde_json::from_value::<WorkerSlot>(v.clone()).ok())
+                    .any(|slot| {
+                        Self::worker_role(&slot.id) == "sentinel"
+                            && matches!(
+                                slot.status,
+                                WorkerStatus::Assigned { .. } | WorkerStatus::Working { .. }
+                            )
+                    })
+            })
+            .unwrap_or(false);
+
+        if sentinel_active {
+            info!("Nexus: sentinel worker active — routing to Sentinel");
+            return Ok(json!(AgentDecision {
+                action: "sentinel_spawned".to_string(),
+                notes: "Sentinel review is active or pending".to_string(),
+                assign_to: None,
+                ticket_id: None,
+                issue_url: None,
+            }));
+        }
 
         // Idle *forge* workers, parsed from the worker_slots map provided by prep.
         // We only ever hand a ticket to a worker that is actually Idle, so a worker
@@ -3526,6 +4306,92 @@ impl Node for NexusNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_existing_chat_resume_policy() {
+        assert!(NexusNode::should_resume_existing_chat(
+            ChatStatus::Error,
+            Some("started")
+        ));
+        assert!(NexusNode::should_resume_existing_chat(
+            ChatStatus::Waiting,
+            Some("interrupted")
+        ));
+        assert!(NexusNode::should_resume_existing_chat(
+            ChatStatus::Waiting,
+            Some("resume_failed")
+        ));
+        assert!(!NexusNode::should_resume_existing_chat(
+            ChatStatus::Running,
+            Some("started")
+        ));
+        assert!(!NexusNode::should_resume_existing_chat(
+            ChatStatus::Waiting,
+            Some("follow_up_sent")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_planning_gate_wait_detection_uses_store_namespace_once() {
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-048";
+        store
+            .set(
+                &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
+                json!({
+                    "phase": "planning",
+                    "role": "forge",
+                    "ts": 1u64,
+                }),
+            )
+            .await;
+
+        assert!(NexusNode::is_waiting_for_planning_gate(&store, ticket_id).await);
+
+        store
+            .set(
+                &NexusNode::ticket_gate_key(ticket_id, "planning"),
+                json!({ "approved_by": "sentinel" }),
+            )
+            .await;
+
+        assert!(!NexusNode::is_waiting_for_planning_gate(&store, ticket_id).await);
+    }
+
+    #[tokio::test]
+    async fn test_nexus_routes_active_sentinel_before_forge_assignment() {
+        let node = NexusNode::new("nexus.agent.md", "registry.json");
+        let context = json!({
+            "assignable_tickets": [{
+                "id": "T-049",
+                "title": "Assignable",
+                "body": "",
+                "priority": 0,
+                "status": { "type": "open" }
+            }],
+            "open_prs": [],
+            "worker_slots": {
+                "forge-1": {
+                    "id": "forge-1",
+                    "status": { "type": "idle" },
+                    "workspace_id": null
+                },
+                "sentinel": {
+                    "id": "sentinel",
+                    "status": {
+                        "type": "assigned",
+                        "ticket_id": "T-048",
+                        "issue_url": null
+                    },
+                    "workspace_id": "ws-sentinel"
+                }
+            }
+        });
+
+        let decision: AgentDecision = serde_json::from_value(node.exec(context).await.unwrap())
+            .expect("nexus exec returns an AgentDecision");
+        assert_eq!(decision.action, "sentinel_spawned");
+    }
 
     #[test]
     fn test_remap_unrecognized_status_review_keywords() {

@@ -222,6 +222,20 @@ impl SharedStore {
         self.backend.keys(&ns_pattern).await
     }
 
+    /// Raw key scan on the backend WITHOUT tenant namespacing.
+    /// `pattern` is matched as-is against full Redis keys (e.g. "ns:*").
+    /// Returns the full Redis keys that matched.
+    pub async fn raw_keys(&self, pattern: &str) -> Vec<String> {
+        self.backend.keys(pattern).await
+    }
+
+    /// Raw delete of a full Redis key WITHOUT tenant namespacing.
+    /// Use this with keys returned by `keys()` / `raw_keys()`, which are
+    /// already fully-qualified and must not be re-prefixed.
+    pub async fn raw_del(&self, key: &str) {
+        self.backend.del(key).await;
+    }
+
     /// Typed get — deserialises JSON into T. Returns None on missing key or type mismatch.
     pub async fn get_typed<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
         let v = self.get(key).await?;

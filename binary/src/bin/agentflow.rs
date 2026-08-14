@@ -174,6 +174,23 @@ async fn run_controller() -> Result<()> {
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
 
+    // ── Start A2A relay (issue #143) ────────────────────────────────────
+    // The relay runs as a background HTTP server, handling A2A JSON-RPC
+    // requests from Sentinel/Forge workspaces (verify requests, streaming
+    // progress, result mirroring to Redis).
+    let a2a_relay = match agent_nexus::a2a::start_a2a_relay(std::sync::Arc::new(store.clone()))
+        .await
+    {
+        Ok(relay) => {
+            tracing::info!("A2A relay started successfully");
+            Some(relay)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to start A2A relay; verify requests will not be available");
+            None
+        }
+    };
+
     // ── Resolve orchestration directory ─────────────────────────────────
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;
@@ -184,7 +201,7 @@ async fn run_controller() -> Result<()> {
     let registry_json = serde_json::to_string_pretty(&registry)?;
     std::env::set_var("OPENFLOWS_REGISTRY_PATH", &registry_path);
     std::env::set_var("OPENFLOWS_REGISTRY_JSON", &registry_json);
-    std::env::set_var("ORCHESTRATOR_DIR", resolver.orchestrator_dir());
+    std::env::set_var("ARTIFACTS_DIR", resolver.orchestrator_dir());
 
     store
         .set("registry_json", serde_json::json!(registry_json))
@@ -192,10 +209,11 @@ async fn run_controller() -> Result<()> {
 
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
-    let nexus = std::sync::Arc::new(openflows::nodes::NexusNode::new(
-        nexus_persona,
-        registry_path.clone(),
-    ));
+    let mut nexus_node = openflows::nodes::NexusNode::new(nexus_persona, registry_path.clone());
+    if let Some(ref relay) = a2a_relay {
+        nexus_node = nexus_node.with_a2a_relay(relay.clone());
+    }
+    let nexus = std::sync::Arc::new(nexus_node);
     let forge_pair = std::sync::Arc::new(openflows::nodes::ForgePairNode::new_with_registry(
         &orch_dir,
         registry_path.clone(),
@@ -362,17 +380,23 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
 
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
-    let store = match pocketflow_core::SharedStore::new_redis(&redis_url).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("  ✗ Redis error: {}", e);
-            return Ok(());
-        }
-    };
+    // Scope the store to the tenant we are cleaning: SharedStore namespaces
+    // every key as `ns:{tenant}:{key}`, so we pass it the tenant and use plain
+    // keys below. (We must NOT also hand-format `ns:{name}:` prefixes here,
+    // which would double the namespace to `ns:{name}:ns:{name}:...` and fail
+    // to touch the real ticket keys.)
+    let store =
+        match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(name.clone()))
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  ✗ Redis error: {}", e);
+                return Ok(());
+            }
+        };
 
-    let tickets_key = format!("ns:{}:tickets", name);
-    let mut tickets: Vec<serde_json::Value> =
-        store.get_typed(&tickets_key).await.unwrap_or_default();
+    let mut tickets: Vec<serde_json::Value> = store.get_typed("tickets").await.unwrap_or_default();
 
     let mut reset_count = 0;
 
@@ -406,28 +430,27 @@ async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     }
 
     if reset_count > 0 {
-        store
-            .set(&tickets_key, serde_json::to_value(&tickets)?)
-            .await;
+        store.set("tickets", serde_json::to_value(&tickets)?).await;
         println!("  ✓ Reset {} ticket(s) to Open", reset_count);
     } else {
         println!("  (no stale tickets found)");
     }
 
-    // Also clear recovery attempt counters
+    // Also clear recovery attempt counters.
+    // keys()/raw_keys() return full Redis keys (ns:{tenant}:...), so delete
+    // them with raw_del to avoid re-applying the tenant namespace.
     let recovery_pattern = format!("ns:{}:ticket:*:recovery_attempts", name);
-    let recovery_keys: Vec<String> = store.keys(&recovery_pattern).await;
+    let recovery_keys: Vec<String> = store.raw_keys(&recovery_pattern).await;
     let recovery_count = recovery_keys.len();
     for key in &recovery_keys {
-        store.del(key).await;
+        store.raw_del(key).await;
     }
     if recovery_count > 0 {
         println!("  ✓ Cleared {} recovery counters", recovery_count);
     }
 
     // Clear worker_slots to prevent stale workspace IDs triggering premature provisioning
-    let worker_slots_key = format!("ns:{}:worker_slots", name);
-    store.set(&worker_slots_key, serde_json::json!({})).await;
+    store.set("worker_slots", serde_json::json!({})).await;
     println!("  ✓ Cleared worker slots (stale workspace references)");
 
     println!("  ✓ Tenant '{}' cleaned", name);
@@ -475,7 +498,9 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                 std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
             match pocketflow_core::SharedStore::new_redis(&redis_url).await {
                 Ok(store) => {
-                    let keys: Vec<String> = store.keys("ns:*").await;
+                    // raw_keys scans full Redis keys (`ns:*`) without re-applying
+                    // the tenant namespace, so we can enumerate all tenants.
+                    let keys: Vec<String> = store.raw_keys("ns:*").await;
                     let mut tenants = std::collections::HashSet::new();
                     for key in keys {
                         if let Some(ns) = key.strip_prefix("ns:") {
@@ -505,11 +530,13 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
                     .unwrap_or_else(|_| "redis://localhost:6379".to_string());
                 match pocketflow_core::SharedStore::new_redis(&redis_url).await {
                     Ok(store) => {
+                        // raw_keys + raw_del operate on full keys, so we purge the
+                        // real `ns:{name}:*` namespace instead of re-prefixing it.
                         let pattern = format!("ns:{}:*", name);
-                        let keys: Vec<String> = store.keys(&pattern).await;
+                        let keys: Vec<String> = store.raw_keys(&pattern).await;
                         if !keys.is_empty() {
                             for key in &keys {
-                                store.del(key).await;
+                                store.raw_del(key).await;
                             }
                             println!("  ✓ Purged {} keys from Redis", keys.len());
                         }
@@ -535,14 +562,16 @@ async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
     let redis_url =
         std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
 
-    let store = pocketflow_core::SharedStore::new_redis(&redis_url)
+    // raw_keys scans full Redis keys without namespacing, so we can enumerate
+    // all `ns:{tenant}:` namespaces from a single store.
+    let scan_store = pocketflow_core::SharedStore::new_redis(&redis_url)
         .await
         .context("Redis not reachable")?;
 
     let tenants: Vec<String> = match tenant {
         Some(t) => vec![t],
         None => {
-            let keys: Vec<String> = store.keys("ns:*").await;
+            let keys: Vec<String> = scan_store.raw_keys("ns:*").await;
             let mut set = std::collections::HashSet::new();
             for key in keys {
                 if let Some(ns) = key.strip_prefix("ns:") {
@@ -560,18 +589,23 @@ async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
     let mut all_data = Vec::new();
 
     for t in &tenants {
-        let tickets: Vec<config::Ticket> = store
-            .get_typed(&format!("ns:{}:tickets", t))
-            .await
-            .unwrap_or_default();
-        let slots: std::collections::HashMap<String, config::WorkerSlot> = store
-            .get_typed(&format!("ns:{}:worker_slots", t))
-            .await
-            .unwrap_or_default();
-        let pending_prs: Vec<serde_json::Value> = store
-            .get_typed(&format!("ns:{}:pending_prs", t))
-            .await
-            .unwrap_or_default();
+        // Per-tenant scoped store: SharedStore namespaces keys with the
+        // tenant, so read plain keys rather than hand-formatted `ns:{t}:` ones.
+        let store =
+            match pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(t.clone()))
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  ⚠ Could not read tenant '{}': {}", t, e);
+                    continue;
+                }
+            };
+        let tickets: Vec<config::Ticket> = store.get_typed("tickets").await.unwrap_or_default();
+        let slots: std::collections::HashMap<String, config::WorkerSlot> =
+            store.get_typed("worker_slots").await.unwrap_or_default();
+        let pending_prs: Vec<serde_json::Value> =
+            store.get_typed("pending_prs").await.unwrap_or_default();
 
         let data = serde_json::json!({
             "tenant": t,

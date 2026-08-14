@@ -10,6 +10,9 @@ config = { path = "../config" }
 github = { path = "../github" }
 coder-client = { path = "../coder-client" }
 openflows-notifier = { package = "notifier", path = "../notifier" }
+a2a-protocol = { path = "../a2a-protocol" }
+provisioner = { path = "../provisioner" }
+
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,3 +20,10 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+
+# A2A relay HTTP server
+axum = { version = "0.8", features = ["http1"] }
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures = { workspace = true }

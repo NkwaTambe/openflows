@@ -88,9 +88,59 @@ A segment that is too large:
 - [Question 2]
 ```
 
+## Planning Gate Protocol (MANDATORY)
+
+After writing PLAN.md, you MUST wait for SENTINEL to approve the planning
+gate before writing any code.  Do NOT skip this step — the controller
+will not spawn SENTINEL until you signal that planning is complete.
+
+### 1. Upload the plan to SharedStore
+
+```bash
+openflows-harness plan write --file PLAN.md
+```
+
+This persists your plan to Redis at `pair:{id}:plan` so SENTINEL (and
+NEXUS) can access it without relying on the Coder API filesystem bridge.
+The plan is automatically cleaned up when the workspace is destroyed.
+
+### 2. Signal planning complete
+
+```bash
+openflows-harness status set planning
+```
+
+This tells the controller you have finished planning and SENTINEL should
+spawn to review your plan.
+
+### 3. Check gate status (ONE SHOT — do NOT poll)
+
+```bash
+# Check if SENTINEL has approved the planning gate yet
+openflows-harness gate status --phase planning
+```
+
+- If it prints `✓ Gate 'planning' approved`: you may proceed to
+  implementation (step 4 below).
+- If it prints `✗ Gate 'planning' not yet approved`: **HALT. Do NOT
+  poll in a loop.** Stop all work. NEXUS will resume this chat with a
+  notification when SENTINEL completes the review.
+
+**Never proceed without gate approval.** The gate is your authorisation
+to write code. NEXUS owns the notification — your job is to check once,
+then stop and wait for the orchestrator to wake you up.
+
+### 4. After gate approval (or after NEXUS resumes with approval notification)
+
+```bash
+openflows-harness status set building
+```
+
+Then begin implementation with Segment 1.
+
 ## Contract negotiation
 
-SENTINEL will review your plan.
+SENTINEL may write CONTRACT.md after reviewing your plan.
 
 If SENTINEL objects:
 1. Read the objection carefully in `CONTRACT.md`

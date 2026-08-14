@@ -3,8 +3,12 @@
 //! This library exposes the `HarnessStore` struct which provides type-safe Redis operations
 //! for managing OpenFlows state, including gate approvals for phase transitions.
 
+pub mod a2a_client;
+pub mod executor;
 pub mod store;
 
+pub use a2a_client::A2AClient;
+pub use executor::execute_verify_task;
 pub use store::{
     DispatchPayload, GateApproval, HandoffPayload, HarnessStore, MergePayload, PrInfo,
     ReviewPayload,

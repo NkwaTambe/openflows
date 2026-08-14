@@ -1,7 +1,7 @@
 terraform {
   required_providers {
-    coder = { source = "coder/coder" }
-    docker = { source = "kreuzwerker/docker" }
+    coder = { source = "coder/coder", version = "~> 2.18.0" }
+    docker = { source = "kreuzwerker/docker", version = "4.5.0" }
   }
 }
 
@@ -16,8 +16,14 @@ variable "dev_binary_host_path" {
 
 variable "harness_version" {
   type        = string
-  default     = "1.1.8"
-  description = "openflows-harness binary version to download"
+  default     = "harness-edge"
+  description = "openflows-harness binary version to download. Use 'harness-edge' for the latest main-branch build, or a specific version tag (e.g. 'v1.2.0')."
+}
+
+variable "a2a_relay_addr" {
+  type        = string
+  default     = "openflows-nexus:3000"
+  description = "Address of the nexus A2A relay (JSON-RPC verify transport, issue #143). Forge resolves the nexus container over the shared docker network by its service name to claim and execute verify tasks."
 }
 
 # Workspace-level parameters (set per-workspace via Coder API rich_parameter_values)
@@ -86,12 +92,25 @@ resource "coder_agent" "main" {
       # REQUIRED — without it the agent cannot coordinate (dispatch/status/
       # heartbeat), so a missing harness must fail the startup script loudly
       # instead of leaving a silently uncoordinated workspace.
-      HARNESS_URL="https://github.com/Kilo-Org/openflows/releases/download/v${var.harness_version}/openflows-harness-v${var.harness_version}-x86_64-unknown-linux-musl"
-      log "Downloading openflows-harness v${var.harness_version}..."
+      HARNESS_ASSET="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
+      if [ "${var.harness_version}" = "harness-edge" ]; then
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/harness-edge/$${HARNESS_ASSET}"
+        log "Downloading openflows-harness (harness-edge/latest build)..."
+      else
+        HARNESS_URL="https://github.com/The-AgenticFlow/openflows/releases/download/${var.harness_version}/$${HARNESS_ASSET}"
+        log "Downloading openflows-harness v${var.harness_version}..."
+      fi
       for attempt in 1 2 3; do
-        if curl -fsSL --retry 3 "$HARNESS_URL" -o /tmp/openflows-harness; then
-          sudo mv /tmp/openflows-harness "$HARNESS_BIN"
-          sudo chmod +x "$HARNESS_BIN"
+        if curl -fsSL --retry 3 "$HARNESS_URL" -o /tmp/openflows-harness.tar.gz; then
+          tar -xzf /tmp/openflows-harness.tar.gz -C /tmp/ || { log "FATAL: failed to extract harness tarball"; exit 1; }
+          HARNESS_DIR=$(find /tmp/ -maxdepth 1 -type d -name "openflows-harness-*" 2>/dev/null | head -1)
+          if [ -n "$HARNESS_DIR" ] && [ -f "$HARNESS_DIR/openflows-harness" ]; then
+            sudo mv "$HARNESS_DIR/openflows-harness" "$HARNESS_BIN"
+            sudo chmod +x "$HARNESS_BIN"
+            rm -rf /tmp/openflows-harness.tar.gz "$HARNESS_DIR"
+          else
+            log "FATAL: could not find harness binary in extracted tarball"; exit 1
+          fi
           break
         fi
         log "Harness download attempt $attempt failed; retrying in 5s..."
@@ -109,13 +128,13 @@ resource "coder_agent" "main" {
     # until the flow artifacts (status/handoff/PR) exist.
     ROLE="${data.coder_parameter.role.value}"
     ROLE_BASE="$${ROLE%-*}"   # forge-1 -> forge
-    HOOKS_SRC="/home/coder/.openflows/orchestration/plugin/hooks/$ROLE_BASE"
+    HOOKS_SRC="/home/coder/.openflows/artifacts/plugin/hooks/$ROLE_BASE"
     HOOKS_DIR="/home/coder/.openflows/hooks"
     if [ -d "$HOOKS_SRC" ]; then
       mkdir -p "$HOOKS_DIR"
       cp -r "$HOOKS_SRC/." "$HOOKS_DIR/"
       chmod +x "$HOOKS_DIR"/*.sh 2>/dev/null || true
-      log "Installed $ROLE_BASE hooks from orchestration volume"
+      log "Installed $ROLE_BASE hooks from artifacts volume"
     else
       log "WARNING: no hooks found for role $ROLE_BASE at $HOOKS_SRC"
     fi
@@ -213,9 +232,50 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TENANT="${data.coder_parameter.tenant.value}"
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
+    export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
+
+    # Start verify executor daemon (task 5 of issue #143: A2A delegated verification)
+    # Subscribes to verify tasks from nexus relay, executes them in sandbox, returns results.
+    # Uses the same environment as heartbeat (REDIS_URL, OPENFLOWS_TENANT, OPENFLOWS_TICKET, OPENFLOWS_ROLE).
+    # This is a long-running process that polls for task assignments via SSE.
+    nohup openflows-harness verify serve >/dev/null 2>&1 &
+    log "Verify executor started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET) — issue #143 task 5"
+
+    # ── Start coding agent ──────────────────────────────────────────────
+    # The agent CLI binary (claude, codex, aider, etc.) may be bind-mounted
+    # from the host at /opt/openflows-dev/. If found, copy it to PATH and
+    # launch it as the work agent. The SessionStart hook fires on launch,
+    # providing the task dispatch, current phase, and workflow instructions.
+    # If no CLI binary is available, the workspace relies on Coder control-
+    # plane agents via the Coder Chat created by the controller.
+    AGENT_CLI=""
+    if [ -f /opt/openflows-dev/claude ]; then
+      AGENT_CLI="claude"
+      sudo cp /opt/openflows-dev/claude /usr/local/bin/claude
+      sudo chmod +x /usr/local/bin/claude
+      log "Mounted Claude Code binary from host — starting agent"
+    elif command -v claude >/dev/null 2>&1; then
+      AGENT_CLI="claude"
+      log "Claude Code found on PATH — starting agent"
+    elif [ -f /opt/openflows-dev/codex ]; then
+      AGENT_CLI="codex"
+      sudo cp /opt/openflows-dev/codex /usr/local/bin/codex
+      sudo chmod +x /usr/local/bin/codex
+      log "Mounted Codex binary from host — starting agent"
+    elif command -v codex >/dev/null 2>&1; then
+      AGENT_CLI="codex"
+      log "Codex found on PATH — starting agent"
+    fi
+
+    if [ -n "$AGENT_CLI" ]; then
+      nohup "$AGENT_CLI" -p "Start working on ticket $OPENFLOWS_TICKET. Read dispatch with 'openflows-harness dispatch read' and follow the workflow. Use 'openflows-harness status set <phase>' to report progress." </dev/null >/tmp/agent.log 2>&1 &
+      log "Agent started (cli=$AGENT_CLI ticket=$OPENFLOWS_TICKET pid=$!)"
+    else
+      log "No agent CLI binary found — workspace will rely on Coder Chat control-plane agent"
+    fi
   EOT
 }
 
@@ -232,11 +292,11 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Mount shared orchestration files (agent definitions, skills, standards)
+  # Mount shared artifact files (agent definitions, skills, standards, plans)
   # This volume is created by the Nexus workspace
   volumes {
-    container_path = "/home/coder/.openflows/orchestration"
-    volume_name    = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+    container_path = "/home/coder/.openflows/artifacts"
+    volume_name    = "openflows-artifacts-${data.coder_parameter.tenant.value}"
     read_only      = true
   }
 
@@ -256,6 +316,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
+    "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

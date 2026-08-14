@@ -94,7 +94,18 @@ Ticket-scoped keys:
 | `ticket:{id}:handoff` | Forge handoff metadata |
 | `ticket:{id}:diff_status:{role}` | diff/status metadata from Coder chats |
 | `ticket:{id}:recovery_attempts` | bounded recovery counter |
+| `ticket:{id}:plan` | PLAN.md artifact (required for gate approval) |
 | `heartbeat:{role}-T-{ticket_id}` | workspace heartbeat record |
+
+A2A Verification Keys (pair-scoped):
+
+| Key Pattern | Purpose |
+|---|---|
+| `pair:{id}:verification` | Latest verification result (VerifyResult JSON) |
+| `audit:a2a:{task_id}:stdout` | Command stdout (bounded 10KB tail) |
+| `audit:a2a:{task_id}:stderr` | Command stderr (bounded 10KB tail) |
+| `audit:a2a:{task_id}:result` | Full VerifyResult artifact |
+| `audit:a2a:rejected` | Log of rejected/disallowed commands |
 
 ---
 
@@ -265,6 +276,29 @@ ticket:{id}:review:sentinel
 
 Each review payload contains a verdict such as `approve` or `reject`, plus report metadata.
 
+**Gate Approval Requirement (Issue #143):** Before approving any plan-based gate transition, SENTINEL must verify that the PLAN.md artifact exists in `pair:{id}:plan`. If missing, SENTINEL emits a `blocked:missing_artifacts` verdict and refuses approval without attempting to review or request gating approval.
+
+### A2A Delegated Verification
+
+SENTINEL may request code execution in Forge's workspace via the A2A relay without direct access to Forge's environment. This is used when acceptance criteria require running commands (tests, builds, linters, etc.).
+
+**A2A Flow:**
+1. SENTINEL calls `openflows-harness verify request --argv <cmd> --timeout-secs <T> --expect-exit <code>`
+2. Request is routed through the Nexus A2A relay (port 3000, JSON-RPC)
+3. Forge's `verify serve` executor receives the task
+4. Command is executed in a sandbox with process timeout enforcement
+5. Stdout/stderr are captured (bounded to 10KB tail per stream)
+6. Result is persisted to Redis (`pair:{id}:verification`, audit trails)
+7. SENTINEL polls result via `openflows-harness verify list --pair-id {id}`
+
+**Validation:**
+- Commands must be in the allowlist (cargo test, npm test, make test, bun test)
+- Timeout enforced via `tokio::time::timeout`
+- Output buffering prevents memory explosion
+- Results are durable (mirrored to Redis before ACK)
+
+See `docs/architecture/a2a-verification.md` for full protocol and error modes.
+
 SENTINEL returns:
 
 | Verdict State | Store Effects | Action |
@@ -272,6 +306,7 @@ SENTINEL returns:
 | approved | mark ticket status `approved`, mark Sentinel chat action complete | `review_approve` |
 | rejected | send follow-up to Forge chat, archive Sentinel chat, mark complete | `review_reject` |
 | no review payloads | no state transition | `no_work` |
+| missing_plan | emit `blocked:missing_artifacts`, refuse approval | `blocked` |
 
 Approval routes to VESSEL. Rejection routes back to FORGE so the implementation chat receives the review report and continues work.
 

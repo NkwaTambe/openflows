@@ -626,6 +626,20 @@ impl GithubRestClient {
     /// Probes the `.github/workflows/` directory via the Contents API.
     /// Returns `true` if at least one workflow file exists, `false` otherwise.
     pub async fn has_workflows(&self, owner: &str, repo: &str) -> Result<bool> {
+        const OTHER_CI_CONFIGS: &[&str] = &[
+            ".circleci/config.yml",
+            ".circleci/config.yaml",
+            ".gitlab-ci.yml",
+            ".gitlab-ci.yaml",
+            "Jenkinsfile",
+            "azure-pipelines.yml",
+            "azure-pipelines.yaml",
+            "bitbucket-pipelines.yml",
+            "bitbucket-pipelines.yaml",
+            ".buildkite/pipeline.yml",
+            ".buildkite/pipeline.yaml",
+        ];
+
         let url = format!(
             "{}/repos/{}/{}/contents/.github/workflows",
             GITHUB_API_BASE, owner, repo
@@ -634,12 +648,17 @@ impl GithubRestClient {
         let resp = self.send_with_retry(|| self.build_get(&url)).await?;
         let status = resp.status();
         if status.as_u16() == 404 {
+            for path in OTHER_CI_CONFIGS {
+                if self.content_path_exists(owner, repo, path).await? {
+                    return Ok(true);
+                }
+            }
             return Ok(false);
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!(status = %status, body, "Failed to check workflows directory");
-            return Ok(false);
+            anyhow::bail!("Failed to check workflows directory: {}", status);
         }
 
         let entries: Vec<ContentEntry> = resp
@@ -649,7 +668,35 @@ impl GithubRestClient {
         let has_yml = entries
             .iter()
             .any(|e| e.name.ends_with(".yml") || e.name.ends_with(".yaml"));
-        Ok(has_yml)
+        if has_yml {
+            return Ok(true);
+        }
+
+        for path in OTHER_CI_CONFIGS {
+            if self.content_path_exists(owner, repo, path).await? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn content_path_exists(&self, owner: &str, repo: &str, path: &str) -> Result<bool> {
+        let url = format!(
+            "{}/repos/{}/{}/contents/{}",
+            GITHUB_API_BASE, owner, repo, path
+        );
+        let resp = self.send_with_retry(|| self.build_get(&url)).await?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(false);
+        }
+        if status.is_success() {
+            return Ok(true);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        warn!(status = %status, body, path, "Failed to check CI config path");
+        anyhow::bail!("Failed to check CI config path {}: {}", path, status)
     }
 
     /// Check if a PR is already merged (for startup reconciliation).

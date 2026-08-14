@@ -25,10 +25,8 @@ pub mod mock_chat_server;
 pub use types::*;
 
 use anyhow::{bail, Context, Result};
-#[cfg(feature = "chats-api")]
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(feature = "chats-api")]
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -52,6 +50,11 @@ pub struct CoderClient {
     /// Lazily populated on first access to reduce API call overhead.
     #[cfg(feature = "chats-api")]
     cached_models: Arc<RwLock<Option<Vec<crate::types::ModelInfo>>>>,
+    /// Cached default organization ID.
+    /// Lazily populated on first access to reduce API call overhead.
+    /// Not gated behind `chats-api`: `get_default_organization_id` is used by
+    /// agent-nexus regardless of that feature, and the field is unconditional.
+    cached_org_id: Arc<RwLock<Option<String>>>,
 }
 
 /// Parse the JSON body returned by `GET /api/experimental/chats/models`.
@@ -140,6 +143,7 @@ impl CoderClient {
             session_token: None,
             #[cfg(feature = "chats-api")]
             cached_models: Arc::new(RwLock::new(None)),
+            cached_org_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -191,6 +195,7 @@ impl CoderClient {
             session_token: None,
             #[cfg(feature = "chats-api")]
             cached_models: Arc::new(RwLock::new(None)),
+            cached_org_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -204,6 +209,7 @@ impl CoderClient {
             session_token: self.session_token.clone(),
             #[cfg(feature = "chats-api")]
             cached_models: self.cached_models.clone(),
+            cached_org_id: self.cached_org_id.clone(),
         }
     }
 
@@ -438,13 +444,22 @@ impl CoderClient {
         }
     }
 
-    /// Get the default organization ID.
+    /// Get the default organization ID with caching.
     ///
-    /// Queries `GET /api/v2/organizations` and returns the ID of the first
-    /// organization marked `is_default`. If none is explicitly marked as
-    /// default, returns the first organization in the list. Returns an error
-    /// if no organizations are found at all.
+    /// Queries `GET /api/v2/organizations` on first call and caches the result.
+    /// Subsequent calls return the cached value to reduce API overhead.
+    /// Returns an error if no organizations are found at all.
     pub async fn get_default_organization_id(&self) -> Result<String> {
+        // Check cache first
+        {
+            let cache = self.cached_org_id.read().await;
+            if let Some(ref cached_id) = *cache {
+                debug!("Using cached organization ID: {}", cached_id);
+                return Ok(cached_id.clone());
+            }
+        }
+
+        // Fetch from API
         let orgs = self.list_organizations().await?;
         if orgs.is_empty() {
             bail!("No organizations found in Coder");
@@ -461,13 +476,21 @@ impl CoderClient {
                 &orgs[0]
             }
         };
+        let org_id = default_org.id.clone();
         info!(
-            org_id = %default_org.id,
+            org_id = %org_id,
             org_name = %default_org.name,
             is_default = default_org.is_default,
-            "Resolved default organization"
+            "Resolved and cached default organization"
         );
-        Ok(default_org.id.clone())
+
+        // Cache the result
+        {
+            let mut cache = self.cached_org_id.write().await;
+            *cache = Some(org_id.clone());
+        }
+
+        Ok(org_id)
     }
 
     /// Create an API token for a user. Attempts to reuse an existing token
@@ -1054,7 +1077,10 @@ impl CoderClient {
         // One single shell token — spaces/pipes are parsed by the REMOTE shell
         // after coder ssh joins this sole post-`--` arg. base64 guarantees no
         // quoting/escaping issues regardless of the command's contents.
-        let wrapped = format!("echo '{}' | base64 -d | bash -l", b64);
+        let wrapped = format!(
+            "cd /home/coder/workspace && echo '{}' | base64 -d | bash -l",
+            b64
+        );
 
         let ssh_token = self.session_token();
         let output = tokio::time::timeout(

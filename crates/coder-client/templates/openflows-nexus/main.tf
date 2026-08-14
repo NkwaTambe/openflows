@@ -1,7 +1,7 @@
 terraform {
   required_providers {
-    coder = { source = "coder/coder" }
-    docker = { source = "kreuzwerker/docker" }
+    coder = { source = "coder/coder", version = "~> 2.18.0" }
+    docker = { source = "kreuzwerker/docker", version = "4.5.0" }
   }
 }
 
@@ -87,7 +87,7 @@ resource "coder_agent" "main" {
     #!/bin/bash
     set -e
 
-    # Fix orchestration directory ownership (shared volume is created as root)
+    # Fix artifacts directory ownership (shared volume is created as root)
     sudo chown -R coder:coder /home/coder/.openflows
 
     # TEMPORARY: Use mounted dev binary for local testing
@@ -159,9 +159,10 @@ resource "docker_volume" "workspace" {
   name = "openflows-nexus-${data.coder_workspace.me.id}"
 }
 
-# Shared orchestration volume - Nexus writes, forge/sentinel/etc read
-resource "docker_volume" "orchestration" {
-  name = "openflows-orchestration-${data.coder_parameter.tenant.value}"
+# Shared artifacts volume — Nexus writes (skills, standards, personas),
+# forge/sentinel read (and forge writes PLAN.md for sentinel review).
+resource "docker_volume" "artifacts" {
+  name = "openflows-artifacts-${data.coder_parameter.tenant.value}"
 }
 
 resource "docker_container" "workspace" {
@@ -173,10 +174,10 @@ resource "docker_container" "workspace" {
     volume_name    = docker_volume.workspace.name
   }
 
-  # Orchestration files volume (written by Nexus, read by other agents)
+  # Artifacts volume (written by Nexus, read by forge/sentinel/lore/vessel)
   volumes {
-    container_path = "/home/coder/.openflows/orchestration"
-    volume_name    = docker_volume.orchestration.name
+    container_path = "/home/coder/.openflows/artifacts"
+    volume_name    = docker_volume.artifacts.name
   }
 
   # TEMPORARY: Mount dev binaries for local testing (remove when using GitHub releases)
@@ -200,12 +201,19 @@ resource "docker_container" "workspace" {
     "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
-    # Path to orchestration files containing agent personas and skills
-    "ORCHESTRATOR_DIR=/home/coder/.openflows/orchestration",
+    # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
+    # reach it over the shared docker network (issue #143). Workspaces address
+    # it via the `openflows-nexus` network alias below.
+    "A2A_RELAY_ADDR=0.0.0.0:3000",
+    # Path to shared artifacts (agent personas, skills, standards, plans)
+    "ARTIFACTS_DIR=/home/coder/.openflows/artifacts",
   ]
 
   networks_advanced {
     name = "openflows_default"
+    # Stable service name so forge/sentinel templates can default
+    # A2A_RELAY_ADDR to openflows-nexus:3000 without knowing the workspace id.
+    aliases = ["openflows-nexus"]
   }
 
   entrypoint = ["sh", "-c", replace(coder_agent.main.init_script, "/localhost|127\\.0\\.0\\.1/", "coder")]

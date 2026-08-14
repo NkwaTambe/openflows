@@ -21,7 +21,10 @@ Create a detailed implementation plan for the current ticket.
 
 ## Output
 
-Writes to `${SPRINTLESS_SHARED}/PLAN.md`:
+Writes to `PLAN.md` in the workspace root, then persists it to Redis SharedStore
+so SENTINEL can read it directly without relying on the Coder API filesystem bridge.
+
+### Structure
 
 ```markdown
 # Implementation Plan: T-{id}
@@ -54,9 +57,11 @@ Total: {N} segments
 ## After Planning
 
 Once PLAN.md is written:
-1. Commit the plan: `git add -A && git commit -m "[T-{id}] plan: implementation approach"`
-2. Begin Segment 1
-3. Use `/segment-done` when each segment is complete
+1. Upload the plan to SharedStore: `openflows-harness plan write --file PLAN.md`
+2. Commit the plan: `git add -A && git commit -m "[T-{id}] plan: implementation approach"`
+3. Signal planning complete: `openflows-harness status set planning`
+4. Begin Segment 1
+5. Use `/segment-done` when each segment is complete
 
 ## Important
 
