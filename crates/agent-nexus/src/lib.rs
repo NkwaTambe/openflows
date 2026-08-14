@@ -1787,11 +1787,70 @@ Use `openflows-harness` for all coordination:
                     let notification_key = format!("ticket:{}:planning_notified", ticket.id);
                     store.del(&notification_key).await;
 
-                    // Check if SENTINEL chat already exists for plan review
+                    // Check if SENTINEL chat already exists for plan review.
                     let sentinel_chat_key =
                         full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
-                    let existing_sentinel_chat: Option<String> =
+                    let sentinel_action_key =
+                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
+                    let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
+
+                    // If a sentinel chat already exists, verify it is actually
+                    // viable — not orphaned (no agent connected, sitting in
+                    // Waiting forever).  An orphaned chat happens when the Coder
+                    // Agent never connects to the provisioned workspace, or the
+                    // workspace agent crashes after chat creation.
+                    if let Some(ref chat_id) = existing_sentinel_chat {
+                        match client.get_chat_opt(chat_id).await {
+                            Ok(Some(chat)) => {
+                                let status = chat.status();
+                                if matches!(status, ChatStatus::Waiting) {
+                                    // Chat is waiting but no agent has ever
+                                    // responded.  Check if a gate approval
+                                    // has been written — if not, the chat
+                                    // never did its job and is stale.
+                                    let gate_key = format!(
+                                        "ticket:{}:gate:planning",
+                                        ticket.id
+                                    );
+                                    let gate_approved: Option<serde_json::Value> =
+                                        store.get_typed(&gate_key).await;
+                                    if gate_approved.is_none() {
+                                        warn!(
+                                            ticket_id = %ticket.id,
+                                            chat_id = %chat_id,
+                                            "Sentinel chat is orphaned (Waiting with no gate \
+                                             approval) — clearing stale chat to re-spawn"
+                                        );
+                                        store.del(&sentinel_chat_key).await;
+                                        store.del(&sentinel_action_key).await;
+                                        existing_sentinel_chat = None;
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                // Chat no longer exists on Coder — stale key.
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    "Stored sentinel chat no longer exists — clearing key"
+                                );
+                                store.del(&sentinel_chat_key).await;
+                                store.del(&sentinel_action_key).await;
+                                existing_sentinel_chat = None;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    error = %e,
+                                    "Failed to verify sentinel chat; will retry next poll"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     // Diagnostic: show what the sentinel chat and action keys resolve to
                     info!(
                         ticket_id = %ticket.id,
@@ -1799,8 +1858,6 @@ Use `openflows-harness` for all coordination:
                         has_existing_chat = existing_sentinel_chat.is_some(),
                         "Checked for existing sentinel chat; proceeding to idle-slot check"
                     );
-                    let sentinel_action_key =
-                        full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
 
                     // Find an idle sentinel worker slot
                     let sentinel_slot = slots.iter().find(|(id, slot)| {
@@ -2011,11 +2068,68 @@ Use `openflows-harness` for all coordination:
                 Some("review_ready") => {
                     // ── PR Review: SENTINEL reviews completed work ──
 
-                    // Check if Sentinel chat already exists for this ticket
+                    // Check if Sentinel chat already exists for this ticket.
+                    // If the chat is orphaned (Waiting with no review written),
+                    // clear it so a fresh one can be spawned.
                     let sentinel_chat_key =
                         full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "sentinel");
-                    let existing_sentinel_chat: Option<String> =
+                    let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
+
+                    if let Some(ref chat_id) = existing_sentinel_chat {
+                        match client.get_chat_opt(chat_id).await {
+                            Ok(Some(chat)) if matches!(chat.status(), ChatStatus::Waiting) => {
+                                let review_key =
+                                    full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
+                                let existing_review: Option<Value> =
+                                    store.get_typed(&review_key).await;
+                                if existing_review.is_none() {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        chat_id = %chat_id,
+                                        "Sentinel chat is orphaned (Waiting with no review) \
+                                         — clearing stale chat to re-spawn"
+                                    );
+                                    store.del(&sentinel_chat_key).await;
+                                    let action_key = full_ticket_key(
+                                        &ticket.id,
+                                        KEY_TICKET_CHAT_ACTION,
+                                        "sentinel",
+                                    );
+                                    store.del(&action_key).await;
+                                    existing_sentinel_chat = None;
+                                }
+                            }
+                            Ok(None) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    "Stored sentinel chat no longer exists — clearing key"
+                                );
+                                store.del(&sentinel_chat_key).await;
+                                let action_key = full_ticket_key(
+                                    &ticket.id,
+                                    KEY_TICKET_CHAT_ACTION,
+                                    "sentinel",
+                                );
+                                store.del(&action_key).await;
+                                existing_sentinel_chat = None;
+                            }
+                            Ok(Some(_)) => {
+                                // Chat exists and is not orphaned — legitimate existing chat.
+                            }
+                            Err(e) => {
+                                warn!(
+                                    ticket_id = %ticket.id,
+                                    chat_id = %chat_id,
+                                    error = %e,
+                                    "Failed to verify sentinel chat; will retry next poll"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     if existing_sentinel_chat.is_some() {
                         debug!(ticket_id = %ticket.id, "Sentinel chat already exists, skipping spawn");
                         continue;
