@@ -108,6 +108,36 @@ impl A2AClient {
         Ok(task_id)
     }
 
+    /// Get a task's current raw status string (e.g. "pending", "running",
+    /// "completed", "cancelled"). Used by the cancel-token poller.
+    pub async fn get_task_status_str(&self, task_id: &str) -> Result<String> {
+        let rpc_request = json!({
+            "jsonrpc": "2.0",
+            "method": "tasks/get",
+            "params": {
+                "task_id": task_id,
+            },
+            "id": uuid::Uuid::new_v4().to_string(),
+        });
+
+        let url = format!("{}/rpc", self.relay_url);
+        let response = self
+            .http_client
+            .post(&url)
+            .json(&rpc_request)
+            .send()
+            .await
+            .context("Failed to get task status from relay")?;
+
+        let body: Value = response.json().await?;
+        let result = body.get("result");
+        Ok(result
+            .and_then(|r| r.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown")
+            .to_string())
+    }
+
     /// Get a task's current status (Sentinel polling after submit).
     pub async fn get_task_status(&self, task_id: &str) -> Result<Option<VerifyResult>> {
         let rpc_request = json!({
@@ -216,6 +246,7 @@ impl A2AClient {
             "method": "tasks/complete",
             "params": {
                 "task_id": result.task_id,
+                "pair_id": self.pair_id,
                 "result": result,
             },
             "id": uuid::Uuid::new_v4().to_string(),
@@ -350,18 +381,22 @@ impl A2AClient {
                 };
 
                 let text = String::from_utf8_lossy(&chunk);
-                let mut last_data: Option<String> = None;
+                let mut buffer = String::new();
 
                 for line in text.lines() {
                     if let Some(data) = line.strip_prefix("data: ") {
-                        last_data = Some(data.to_string());
+                        buffer.push_str(data);
                     } else if let Some(data) = line.strip_prefix("data:") {
-                        last_data = Some(data.to_string());
+                        buffer.push_str(data);
+                    } else if line.is_empty() && !buffer.is_empty() {
+                        if let Ok(event) = serde_json::from_str::<VerifyProgressEvent>(&buffer) {
+                            let _ = tx.send(event);
+                        }
+                        buffer.clear();
                     }
                 }
-
-                if let Some(data) = last_data {
-                    if let Ok(event) = serde_json::from_str::<VerifyProgressEvent>(&data) {
+                if !buffer.is_empty() {
+                    if let Ok(event) = serde_json::from_str::<VerifyProgressEvent>(&buffer) {
                         let _ = tx.send(event);
                     }
                 }

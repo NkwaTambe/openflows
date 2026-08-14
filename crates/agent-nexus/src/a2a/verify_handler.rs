@@ -41,7 +41,10 @@ async fn log_rejected_request(relay: &A2ARelay, req: &VerifyRequest, reason: &st
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
 
-    // Append to audit:a2a:rejected (append-only log via Redis LPUSH)
+    // Write last rejected request to audit:a2a:rejected for inspection.
+    // Only the most recent rejection is kept — this is a debugging aid,
+    // not an append-only log. A full audit trail requires Redis LIST ops
+    // (LPUSH) which are not currently exposed by SharedStore.
     let rejected_key = a2a_protocol::audit_rejected_key();
     let entry_str = entry.to_string();
     relay

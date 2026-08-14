@@ -9,6 +9,7 @@ use config::state::{full_ticket_key, full_ticket_key_flat, heartbeat_key, Heartb
 use fred::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -676,9 +677,33 @@ impl HarnessStore {
             // Set up progress streaming channel
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<VerifyProgressEvent>();
 
-            // Get a cancel token from the relay by pushing a progress event
-            // (this triggers the relay to create a cancel token if one doesn't exist)
-            let cancel_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Get a cancel token — starts local and is synced to the relay's
+            // cancel state by a background polling task below.
+            let cancel_token =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // Spawn a background poller that checks the relay for cancellation
+            // and sets the local token so the executor kills the child process.
+            let cancel_token_for_poller = cancel_token.clone();
+            let poller_task_id = task_id.clone();
+            let poller_client =
+                crate::a2a_client::A2AClient::new(ticket.to_string(), "forge".to_string());
+            if let Ok(poller) = poller_client {
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        match poller.get_task_status_str(&poller_task_id).await {
+                            Ok(status) if status == "cancelled" => {
+                                cancel_token_for_poller.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            Ok(status) if status == "completed" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
 
             // Spawn a task to forward progress events to the relay
             let progress_task_id = task_id.clone();

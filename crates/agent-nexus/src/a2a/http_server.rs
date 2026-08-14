@@ -156,17 +156,20 @@ async fn handle_rpc(
             id: req.id,
         }
         .into_response(),
-        Err(e) => JsonRpcResponse {
-            jsonrpc: "2.0".into(),
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32603,
-                message: "Internal error".into(),
-                data: Some(json!(e.to_string())),
-            }),
-            id: req.id,
+        Err(e) => {
+            warn!(error = %e, "RPC handler error");
+            JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: "Internal error".into(),
+                    data: None,
+                }),
+                id: req.id,
+            }
+            .into_response()
         }
-        .into_response(),
     }
 }
 
@@ -271,13 +274,17 @@ async fn handle_tasks_claim(state: &A2AServerState, params: &Value) -> anyhow::R
 
 /// tasks/complete: Forge executor submits a terminal result for a task.
 ///
-/// `params: { "task_id", "result": { VerifyResult } }` → the relay marks the
-/// task completed and mirrors the result to Redis before returning.
+/// `params: { "task_id", "pair_id", "result": { VerifyResult } }` → the relay
+/// marks the task completed and mirrors the result to Redis before returning.
 async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow::Result<Value> {
     let task_id = params
         .get("task_id")
         .and_then(|t| t.as_str())
         .context("tasks/complete requires string task_id")?;
+    let pair_id = params
+        .get("pair_id")
+        .and_then(|p| p.as_str())
+        .context("tasks/complete requires string pair_id")?;
 
     let result: VerifyResult = params
         .get("result")
@@ -295,6 +302,18 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
             result.task_id,
             task_id
         ));
+    }
+
+    // Guard (v1 best-effort): verify the caller's pair_id matches the owning
+    // task's pair_id so a workspace cannot complete another pair's task.
+    if let Some(entry) = state.relay.get_task(task_id).await {
+        if entry.request.pair_id != pair_id {
+            return Err(anyhow::anyhow!(
+                "tasks/complete pair_id mismatch: task belongs to {} but caller claims {}",
+                entry.request.pair_id,
+                pair_id
+            ));
+        }
     }
 
     state.relay.complete_task(task_id, result).await?;

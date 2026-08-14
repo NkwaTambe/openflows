@@ -20,7 +20,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -253,6 +253,7 @@ pub async fn execute_verify_task(
 }
 
 /// Kill the entire process group for a given child PID.
+/// Sends SIGTERM first, waits a 5-second grace period, then escalates to SIGKILL.
 fn kill_process_group(pid: u32) {
     if pid == 0 {
         return;
@@ -260,7 +261,12 @@ fn kill_process_group(pid: u32) {
     let pgid = Pid::from_raw(-(pid as i32)); // Negative PID = process group
     match killpg(pgid, Signal::SIGTERM) {
         Ok(_) => debug!(pid, "Sent SIGTERM to process group"),
-        Err(e) => warn!(pid, error = %e, "Failed to kill process group"),
+        Err(e) => warn!(pid, error = %e, "Failed to send SIGTERM to process group"),
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    match killpg(pgid, Signal::SIGKILL) {
+        Ok(_) => debug!(pid, "Sent SIGKILL to process group after grace period"),
+        Err(e) => warn!(pid, error = %e, "Failed to send SIGKILL to process group"),
     }
 }
 

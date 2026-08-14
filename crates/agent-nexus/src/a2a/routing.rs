@@ -155,8 +155,9 @@ pub struct A2ARelay {
     // task_id → task entry (claim/complete/get by task_id)
     tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
     // idempotency_key → task_id (dedup: (pair_id, sha256(request_body)))
-    // TODO: add TTL or bounded eviction
     idempotency: Arc<Mutex<HashMap<String, String>>>,
+    // Timestamps for idempotency TTL eviction (idempotency_key → inserted_at)
+    idempotency_ts: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     // task_id → progress event buffer (for resubscribe / SSE replay)
     event_buffers: Arc<Mutex<HashMap<String, EventBuffer>>>,
     // task_id → broadcast sender for real-time progress streaming
@@ -173,6 +174,7 @@ impl A2ARelay {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             idempotency: Arc::new(Mutex::new(HashMap::new())),
+            idempotency_ts: Arc::new(Mutex::new(HashMap::new())),
             event_buffers: Arc::new(Mutex::new(HashMap::new())),
             broadcast_senders: Arc::new(RwLock::new(HashMap::new())),
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
@@ -309,7 +311,14 @@ impl A2ARelay {
         self.idempotency
             .lock()
             .await
-            .insert(idempotency_key, task_id.clone());
+            .insert(idempotency_key.clone(), task_id.clone());
+        self.idempotency_ts
+            .lock()
+            .await
+            .insert(idempotency_key, std::time::Instant::now());
+
+        // Mirror the request to the audit trail so it can be replayed later
+        let _ = self.mirror_request(&task_id, req).await;
 
         // Initialize event buffer and broadcast channel for this task
         self.event_buffers
@@ -412,6 +421,62 @@ impl A2ARelay {
             "Result mirrored to Redis"
         );
         Ok(())
+    }
+
+    /// Mirror the original verify request to the audit trail so
+    /// `get_task_request` can replay it later. Call this once when a
+    /// new task is created.
+    pub async fn mirror_request(&self, task_id: &str, request: &VerifyRequest) -> Result<()> {
+        let audit_request_key = format!("{}:request", a2a_protocol::audit_task_key(task_id));
+        self.store
+            .set(&audit_request_key, serde_json::to_value(request)?)
+            .await;
+        debug!(task_id, "Request mirrored to audit trail");
+        Ok(())
+    }
+
+    /// Evict idempotency entries older than `ttl` and not still pending/running.
+    /// Call this periodically to bound the idempotency map.
+    pub async fn cleanup_idempotency(&self) {
+        const IDEMPOTENCY_TTL_SECS: u64 = 3600; // 1 hour
+        let now = std::time::Instant::now();
+
+        let stale_keys: Vec<String> = {
+            let ts = self.idempotency_ts.lock().await;
+            ts.iter()
+                .filter(|(_, instant)| now.duration_since(**instant).as_secs() > IDEMPOTENCY_TTL_SECS)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
+
+        let to_evict: Vec<(String, String)> = {
+            let idempotency = self.idempotency.lock().await;
+            let tasks = self.tasks.lock().await;
+            stale_keys
+                .iter()
+                .filter_map(|key| {
+                    let task_id = idempotency.get(key)?;
+                    let should_evict = match tasks.get(task_id) {
+                        Some(t) => matches!(t.state, TaskState::Completed | TaskState::Cancelled),
+                        None => true,
+                    };
+                    if should_evict {
+                        Some((key.clone(), task_id.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let mut idempotency = self.idempotency.lock().await;
+        let mut ts = self.idempotency_ts.lock().await;
+        let mut tasks = self.tasks.lock().await;
+        for (key, task_id) in to_evict {
+            idempotency.remove(&key);
+            ts.remove(&key);
+            tasks.remove(&task_id);
+        }
     }
 
     /// Get a task's stored request for replay (used by resubscribe).
