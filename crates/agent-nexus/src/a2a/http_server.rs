@@ -352,13 +352,13 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
         }
     }
 
-    // Mark the task as cancelled in the relay state
-    let newly_set = state.relay.mark_cancelled(task_id).await;
-
-    // Transition task state to Cancelled
+    // Transition the task to Cancelled state with a synthetic result.
+    // The executor's cancel poller observes "cancelled" and sets the
+    // local cancel token to kill the child process. We intentionally do
+    // NOT call complete_task here — that would transition to Completed
+    // before the poller can detect the cancellation.
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.state == TaskState::Running || entry.state == TaskState::Pending {
-            // Build a synthetic cancelled result and complete the task
             let cancelled_result = a2a_protocol::VerifyResult {
                 task_id: task_id.to_string(),
                 exit_code: None,
@@ -372,18 +372,13 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
                     workspace: format!("unknown-{}", entry.request.pair_id),
                 },
             };
-            let _ = state.relay.complete_task(task_id, cancelled_result).await;
+            let _ = state.relay.cancel_task(task_id, cancelled_result).await;
         }
-        debug!(
-            task_id,
-            state = ?entry.state,
-            "Cancel signal sent to task"
-        );
     }
 
     Ok(json!({
         "task_id": task_id,
-        "cancelled": newly_set
+        "cancelled": true
     }))
 }
 

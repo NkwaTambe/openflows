@@ -560,6 +560,36 @@ impl A2ARelay {
 
     // ── Cancel ──────────────────────────────────────────────────────────────
 
+    /// Set the cancel flag for a task and transition it to Cancelled state
+    /// with a synthetic result, mirroring to Redis. The task stays Cancelled
+    /// (not Completed) so the executor's poller can observe "cancelled" and
+    /// kill the child process before the executor submits its own result.
+    pub async fn cancel_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
+        // Set the cancel flag
+        let mut tokens = self.cancel_tokens.lock().await;
+        match tokens.get(task_id) {
+            Some(flag) => {
+                flag.store(true, Ordering::SeqCst);
+            }
+            None => {
+                tokens.insert(task_id.to_string(), Arc::new(AtomicBool::new(true)));
+            }
+        }
+        drop(tokens);
+
+        // Transition task state to Cancelled and store result
+        let mut tasks = self.tasks.lock().await;
+        if let Some(entry) = tasks.get_mut(task_id) {
+            entry.state = TaskState::Cancelled;
+            entry.result = Some(result.clone());
+        }
+        drop(tasks);
+
+        self.mirror_result(&result).await?;
+        debug!(task_id, "Task cancelled and result mirrored");
+        Ok(())
+    }
+
     /// Set the cancel flag for a task. Returns true if the flag was newly
     /// set, false if it was already set or the task has no cancel token.
     pub async fn mark_cancelled(&self, task_id: &str) -> bool {
@@ -570,7 +600,6 @@ impl A2ARelay {
                 !already
             }
             None => {
-                // Create a new flag (for tasks where claim hasn't happened yet)
                 tokens.insert(task_id.to_string(), Arc::new(AtomicBool::new(true)));
                 true
             }
