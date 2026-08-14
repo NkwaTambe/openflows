@@ -1809,10 +1809,7 @@ Use `openflows-harness` for all coordination:
                                     // responded.  Check if a gate approval
                                     // has been written — if not, the chat
                                     // never did its job and is stale.
-                                    let gate_key = format!(
-                                        "ticket:{}:gate:planning",
-                                        ticket.id
-                                    );
+                                    let gate_key = format!("ticket:{}:gate:planning", ticket.id);
                                     let gate_approved: Option<serde_json::Value> =
                                         store.get_typed(&gate_key).await;
                                     if gate_approved.is_none() {
@@ -2107,11 +2104,8 @@ Use `openflows-harness` for all coordination:
                                     "Stored sentinel chat no longer exists — clearing key"
                                 );
                                 store.del(&sentinel_chat_key).await;
-                                let action_key = full_ticket_key(
-                                    &ticket.id,
-                                    KEY_TICKET_CHAT_ACTION,
-                                    "sentinel",
-                                );
+                                let action_key =
+                                    full_ticket_key(&ticket.id, KEY_TICKET_CHAT_ACTION, "sentinel");
                                 store.del(&action_key).await;
                                 existing_sentinel_chat = None;
                             }

@@ -322,8 +322,7 @@ impl Node for SentinelNode {
                     // literal role string "forge". The chat key is stored as
                     // `ticket:{id}:chat:{worker_id}` (e.g. `forge-1`).
                     let worker_id = verdict["worker_id"].as_str().unwrap_or("");
-                    let forge_chat_key =
-                        full_ticket_key(ticket_id, KEY_TICKET_CHAT, worker_id);
+                    let forge_chat_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT, worker_id);
                     let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
 
                     if let (Some(ref client), Some(ref chat_id)) = (&client, &forge_chat_id) {
