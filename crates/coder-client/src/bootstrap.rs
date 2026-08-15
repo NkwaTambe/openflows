@@ -6,7 +6,7 @@
 //! Safe to call on every restart.
 
 use crate::{CoderClient, CreateWorkspaceRequest};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::json;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -41,7 +41,7 @@ impl CoderBootstrapper {
     /// Create a bootstrapper from environment variables.
     ///
     /// Reads:
-    /// - `CODER_URL`: Coder server URL (required)
+    /// - `CODER_URL`: Coder server URL (default: http://localhost:7080)
     /// - `CODER_ADMIN_EMAIL`: Admin email (default: admin@openflows.dev)
     /// - `CODER_ADMIN_PASSWORD`: Admin password (default: Op3nFl0ws!)
     /// - `CODER_ADMIN_USERNAME`: Admin username (default: admin)
@@ -50,7 +50,8 @@ impl CoderBootstrapper {
     /// (uppercase, lowercase, digit, special character, min 8 chars), it is
     /// replaced with the secure default and a warning is logged.
     pub fn from_env() -> Result<Self> {
-        let url = std::env::var("CODER_URL").context("CODER_URL not set")?;
+        let url =
+            std::env::var("CODER_URL").unwrap_or_else(|_| "http://localhost:7080".to_string());
         let email = std::env::var("CODER_ADMIN_EMAIL")
             .unwrap_or_else(|_| "admin@openflows.dev".to_string());
         let raw_password = std::env::var("CODER_ADMIN_PASSWORD")
