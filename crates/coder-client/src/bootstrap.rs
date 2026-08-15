@@ -50,8 +50,8 @@ impl CoderBootstrapper {
     /// (uppercase, lowercase, digit, special character, min 8 chars), it is
     /// replaced with the secure default and a warning is logged.
     pub fn from_env() -> Result<Self> {
-        let url = std::env::var("CODER_URL")
-            .unwrap_or_else(|_| "http://localhost:7080".to_string());
+        let url =
+            std::env::var("CODER_URL").unwrap_or_else(|_| "http://localhost:7080".to_string());
         let email = std::env::var("CODER_ADMIN_EMAIL")
             .unwrap_or_else(|_| "admin@openflows.dev".to_string());
         let raw_password = std::env::var("CODER_ADMIN_PASSWORD")
