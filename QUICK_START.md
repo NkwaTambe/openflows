@@ -3,6 +3,8 @@
 This guide covers everything you need to get OpenFlows running on a fresh machine: prerequisites, one-time setup (`.env`, Docker, bootstrap, licenses, tokens), adding a tenant, running the controller, verifying it works, and common troubleshooting.
 
 > **Overview:** For what OpenFlows is, its architecture, how far it has come, and what's left to finish, see the [README](README.md).
+>
+> **Working directory:** Unless stated otherwise, all commands are run from the **project root** (the directory containing `docker-compose.yml`). There is no need to `cd` into subdirectories.
 
 ---
 
@@ -22,25 +24,30 @@ This guide covers everything you need to get OpenFlows running on a fresh machin
 
 ## Step 1 — Configure the environment
 
+Run this from the **project root** to create your local `.env`:
+
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and fill in at least:
+Open `.env` and fill in the required variables. The file is well-commented; the table below summarizes every variable so you know what to set and why.
 
-| Variable | Description |
-|----------|-------------|
-| `GITHUB_TOKEN` | GitHub PAT with the `repo` scope (from <https://github.com/settings/tokens>) |
-| `GITHUB_REPOSITORY` | Your repo as `owner/repo` (e.g. `my-org/my-repo`) |
-| `CODER_SESSION_TOKEN` | Leave empty for now — obtained in [Step 4](#step-4--coder-license--github-login--api-token) |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GITHUB_TOKEN` | **Yes** | GitHub PAT with the `repo` scope — used to sync issues and create PRs. Get it at <https://github.com/settings/tokens> (classic token, `repo` scope). |
+| `GITHUB_REPOSITORY` | **Yes** | Your repo as `owner/repo` (e.g. `my-org/my-repo`). The controller watches this repo for new issues. |
+| `CODER_SESSION_TOKEN` | **Yes** | API token for authenticating with Coder. Leave empty in Step 1 — you will paste it in [Step 4](#step-4--sign-in-add-a-coder-license--get-the-api-token). |
 
-Optional overrides (used when bootstrap creates the Coder admin account):
+The following variables are optional — the system uses defaults that work out of the box with `docker compose up -d`. Only set them if you host Redis or Coder elsewhere, or want to customize the admin account:
 
-```bash
-CODER_ADMIN_USERNAME=admin
-CODER_ADMIN_EMAIL=admin@openflows.dev
-CODER_ADMIN_PASSWORD=Op3nFl0ws!
-```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REDIS_URL` | `redis://localhost:6379` | Connection URL for Redis. |
+| `CODER_URL` | `http://localhost:7080` | HTTP URL of the Coder server. |
+| `CODER_ADMIN_USERNAME` | `admin` | Admin username created by bootstrap. |
+| `CODER_ADMIN_EMAIL` | `admin@openflows.dev` | Admin email created by bootstrap. |
+| `CODER_ADMIN_PASSWORD` | `Op3nFl0ws!` | Admin password created by bootstrap. Must be ≥8 chars with uppercase, lowercase, digit, and special character — otherwise bootstrap silently falls back to the default. |
+| `OPENFLOWS_TENANT` | `default` | Namespace prefix for Redis keys. |
 
 > **`.dev-binaries` note:** This directory is created and populated automatically during bootstrap and is bind-mounted into Coder workspaces. If bootstrap fails with `cp: ...: Permission denied`, the directory has become `root`-owned. Fix it:
 > ```bash
@@ -52,15 +59,17 @@ CODER_ADMIN_PASSWORD=Op3nFl0ws!
 
 ## Step 2 — Start the Docker infrastructure
 
+Run this from the **project root** to bring up Redis, the Coder database, and the Coder server:
+
 ```bash
 docker compose up -d
 ```
 
-This starts three services (see `docker-compose.yml`):
+**What this does:** Starts three containerized services (defined in `docker-compose.yml`) that the controller depends on at runtime:
 
-- **Redis** — the shared state store (port `6379`)
-- **coder-db** — PostgreSQL for Coder (no external port)
-- **coder** — the Coder server itself (port `7080`)
+- **Redis** — the shared state store used by the controller to track tickets, worker assignments, and gate approvals (port `6379`).
+- **coder-db** — PostgreSQL database that stores Coder's configuration and users (no external port).
+- **coder** — the Coder server that provisions and manages workspaces for the AI agents (port `7080`).
 
 Wait until all services are healthy:
 
@@ -76,16 +85,18 @@ You should see `redis`, `coder-db`, and `coder` all reporting `healthy` (or `run
 
 ## Step 3 — Bootstrap (one-time setup)
 
+Run this from the **project root** to initialize Coder with the templates and configuration OpenFlows needs:
+
 ```bash
 ./scripts/prod.sh bootstrap
 ```
 
-This will:
+**What this does and why each step matters:**
 
-1. **Build and sync dev binaries** — compiles `openflows` (controller) and `openflows-harness` (worker coordination) in release mode and copies both to `.dev-binaries/` for mounting into Coder workspaces.
-2. **Create the admin user in Coder** — creates the initial admin account (see Step 4 for credentials).
-3. **Push workspace templates** — deploys the `nexus`, `forge`, `sentinel`, `vessel`, and `lore` templates via `coder templates push`.
-4. **Verify LLM/GitHub auth** — ensures a GitHub token and at least one LLM model are configured.
+1. **Build and sync dev binaries** — compiles the `openflows` controller and `openflows-harness` worker binary in release mode, then copies both to `.dev-binaries/`. This directory is mounted into Coder workspaces so they have the latest version of the tools.
+2. **Create the admin user in Coder** — creates the initial admin account using the credentials from `.env` (see Step 4 for defaults).
+3. **Push workspace templates** — deploys the `nexus`, `forge`, `sentinel`, `vessel`, and `lore` templates to Coder. These templates define the workspaces that each AI agent will run in.
+4. **Verify LLM/GitHub auth** — checks that a GitHub token is present and that at least one LLM model is configured in Coder's AI settings.
 
 ---
 
@@ -99,17 +110,18 @@ The bootstrap script creates the initial Coder admin account. By default the cre
 | Email | `admin@openflows.dev` |
 | Password | `Op3nFl0ws!` |
 
-Override them with `CODER_ADMIN_USERNAME` / `CODER_ADMIN_EMAIL` / `CODER_ADMIN_PASSWORD` before running bootstrap.
+Override them with `CODER_ADMIN_USERNAME` / `CODER_ADMIN_EMAIL` / `CODER_ADMIN_PASSWORD` in `.env` before running bootstrap.
 
 > **Password requirements:** If the `CODER_ADMIN_PASSWORD` you set does not meet Coder's security requirements (at least 8 characters, and containing an uppercase letter, a lowercase letter, a digit, and a special character), bootstrap **silently falls back to `Op3nFl0ws!`** and creates the admin with that instead. Either set a password that satisfies these requirements, or sign in with the default `Op3nFl0ws!` (check the bootstrap output for the "falling back to default" warning).
 
 Then:
 
 1. Open **http://localhost:7080**
-2. **Sign in with the admin credentials above** (first-time only). The bundled Coder service authenticates with a username/password — it does **not** come with GitHub OAuth pre-configured. GitHub sign-in is only available if you manually configure a GitHub OAuth provider in Coder afterwards; it is not required to get started.
-3. **Add a Coder license** — create a license from your account at coder.com, then add it at **http://localhost:7080/deployment/licenses/add**. (Coder requires a valid license before some functionality is enabled. For local development you can use Coder's free/developer license — see <https://coder.com/docs/next/admin/licenses>.)
-4. Click your **username** (top-right corner) → **Account** → **Tokens**.
-5. Click **Create Token**, copy the token, and paste it into `.env` as:
+2. **Sign in with the admin credentials above** (first-time only). GitHub sign-up is enabled by default — team members can sign in with their GitHub accounts via Coder's device flow.
+3. **Add a Coder license** — create a license from your account at coder.com, then add it at **[http://localhost:7080/deployment/licenses/add](http://localhost:7080/deployment/licenses/add)**. Coder requires a valid license before some functionality is enabled. For local development you can use Coder's free/developer license — see <https://coder.com/docs/next/admin/licenses>.
+4. **Configure an LLM model** — OpenFlows agents need at least one model configured. Go to **[http://localhost:7080/ai-settings/agents](http://localhost:7080/ai-settings/agents)** → click the **Models** tab and add a provider/model (e.g. OpenAI, Anthropic).
+5. Click your **username** (top-right corner) → **Account** → **Tokens** (or go directly to **[http://localhost:7080/settings/tokens](http://localhost:7080/settings/tokens)**).
+6. Click **Create Token**, copy the token, and paste it into `.env` as:
    ```bash
    CODER_SESSION_TOKEN=your_token_here
    ```
@@ -118,28 +130,35 @@ Then:
 
 ## Step 5 — Add a tenant
 
+Run this from the **project root** to bind a GitHub repository to the controller:
+
 ```bash
 ./scripts/prod.sh tenant <owner/repo> --name <my-team>
 ```
 
-This binds a GitHub repo to the controller. You must add at least one tenant before starting the controller. See [TOKEN_GUIDE.md](TOKEN_GUIDE.md) for the token acquisition walkthrough.
+**What this does:** Register a team as a tenant so the controller can sync issues from the given repo, provision workspaces, and coordinate agents for that team. You must add at least one tenant before starting the controller. See [TOKEN_GUIDE.md](TOKEN_GUIDE.md) for the token acquisition walkthrough.
 
 ---
 
 ## Step 6 — Run the controller
 
+Run this from the **project root** (open a **separate terminal** — the controller runs in the foreground and streams logs to that terminal):
+
 ```bash
-# Run this in a separate terminal; the controller remains in the foreground
 ./scripts/prod.sh run
 ```
 
-This **always** resets Redis to a clean slate, then starts the controller in the foreground (logs stream to this terminal). Create a GitHub issue in a bound repo → OpenFlows automatically assigns, provisions a workspace, and starts working.
+**What this does and why:** The controller is the brain of OpenFlows. It syncs open GitHub issues as tickets, assigns them to available forge workers, provisions Coder workspaces for those workers, and coordinates the agent team through the full issue-to-PR lifecycle.
+
+This command **always** resets Redis to a clean slate first (removing any stale tickets, workers, and gate records from previous runs), then starts the controller in the foreground.
+
+Create a GitHub issue in a bound repo → OpenFlows automatically assigns, provisions a workspace, and starts working.
 
 ---
 
 ## Step 7 — Verify it's working
 
-Because the controller runs in the foreground, its logs stream directly to the terminal where you started `./scripts/prod.sh run`. In a **separate terminal** you can verify:
+Because the controller runs in the foreground, its logs stream directly to the terminal where you started `./scripts/prod.sh run`. In a **separate terminal** (also from the project root) you can verify:
 
 ```bash
 # Health check
@@ -170,9 +189,25 @@ curl -fsSL https://coder.com/install.sh | sh
 
 Ensure `coder` is on your `PATH`, confirm with `coder version`, then re-run bootstrap.
 
+### `CODER_URL not set` / `Error: Failed to create bootstrapper from environment` (during bootstrap)
+
+The CLI defaults to `http://localhost:7080` — this error should no longer appear unless you explicitly unset `CODER_URL` in your environment. If you do need a different URL, set it in `.env`:
+
+```bash
+CODER_URL=http://your-coder-host:7080
+```
+
+### `REDIS_URL is not set` (during `prod.sh run`)
+
+The CLI defaults to `redis://localhost:6379` — this error should no longer appear unless you explicitly unset `REDIS_URL` in your environment. If you do need a different URL, set it in `.env`:
+
+```bash
+REDIS_URL=redis://your-redis-host:6379
+```
+
 ### "No LLM models configured in Coder"
 
-Open the Coder dashboard → **AI Settings** → **Coder Agents** → **Models** and configure at least one provider/model, then re-run bootstrap.
+Open the Coder dashboard → **[http://localhost:7080/ai-settings/agents](http://localhost:7080/ai-settings/agents)** → click the **Models** tab and configure at least one provider/model, then re-run bootstrap.
 
 ### `cp: cannot create regular file '.dev-binaries/openflows': Permission denied`
 

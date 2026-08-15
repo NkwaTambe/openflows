@@ -145,15 +145,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run_controller() -> Result<()> {
-    // ── Fail-fast environment validation (no fallback) ──────────────────
-    let coder_url = std::env::var("CODER_URL").context(
-        "CODER_URL is not set. The Controller must run inside an openflows-nexus workspace.",
-    )?;
+    // ── Fail-fast environment validation ────────────────────────────────
+    let coder_url = std::env::var("CODER_URL")
+        .unwrap_or_else(|_| "http://localhost:7080".to_string());
     let _coder_token = std::env::var("CODER_SESSION_TOKEN")
         .context("CODER_SESSION_TOKEN is not set. The Controller must run inside an openflows-nexus workspace.")?;
-    let redis_url = std::env::var("REDIS_URL").context(
-        "REDIS_URL is not set. The Controller must run inside an openflows-nexus workspace.",
-    )?;
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://localhost:6379".to_string());
     let tenant = std::env::var("OPENFLOWS_TENANT").context(
         "OPENFLOWS_TENANT is not set. The Controller must run inside an openflows-nexus workspace.",
     )?;
@@ -174,7 +172,6 @@ async fn run_controller() -> Result<()> {
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
 
-    // ── Start A2A relay (issue #143) ────────────────────────────────────
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
     // progress, result mirroring to Redis).
