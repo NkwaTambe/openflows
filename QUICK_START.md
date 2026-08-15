@@ -191,7 +191,7 @@ Ensure `coder` is on your `PATH`, confirm with `coder version`, then re-run boot
 
 ### `CODER_URL not set` / `Error: Failed to create bootstrapper from environment` (during bootstrap)
 
-The CLI defaults to `http://localhost:7080` — this error should no longer appear unless you explicitly unset `CODER_URL` in your environment. If you do need a different URL, set it in `.env`:
+The CLI defaults to `http://localhost:7080` when `CODER_URL` is not set, so the old bootstrap error should no longer appear. If you still see a connection failure, check that `CODER_URL` in `.env` is not set to an empty or malformed value — an empty value (`CODER_URL=`) is treated as the URL itself rather than falling back to the default. If you do need a different URL, set it to a valid value:
 
 ```bash
 CODER_URL=http://your-coder-host:7080
@@ -199,7 +199,7 @@ CODER_URL=http://your-coder-host:7080
 
 ### `REDIS_URL is not set` (during `prod.sh run`)
 
-The CLI defaults to `redis://localhost:6379` — this error should no longer appear unless you explicitly unset `REDIS_URL` in your environment. If you do need a different URL, set it in `.env`:
+The CLI defaults to `redis://localhost:6379` when `REDIS_URL` is not set, so the old run error should no longer appear. If you still see a connection failure, check that `REDIS_URL` in `.env` is not set to an empty or malformed value — an empty value (`REDIS_URL=`) is treated as the URL itself rather than falling back to the default. If you do need a different URL, set it to a valid value:
 
 ```bash
 REDIS_URL=redis://your-redis-host:6379
