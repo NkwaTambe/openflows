@@ -159,28 +159,26 @@ impl CoderBootstrapper {
             .with_session_token(&session_token);
         info!("  ✓ API token generated");
 
-        // 4. Resolve the .dev-binaries host path so workspace templates can
-        //    bind-mount the local openflows binary for local dev/testing.
-        //    Set as a TF_VAR_* env var — `coder templates push` runs Terraform
-        //    under the hood and inherits the parent environment.
-        if std::env::var("TF_VAR_dev_binary_host_path").is_err() {
-            if let Ok(cwd) = std::env::current_dir() {
-                let dev_bin = cwd.join(".dev-binaries");
-                if dev_bin.is_dir() {
-                    let canonical = std::fs::canonicalize(&dev_bin)
-                        .unwrap_or(dev_bin)
-                        .to_string_lossy()
-                        .into_owned();
-                    info!(
-                        host_path = %canonical,
-                        "Setting TF_VAR_dev_binary_host_path for template push"
-                    );
-                    std::env::set_var("TF_VAR_dev_binary_host_path", &canonical);
-                }
-            }
-        }
+        Self::push_templates_and_create_nexus(client).await
+    }
 
-        // 5. Push workspace templates (bundled in binary)
+    /// Shared post-auth logic: push templates and create the nexus workspace.
+    /// Used by both the "reuse existing token" fast path and the full admin
+    /// bootstrap path.
+    async fn push_templates_and_create_nexus(client: CoderClient) -> Result<CoderClient> {
+        let resolved_user = client.resolve_current_user().await?;
+        info!(
+            username = %resolved_user,
+            "  ✓ Current user resolved from auth token"
+        );
+
+        // Resolve the .dev-binaries host path so workspace templates can
+        // bind-mount the local openflows binary for local dev/testing.
+        // Set as a TF_VAR_* env var — `coder templates push` runs Terraform
+        // under the hood and inherits the parent environment.
+        Self::set_dev_binary_host_path();
+
+        // Push workspace templates (bundled in binary)
         push_template_silently(
             &client,
             "openflows-forge",
@@ -216,34 +214,10 @@ impl CoderBootstrapper {
         // (it still runs the old template version). Delete and recreate it so
         // the new template (e.g. fixed bind-mount path) takes effect.
         if nexus_template_updated {
-            let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
-                .unwrap_or_else(|_| "openflows-nexus".to_string());
-            if let Ok(me) = client.get_me().await {
-                if let Ok(workspaces) = client.list_workspaces(&me.id).await {
-                    if let Some(existing) =
-                        workspaces.iter().find(|w| w.name == nexus_workspace_name)
-                    {
-                        info!(
-                            workspace_id = %existing.id,
-                            workspace_name = %existing.name,
-                            "  → Nexus template updated — deleting stale workspace for recreation"
-                        );
-                        // Stop first (required before delete in Coder)
-                        let _ = client.stop_workspace(&existing.id).await;
-                        match client.delete_workspace(&existing.id).await {
-                            Ok(()) => info!("  ✓ Stale nexus workspace deleted"),
-                            Err(e) => {
-                                warn!(error = %e, "  ⚠ Could not delete stale nexus workspace; will attempt to create anyway")
-                            }
-                        }
-                        // Give Coder a moment to clean up
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                    }
-                }
-            }
+            Self::delete_stale_nexus_workspace(&client).await;
         }
 
-        // 6. Create or refresh the long-lived Nexus workspace outside Coder.
+        // Create or refresh the long-lived Nexus workspace outside Coder.
         //
         // This is the bootstrapper's "first mover" responsibility: seed the
         // persistent control-plane workspace that runs the orchestration loop.
@@ -252,102 +226,146 @@ impl CoderBootstrapper {
             .unwrap_or(true)
             && std::env::var("ROLE").as_deref() != Ok("nexus")
         {
-            let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
-                .unwrap_or_else(|_| "openflows-nexus".to_string());
-            let nexus_api_token = std::env::var("OPENFLOWS_NEXUS_API_TOKEN")
-                .or_else(|_| std::env::var("NEXUS_CODER_API_TOKEN"))
-                .unwrap_or_else(|_| client.token().to_string());
-            let repository = std::env::var("GITHUB_REPOSITORY").unwrap_or_else(|_| String::new());
-            let repo_url = if repository.is_empty() {
-                String::new()
-            } else {
-                format!("https://github.com/{}.git", repository)
-            };
-            let redis_url = "redis://redis:6379".to_string();
-            let tenant =
-                std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
-            let registry_json = match std::env::var("OPENFLOWS_REGISTRY_JSON") {
-                Ok(json) => json,
-                Err(_) => {
-                    let path = std::env::var("OPENFLOWS_REGISTRY_PATH")
-                        .unwrap_or_else(|_| "orchestration/agent/registry.json".to_string());
-                    std::fs::read_to_string(&path).unwrap_or_default()
-                }
-            };
-
-            // Convert localhost URLs to Docker service names for workspace-to-service communication.
-            // When creating workspaces from the host (where CODER_URL=http://localhost:7080),
-            // the workspace containers cannot reach "localhost" — they need the Docker service name.
-            let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
-
-            let github_pat = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap_or_default();
-            match client
-                .create_workspace(&CreateWorkspaceRequest {
-                    template_name: "openflows-nexus".to_string(),
-                    name: nexus_workspace_name.clone(),
-                    parameters: json!({
-                        "repo_url": repo_url,
-                        "redis_url": redis_url,
-                        "coder_url": coder_url_for_workspace,
-                        "coder_session_token": nexus_api_token,
-                        "tenant": tenant,
-                        "github_repository": repository,
-                        "registry_json": registry_json,
-                        "github_pat": github_pat,
-                        "start_controller": false, // Bootstrap only sets up the workspace
-                                                 // Controller is started via 'openflows run'
-                    }),
-                })
-                .await
-            {
-                Ok(workspace) => {
-                    let _ = client
-                        .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
-                        .await;
-                    if let Err(e) = client
-                        .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
-                        .await
-                    {
-                        warn!(error = %e, "Workspace SSH not ready during bootstrap; continuing anyway");
-                    }
-
-                    if let Ok(home) = std::env::var("HOME") {
-                        let state_dir = format!("{}/.openflows", home);
-                        if std::fs::create_dir_all(&state_dir).is_ok() {
-                            let state_file = format!("{}/nexus-workspace.json", state_dir);
-                            let _ = std::fs::write(
-                                &state_file,
-                                serde_json::to_string_pretty(&json!({
-                                    "workspace_id": workspace.id,
-                                    "workspace_name": workspace.name,
-                                    "template_name": "openflows-nexus",
-                                    "coder_url": client.base_url(),
-                                }))
-                                .unwrap_or_else(|_| "{}".to_string()),
-                            );
-                            info!(state_file = %state_file, "Nexus workspace state persisted");
-                        }
-                    }
-
-                    std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_ID", &workspace.id);
-                    std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_NAME", &workspace.name);
-                    info!(
-                        workspace_id = %workspace.id,
-                        workspace_name = %workspace.name,
-                        "  ✓ Nexus workspace resolved"
-                    );
-                }
-                Err(e) => {
-                    info!(
-                        error = %e,
-                        "  ⚠ Nexus workspace bootstrap skipped/failed; continuing with existing control plane"
-                    );
-                }
-            }
+            Self::create_nexus_workspace(&client).await;
         }
 
         info!("  ✓ Coder bootstrapped");
         Ok(client)
+    }
+
+    /// Set the TF_VAR_dev_binary_host_path for local dev/testing template pushes.
+    fn set_dev_binary_host_path() {
+        if std::env::var("TF_VAR_dev_binary_host_path").is_ok() {
+            return;
+        }
+        let Ok(cwd) = std::env::current_dir() else {
+            return;
+        };
+        let dev_bin = cwd.join(".dev-binaries");
+        if !dev_bin.is_dir() {
+            return;
+        }
+        let canonical = std::fs::canonicalize(&dev_bin)
+            .unwrap_or(dev_bin)
+            .to_string_lossy()
+            .into_owned();
+        info!(
+            host_path = %canonical,
+            "Setting TF_VAR_dev_binary_host_path for template push"
+        );
+        std::env::set_var("TF_VAR_dev_binary_host_path", &canonical);
+    }
+
+    /// Delete a stale nexus workspace when its template has been updated.
+    async fn delete_stale_nexus_workspace(client: &CoderClient) {
+        let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
+            .unwrap_or_else(|_| "openflows-nexus".to_string());
+        let Ok(me) = client.get_me().await else { return };
+        let Ok(workspaces) = client.list_workspaces(&me.id).await else { return };
+        let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) else {
+            return;
+        };
+        info!(
+            workspace_id = %existing.id,
+            workspace_name = %existing.name,
+            "  → Nexus template updated — deleting stale workspace for recreation"
+        );
+        let _ = client.stop_workspace(&existing.id).await;
+        match client.delete_workspace(&existing.id).await {
+            Ok(()) => info!("  ✓ Stale nexus workspace deleted"),
+            Err(e) => {
+                warn!(error = %e, "  ⚠ Could not delete stale nexus workspace; will attempt to create anyway")
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    /// Create the long-lived Nexus workspace.
+    async fn create_nexus_workspace(client: &CoderClient) {
+        let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
+            .unwrap_or_else(|_| "openflows-nexus".to_string());
+        let nexus_api_token = std::env::var("OPENFLOWS_NEXUS_API_TOKEN")
+            .or_else(|_| std::env::var("NEXUS_CODER_API_TOKEN"))
+            .unwrap_or_else(|_| client.token().to_string());
+        let repository = std::env::var("GITHUB_REPOSITORY").unwrap_or_else(|_| String::new());
+        let repo_url = if repository.is_empty() {
+            String::new()
+        } else {
+            format!("https://github.com/{}.git", repository)
+        };
+        let redis_url = "redis://redis:6379".to_string();
+        let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+        let registry_json = match std::env::var("OPENFLOWS_REGISTRY_JSON") {
+            Ok(json) => json,
+            Err(_) => {
+                let path = std::env::var("OPENFLOWS_REGISTRY_PATH")
+                    .unwrap_or_else(|_| "orchestration/agent/registry.json".to_string());
+                std::fs::read_to_string(&path).unwrap_or_default()
+            }
+        };
+        let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
+        let github_pat = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap_or_default();
+
+        match client
+            .create_workspace(&CreateWorkspaceRequest {
+                template_name: "openflows-nexus".to_string(),
+                name: nexus_workspace_name.clone(),
+                parameters: json!({
+                    "repo_url": repo_url,
+                    "redis_url": redis_url,
+                    "coder_url": coder_url_for_workspace,
+                    "coder_session_token": nexus_api_token,
+                    "tenant": tenant,
+                    "github_repository": repository,
+                    "registry_json": registry_json,
+                    "github_pat": github_pat,
+                    "start_controller": false,
+                }),
+            })
+            .await
+        {
+            Ok(workspace) => {
+                let _ = client
+                    .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
+                    .await;
+                if let Err(e) = client
+                    .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
+                    .await
+                {
+                    warn!(error = %e, "Workspace SSH not ready during bootstrap; continuing anyway");
+                }
+                if let Ok(home) = std::env::var("HOME") {
+                    let state_dir = format!("{}/.openflows", home);
+                    if std::fs::create_dir_all(&state_dir).is_ok() {
+                        let state_file = format!("{}/nexus-workspace.json", state_dir);
+                        let _ = std::fs::write(
+                            &state_file,
+                            serde_json::to_string_pretty(&json!({
+                                "workspace_id": workspace.id,
+                                "workspace_name": workspace.name,
+                                "template_name": "openflows-nexus",
+                                "coder_url": client.base_url(),
+                            }))
+                            .unwrap_or_else(|_| "{}".to_string()),
+                        );
+                        info!(state_file = %state_file, "Nexus workspace state persisted");
+                    }
+                }
+                std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_ID", &workspace.id);
+                std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_NAME", &workspace.name);
+                info!(
+                    workspace_id = %workspace.id,
+                    workspace_name = %workspace.name,
+                    "  ✓ Nexus workspace resolved"
+                );
+            }
+            Err(e) => {
+                info!(
+                    error = %e,
+                    "  ⚠ Nexus workspace bootstrap skipped/failed; continuing with existing control plane"
+                );
+            }
+        }
     }
 
     /// Verify that at least one LLM provider/model is configured in Coder.

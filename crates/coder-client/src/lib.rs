@@ -55,6 +55,10 @@ pub struct CoderClient {
     /// Not gated behind `chats-api`: `get_default_organization_id` is used by
     /// agent-nexus regardless of that feature, and the field is unconditional.
     cached_org_id: Arc<RwLock<Option<String>>>,
+    /// Cached current username, resolved via `get_me()` from the active token.
+    /// Lazily populated on first access; prevents the "admin" hardcode from
+    /// being used when a different user's token is configured.
+    cached_username: Arc<RwLock<Option<String>>>,
 }
 
 /// Parse the JSON body returned by `GET /api/experimental/chats/models`.
@@ -144,6 +148,7 @@ impl CoderClient {
             #[cfg(feature = "chats-api")]
             cached_models: Arc::new(RwLock::new(None)),
             cached_org_id: Arc::new(RwLock::new(None)),
+            cached_username: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -196,6 +201,7 @@ impl CoderClient {
             #[cfg(feature = "chats-api")]
             cached_models: Arc::new(RwLock::new(None)),
             cached_org_id: Arc::new(RwLock::new(None)),
+            cached_username: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -210,6 +216,7 @@ impl CoderClient {
             #[cfg(feature = "chats-api")]
             cached_models: self.cached_models.clone(),
             cached_org_id: self.cached_org_id.clone(),
+            cached_username: self.cached_username.clone(),
         }
     }
 
@@ -227,7 +234,9 @@ impl CoderClient {
         format!("{}{}", self.base_url, path)
     }
 
-    /// Get the session token (if set). Falls back to the API token.
+    /// Get the session token (if set). This is used for both REST API
+    /// authentication and SSH operations. Falls back to the API token
+    /// when no session token has been configured.
     pub fn session_token(&self) -> &str {
         self.session_token.as_deref().unwrap_or(&self.token)
     }
@@ -1170,9 +1179,38 @@ impl CoderClient {
 // Chats API (Phase 3)
 
 impl CoderClient {
+    /// Resolve the real username from the Coder server using the current token.
+    /// Caches the result so `current_username()` and subsequent calls are free.
+    pub async fn resolve_current_user(&self) -> Result<String> {
+        {
+            let guard = self.cached_username.read().await;
+            if let Some(ref name) = *guard {
+                return Ok(name.clone());
+            }
+        }
+        let me = self.get_me().await?;
+        let mut guard = self.cached_username.write().await;
+        guard.replace(me.username.clone());
+        Ok(me.username)
+    }
+
     /// Get the current user's username (for constructing chat API paths).
+    ///
+    /// Resolution order:
+    /// 1. Cached username from a previous [`resolve_current_user`] call.
+    /// 2. Owner portion of `workspace_name` ("owner/workspace" format).
+    /// 3. Fallback to `"admin"` (legacy / unauthenticated clients).
+    ///
+    /// Callers that need a guaranteed-correct identity should call
+    /// [`resolve_current_user`] before using this function.
+    ///
+    /// [`resolve_current_user`]: CoderClient::resolve_current_user
     pub fn current_username(&self) -> String {
-        // Extract from workspace_name if available (format: "owner/workspace")
+        if let Ok(guard) = self.cached_username.try_read() {
+            if let Some(ref name) = *guard {
+                return name.clone();
+            }
+        }
         if let Some(ref ws) = self.workspace_name {
             if let Some((owner, _)) = ws.split_once('/') {
                 return owner.to_string();
