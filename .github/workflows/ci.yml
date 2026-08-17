@@ -23,7 +23,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Run zizmor
-        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        uses: zizmorcore/zizmor-action@v0.6.2
         with:
           inputs: .github/workflows
           collect: workflows
@@ -114,7 +114,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check PR title
-        uses: amannn/action-semantic-pull-request@73c6199b462eb3d34c2f6bea06eee6feecdbd948 # v5
+        uses: amannn/action-semantic-pull-request@v5
         env:
           GITHUB_EVENT_PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}
       - name: Check PR template sections
