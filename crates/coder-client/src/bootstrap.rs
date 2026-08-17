@@ -464,12 +464,16 @@ impl CoderBootstrapper {
                 )
             })?;
 
-        if let Err(e) = client
+        client
             .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
             .await
-        {
-            warn!(error = %e, "Workspace SSH not ready during bootstrap; continuing anyway");
-        }
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Nexus workspace '{}' did not become reachable over SSH: {}",
+                    workspace.id,
+                    e
+                )
+            })?;
         if let Ok(home) = std::env::var("HOME") {
             let state_dir = format!("{}/.openflows", home);
             if std::fs::create_dir_all(&state_dir).is_ok() {
