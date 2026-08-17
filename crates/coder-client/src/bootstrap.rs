@@ -268,7 +268,7 @@ impl CoderBootstrapper {
         // This is the bootstrapper's "first mover" responsibility: seed the
         // persistent control-plane workspace that runs the orchestration loop.
         if create_nexus_workspace {
-            Self::create_nexus_workspace(&client).await;
+            Self::create_nexus_workspace(&client).await?;
         }
 
         info!("  ✓ Coder bootstrapped");
@@ -305,12 +305,24 @@ impl CoderBootstrapper {
     async fn delete_stale_nexus_workspace(client: &CoderClient) -> Result<()> {
         let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
             .unwrap_or_else(|_| "openflows-nexus".to_string());
-        let Ok(me) = client.get_me().await else {
-            return Ok(());
-        };
-        let Ok(workspaces) = client.list_workspaces(&me.id).await else {
-            return Ok(());
-        };
+        let me = client.get_me().await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to resolve current user while checking for stale nexus workspace '{}': {}. \
+                 Cannot safely delete the stale workspace — resolve the error or set \
+                 OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
+                nexus_workspace_name,
+                e
+            )
+        })?;
+        let workspaces = client.list_workspaces(&me.id).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to list workspaces while checking for stale nexus workspace '{}': {}. \
+                 Cannot safely delete the stale workspace — resolve the error or set \
+                 OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
+                nexus_workspace_name,
+                e
+            )
+        })?;
         let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) else {
             return Ok(());
         };
@@ -339,7 +351,11 @@ impl CoderBootstrapper {
     }
 
     /// Create the long-lived Nexus workspace.
-    async fn create_nexus_workspace(client: &CoderClient) {
+    ///
+    /// Returns Err if the workspace could not be created or did not become
+    /// ready. Callers must fail bootstrap on error so a deleted control plane
+    /// is never left without a functional replacement.
+    async fn create_nexus_workspace(client: &CoderClient) -> Result<()> {
         let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
             .unwrap_or_else(|_| "openflows-nexus".to_string());
         let nexus_api_token = std::env::var("OPENFLOWS_NEXUS_API_TOKEN")
@@ -364,7 +380,7 @@ impl CoderBootstrapper {
         let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
         let github_pat = std::env::var("GITHUB_PERSONAL_ACCESS_TOKEN").unwrap_or_default();
 
-        match client
+        let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
                 template_name: "openflows-nexus".to_string(),
                 name: nexus_workspace_name.clone(),
@@ -381,49 +397,58 @@ impl CoderBootstrapper {
                 }),
             })
             .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create nexus workspace '{}': {}. \
+                     The control plane may be unavailable — resolve the error or set \
+                     OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve an existing workspace.",
+                    nexus_workspace_name,
+                    e
+                )
+            })?;
+
+        client
+            .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Nexus workspace '{}' did not become ready: {}",
+                    workspace.id,
+                    e
+                )
+            })?;
+
+        if let Err(e) = client
+            .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
+            .await
         {
-            Ok(workspace) => {
-                let _ = client
-                    .wait_for_workspace_ready(&workspace.id, Duration::from_secs(300))
-                    .await;
-                if let Err(e) = client
-                    .wait_for_workspace_ssh(&workspace.id, Duration::from_secs(120))
-                    .await
-                {
-                    warn!(error = %e, "Workspace SSH not ready during bootstrap; continuing anyway");
-                }
-                if let Ok(home) = std::env::var("HOME") {
-                    let state_dir = format!("{}/.openflows", home);
-                    if std::fs::create_dir_all(&state_dir).is_ok() {
-                        let state_file = format!("{}/nexus-workspace.json", state_dir);
-                        let _ = std::fs::write(
-                            &state_file,
-                            serde_json::to_string_pretty(&json!({
-                                "workspace_id": workspace.id,
-                                "workspace_name": workspace.name,
-                                "template_name": "openflows-nexus",
-                                "coder_url": client.base_url(),
-                            }))
-                            .unwrap_or_else(|_| "{}".to_string()),
-                        );
-                        info!(state_file = %state_file, "Nexus workspace state persisted");
-                    }
-                }
-                std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_ID", &workspace.id);
-                std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_NAME", &workspace.name);
-                info!(
-                    workspace_id = %workspace.id,
-                    workspace_name = %workspace.name,
-                    "  ✓ Nexus workspace resolved"
+            warn!(error = %e, "Workspace SSH not ready during bootstrap; continuing anyway");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let state_dir = format!("{}/.openflows", home);
+            if std::fs::create_dir_all(&state_dir).is_ok() {
+                let state_file = format!("{}/nexus-workspace.json", state_dir);
+                let _ = std::fs::write(
+                    &state_file,
+                    serde_json::to_string_pretty(&json!({
+                        "workspace_id": workspace.id,
+                        "workspace_name": workspace.name,
+                        "template_name": "openflows-nexus",
+                        "coder_url": client.base_url(),
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string()),
                 );
-            }
-            Err(e) => {
-                info!(
-                    error = %e,
-                    "  ⚠ Nexus workspace bootstrap skipped/failed; continuing with existing control plane"
-                );
+                info!(state_file = %state_file, "Nexus workspace state persisted");
             }
         }
+        std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_ID", &workspace.id);
+        std::env::set_var("OPENFLOWS_NEXUS_WORKSPACE_NAME", &workspace.name);
+        info!(
+            workspace_id = %workspace.id,
+            workspace_name = %workspace.name,
+            "  ✓ Nexus workspace resolved"
+        );
+        Ok(())
     }
 
     /// Verify that at least one LLM provider/model is configured in Coder.
@@ -704,10 +729,11 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
     let current_hash = template_hash(data);
 
     let before_templates = client.list_templates().await.ok();
-    let before_template_id = before_templates
+    let before_template = before_templates
         .as_ref()
-        .and_then(|t| t.iter().find(|t| t.name == name))
-        .map(|t| t.id.clone());
+        .and_then(|t| t.iter().find(|t| t.name == name));
+    let before_template_id = before_template.map(|t| t.id.clone());
+    let before_updated_at = before_template.map(|t| t.updated_at.clone());
 
     let mut hashes = load_template_hashes();
     let last_hash = hashes.get(name).map(String::as_str);
@@ -730,14 +756,22 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
     match client.push_template(name, data).await {
         Ok(t) => {
             let after_templates = client.list_templates().await.ok();
-            let after_id = after_templates
+            let after_updated_at = after_templates
                 .as_ref()
                 .and_then(|ts| ts.iter().find(|tp| tp.name == name))
-                .map(|tp| tp.id.clone());
+                .map(|tp| tp.updated_at.clone());
 
-            if before_template_id.is_some() && after_id.as_ref() == before_template_id.as_ref() {
+            // A successful version push keeps the stable template ID but bumps
+            // `updated_at`. Only treat the push as rejected when we have a
+            // known previous `updated_at` and it did not change. (An empty
+            // `updated_at` means the API did not report one, so we cannot
+            // verify and assume the push succeeded.)
+            if before_template_id.is_some()
+                && !before_updated_at.as_deref().unwrap_or("").is_empty()
+                && after_updated_at.as_ref() == before_updated_at.as_ref()
+            {
                 warn!(
-                    "  ⚠ Template '{}' push returned success but template ID did not change — push may have been rejected",
+                    "  ⚠ Template '{}' push returned success but updated_at did not change — push may have been rejected",
                     name
                 );
                 return None;
