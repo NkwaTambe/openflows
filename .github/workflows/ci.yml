@@ -102,3 +102,40 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check for typos
         uses: crate-ci/typos@5e38bf262baaf477ca9f241b3a7cd3d277fd7df8 # master
+
+  pr-lint:
+    name: PR Lint
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check PR title
+        uses: amannn/action-semantic-pull-request@73c6199b462eb3d34c2f6bea06eee6feecdbd948 # v5
+        env:
+          GITHUB_EVENT_PULL_REQUEST_TITLE: ${{ github.event.pull_request.title }}
+      - name: Check PR template sections
+        run: |
+          body="${{ github.event.pull_request.body }}"
+          missing=""
+
+          # Check for required template sections (case-insensitive)
+          if ! echo "$body" | grep -qi "^## Summary"; then
+            missing="${missing}Summary, "
+          fi
+          if ! echo "$body" | grep -qi "^## Changes"; then
+            missing="${missing}Changes, "
+          fi
+          if ! echo "$body" | grep -qi "^## Validation"; then
+            missing="${missing}Validation, "
+          fi
+
+          if [ -n "$missing" ]; then
+            echo "::error::PR is missing required sections: ${missing%, }"
+            echo "::error::See template: .github/pull_request_template.md"
+            exit 1
+          fi
+          echo "✓ PR body contains all required sections"
