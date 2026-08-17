@@ -334,9 +334,8 @@ impl CoderBootstrapper {
         let _ = client.stop_workspace(&existing.id).await;
         match client.delete_workspace(&existing.id).await {
             Ok(()) => {
-                info!("  ✓ Stale nexus workspace deleted");
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                Ok(())
+                info!("  ✓ Stale nexus workspace deleted — waiting for it to be fully removed");
+                Self::wait_for_workspace_gone(client, &me.id, &nexus_workspace_name).await
             }
             Err(e) => {
                 anyhow::bail!(
@@ -347,6 +346,43 @@ impl CoderBootstrapper {
                     e
                 )
             }
+        }
+    }
+
+    /// Wait until the named workspace no longer appears in the user's listing.
+    ///
+    /// Coder's workspace deletion is asynchronous, so a fixed sleep is racy:
+    /// if deletion outlives the sleep, recreation hits a name conflict and the
+    /// client's conflict handling returns the stale workspace as a success.
+    /// Poll until the name is actually free (or a timeout elapses) before the
+    /// caller recreates it.
+    async fn wait_for_workspace_gone(
+        client: &CoderClient,
+        user_id: &str,
+        name: &str,
+    ) -> Result<()> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let workspaces = client.list_workspaces(user_id).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to list workspaces while waiting for stale nexus workspace '{}' to be removed: {}",
+                    name,
+                    e
+                )
+            })?;
+            if !workspaces.iter().any(|w| w.name == name) {
+                info!("  ✓ Stale nexus workspace '{}' fully removed", name);
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Timed out waiting for stale nexus workspace '{}' to be removed. \
+                     Recreating now would reuse the stale workspace. \
+                     Delete it manually or set OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
+                    name
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
