@@ -178,42 +178,88 @@ impl CoderBootstrapper {
         // under the hood and inherits the parent environment.
         Self::set_dev_binary_host_path();
 
-        // Push workspace templates (bundled in binary)
-        push_template_silently(
+        // Check whether nexus workspace creation is enabled before deleting
+        // any stale workspace. If creation is disabled, we must preserve the
+        // existing one.
+        let create_nexus_workspace = std::env::var("OPENFLOWS_CREATE_NEXUS_WORKSPACE")
+            .map(|v| v != "false")
+            .unwrap_or(true)
+            && std::env::var("ROLE").as_deref() != Ok("nexus");
+
+        // Track template push failures — bootstrap must fail if required
+        // templates cannot be pushed, so the caller knows provisioning is
+        // incomplete. `None` from push_template_silently means the push failed;
+        // `Some(false)` means it was skipped (hash matched), which is not an
+        // error.
+        let mut template_errors = Vec::new();
+
+        let forge_result = push_template_silently(
             &client,
             "openflows-forge",
             include_bytes!("../templates/openflows-forge.tar.gz"),
         )
         .await;
-        push_template_silently(
+        if forge_result.is_none() {
+            template_errors.push("openflows-forge");
+        }
+
+        let sentinel_result = push_template_silently(
             &client,
             "openflows-sentinel",
             include_bytes!("../templates/openflows-sentinel.tar.gz"),
         )
         .await;
-        let nexus_template_updated = push_template_silently(
+        if sentinel_result.is_none() {
+            template_errors.push("openflows-sentinel");
+        }
+
+        let nexus_result = push_template_silently(
             &client,
             "openflows-nexus",
             include_bytes!("../templates/openflows-nexus.tar.gz"),
         )
         .await;
-        push_template_silently(
+        if nexus_result.is_none() {
+            template_errors.push("openflows-nexus");
+        }
+        let nexus_template_updated = nexus_result == Some(true);
+
+        let vessel_result = push_template_silently(
             &client,
             "openflows-vessel",
             include_bytes!("../templates/openflows-vessel.tar.gz"),
         )
         .await;
-        push_template_silently(
+        if vessel_result.is_none() {
+            template_errors.push("openflows-vessel");
+        }
+
+        let lore_result = push_template_silently(
             &client,
             "openflows-lore",
             include_bytes!("../templates/openflows-lore.tar.gz"),
         )
         .await;
+        if lore_result.is_none() {
+            template_errors.push("openflows-lore");
+        }
 
-        // If the nexus template was re-pushed, the existing workspace is stale
-        // (it still runs the old template version). Delete and recreate it so
-        // the new template (e.g. fixed bind-mount path) takes effect.
-        if nexus_template_updated {
+        // Fail fast if critical templates could not be pushed. This prevents
+        // bootstrap from silently succeeding when the member's credentials
+        // lack permission to modify templates.
+        if !template_errors.is_empty() {
+            anyhow::bail!(
+                "Failed to push {} template(s): {}. \
+                 Verify the session token has template management permissions.",
+                template_errors.len(),
+                template_errors.join(", ")
+            );
+        }
+
+        // Delete stale workspace only if we intend to recreate it. If
+        // OPENFLOWS_CREATE_NEXUS_WORKSPACE=false or ROLE=nexus, preserving
+        // the existing control plane avoids a window with no workspace.
+        if nexus_template_updated && create_nexus_workspace {
             Self::delete_stale_nexus_workspace(&client).await;
         }
 
@@ -221,11 +267,7 @@ impl CoderBootstrapper {
         //
         // This is the bootstrapper's "first mover" responsibility: seed the
         // persistent control-plane workspace that runs the orchestration loop.
-        if std::env::var("OPENFLOWS_CREATE_NEXUS_WORKSPACE")
-            .map(|v| v != "false")
-            .unwrap_or(true)
-            && std::env::var("ROLE").as_deref() != Ok("nexus")
-        {
+        if create_nexus_workspace {
             Self::create_nexus_workspace(&client).await;
         }
 
@@ -638,9 +680,15 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 /// on the Coder server yet). After a successful push, the hash is persisted so
 /// subsequent bootstrap calls skip unchanged templates.
 ///
-/// Returns `true` if the template was (re)pushed, `false` if it was skipped
-/// because the content hash matched the last-pushed version.
-async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> bool {
+/// Returns `Some(true)` if the template was (re)pushed, `Some(false)` if it was
+/// skipped because the content hash matched the last-pushed version, or `None`
+/// if the push attempt failed. Callers use `None` to determine whether bootstrap
+/// should fail due to a template management error.
+async fn push_template_silently(
+    client: &CoderClient,
+    name: &str,
+    data: &[u8],
+) -> Option<bool> {
     let current_hash = template_hash(data);
 
     // Check whether the template exists on the Coder server.
@@ -659,7 +707,7 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
             "  ✓ Template '{}' unchanged — skipping push (hash matches)",
             name
         );
-        return false;
+        return Some(false);
     }
 
     let reason = if !exists {
@@ -674,11 +722,11 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
             hashes.insert(name.to_string(), current_hash);
             save_template_hashes(&hashes);
             info!("  ✓ Template '{}' pushed (version updated)", t.name);
-            true
+            Some(true)
         }
         Err(e) => {
             warn!("  ⚠ Template '{}' push failed: {}", name, e);
-            false
+            None
         }
     }
 }
