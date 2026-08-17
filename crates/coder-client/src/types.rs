@@ -60,6 +60,8 @@ pub struct CoderTemplate {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default, rename = "updated_at")]
+    pub updated_at: String,
 }
 
 /// Request to create a workspace.

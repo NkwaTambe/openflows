@@ -3,9 +3,7 @@
 
 > Official site: [openflows.dev](https://openflows.dev)
 
-**OpenFlows is an autonomous software development team orchestrator that runs on your self-hosted Coder deployment.**
-
-Give it a GitHub repo and some issues, and OpenFlows orchestrates a team of coordinated AI agents that plan the work, write the code, review it adversarially, and ship reviewed PRs — without you writing a single line of code. Each agent runs as a **Coder Agent** (control-plane AI loop) operating on an ephemeral, governed Coder workspace, with LLM keys kept in the Coder control plane and every action tied to your identity.
+**OpenFlows is an autonomous AI software team that turns GitHub issues into reviewed, production-ready pull requests inside your self-hosted Coder environment.** For developers, it handles planning, coding, testing, and adversarial review while keeping them in control of architecture and final decisions. For companies, it brings governed, auditable AI delivery into existing engineering workflows without exposing LLM keys or weakening security boundaries. For stakeholders, it creates a faster, more transparent path from product intent to shipped software.
 
 > **Getting started?** All setup, startup, and troubleshooting steps live in [**QUICK_START.md**](QUICK_START.md). The rest of this README is an overview of what the project is, how it works, how far it has come, and what's left.
 

@@ -260,7 +260,7 @@ impl CoderBootstrapper {
         // OPENFLOWS_CREATE_NEXUS_WORKSPACE=false or ROLE=nexus, preserving
         // the existing control plane avoids a window with no workspace.
         if nexus_template_updated && create_nexus_workspace {
-            Self::delete_stale_nexus_workspace(&client).await;
+            Self::delete_stale_nexus_workspace(&client).await?;
         }
 
         // Create or refresh the long-lived Nexus workspace outside Coder.
@@ -299,17 +299,20 @@ impl CoderBootstrapper {
     }
 
     /// Delete a stale nexus workspace when its template has been updated.
-    async fn delete_stale_nexus_workspace(client: &CoderClient) {
+    /// Returns Ok if no workspace existed, or after successful deletion.
+    /// Returns Err if deletion failed — callers must fail bootstrap to avoid
+    /// a name conflict when recreating the workspace.
+    async fn delete_stale_nexus_workspace(client: &CoderClient) -> Result<()> {
         let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
             .unwrap_or_else(|_| "openflows-nexus".to_string());
         let Ok(me) = client.get_me().await else {
-            return;
+            return Ok(());
         };
         let Ok(workspaces) = client.list_workspaces(&me.id).await else {
-            return;
+            return Ok(());
         };
         let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) else {
-            return;
+            return Ok(());
         };
         info!(
             workspace_id = %existing.id,
@@ -318,12 +321,21 @@ impl CoderBootstrapper {
         );
         let _ = client.stop_workspace(&existing.id).await;
         match client.delete_workspace(&existing.id).await {
-            Ok(()) => info!("  ✓ Stale nexus workspace deleted"),
+            Ok(()) => {
+                info!("  ✓ Stale nexus workspace deleted");
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(())
+            }
             Err(e) => {
-                warn!(error = %e, "  ⚠ Could not delete stale nexus workspace; will attempt to create anyway")
+                anyhow::bail!(
+                    "  ⚠ Could not delete stale nexus workspace '{}': {}. \
+                     Cannot recreate — would cause a name conflict with the existing stale workspace. \
+                     Either delete it manually or set OPENFLOWS_CREATE_NEXUS_WORKSPACE=false to preserve it.",
+                    nexus_workspace_name,
+                    e
+                )
             }
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 
     /// Create the long-lived Nexus workspace.
@@ -691,18 +703,16 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> Option<bool> {
     let current_hash = template_hash(data);
 
-    // Check whether the template exists on the Coder server.
-    let exists = if let Ok(templates) = client.list_templates().await {
-        templates.iter().any(|t| t.name == name)
-    } else {
-        false
-    };
+    let before_templates = client.list_templates().await.ok();
+    let before_template_id = before_templates
+        .as_ref()
+        .and_then(|t| t.iter().find(|t| t.name == name))
+        .map(|t| t.id.clone());
 
-    // Compare against the last-pushed hash stored locally.
     let mut hashes = load_template_hashes();
     let last_hash = hashes.get(name).map(String::as_str);
 
-    if exists && last_hash == Some(current_hash.as_str()) {
+    if before_template_id.is_some() && last_hash == Some(current_hash.as_str()) {
         info!(
             "  ✓ Template '{}' unchanged — skipping push (hash matches)",
             name
@@ -710,7 +720,7 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
         return Some(false);
     }
 
-    let reason = if !exists {
+    let reason = if before_template_id.is_none() {
         "new template"
     } else {
         "content changed"
@@ -719,6 +729,20 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
 
     match client.push_template(name, data).await {
         Ok(t) => {
+            let after_templates = client.list_templates().await.ok();
+            let after_id = after_templates
+                .as_ref()
+                .and_then(|ts| ts.iter().find(|tp| tp.name == name))
+                .map(|tp| tp.id.clone());
+
+            if before_template_id.is_some() && after_id.as_ref() == before_template_id.as_ref() {
+                warn!(
+                    "  ⚠ Template '{}' push returned success but template ID did not change — push may have been rejected",
+                    name
+                );
+                return None;
+            }
+
             hashes.insert(name.to_string(), current_hash);
             save_template_hashes(&hashes);
             info!("  ✓ Template '{}' pushed (version updated)", t.name);

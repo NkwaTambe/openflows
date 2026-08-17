@@ -700,6 +700,11 @@ impl CoderClient {
                         Some(CoderTemplate {
                             id: v.get("id")?.as_str()?.to_string(),
                             name: v.get("name")?.as_str()?.to_string(),
+                            updated_at: v
+                                .get("updated_at")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
                         })
                     })
                     .collect()
