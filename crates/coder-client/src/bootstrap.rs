@@ -323,7 +323,10 @@ impl CoderBootstrapper {
                 e
             )
         })?;
-        let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) else {
+        let Some(existing) = workspaces
+            .iter()
+            .find(|w| w.name == nexus_workspace_name && w.owner_name == me.username)
+        else {
             return Ok(());
         };
         info!(
@@ -335,7 +338,7 @@ impl CoderBootstrapper {
         match client.delete_workspace(&existing.id).await {
             Ok(()) => {
                 info!("  ✓ Stale nexus workspace deleted — waiting for it to be fully removed");
-                Self::wait_for_workspace_gone(client, &me.id, &nexus_workspace_name).await
+                Self::wait_for_workspace_gone(client, &me.username, &nexus_workspace_name).await
             }
             Err(e) => {
                 anyhow::bail!(
@@ -356,21 +359,28 @@ impl CoderBootstrapper {
     /// client's conflict handling returns the stale workspace as a success.
     /// Poll until the name is actually free (or a timeout elapses) before the
     /// caller recreates it.
+    ///
+    /// The workspace listing is deployment-wide, so the poll is scoped to the
+    /// current user's own workspaces (`owner_name`) to avoid mistaking another
+    /// user's same-named workspace for the one being deleted.
     async fn wait_for_workspace_gone(
         client: &CoderClient,
-        user_id: &str,
+        owner_name: &str,
         name: &str,
     ) -> Result<()> {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            let workspaces = client.list_workspaces(user_id).await.map_err(|e| {
+            let workspaces = client.list_workspaces(owner_name).await.map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to list workspaces while waiting for stale nexus workspace '{}' to be removed: {}",
                     name,
                     e
                 )
             })?;
-            if !workspaces.iter().any(|w| w.name == name) {
+            if !workspaces
+                .iter()
+                .any(|w| w.name == name && w.owner_name == owner_name)
+            {
                 info!("  ✓ Stale nexus workspace '{}' fully removed", name);
                 return Ok(());
             }
@@ -791,10 +801,16 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
 
     match client.push_template(name, data).await {
         Ok(t) => {
-            let after_templates = client.list_templates().await.ok();
+            let after_templates = match client.list_templates().await {
+                Ok(templates) => templates,
+                Err(e) => {
+                    warn!("  ⚠ Could not verify template '{}' after push: {}", name, e);
+                    return None;
+                }
+            };
             let after_updated_at = after_templates
-                .as_ref()
-                .and_then(|ts| ts.iter().find(|tp| tp.name == name))
+                .iter()
+                .find(|tp| tp.name == name)
                 .map(|tp| tp.updated_at.clone());
 
             // A successful version push keeps the stable template ID but bumps
