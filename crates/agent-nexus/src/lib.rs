@@ -744,9 +744,10 @@ Before significant work, read the relevant skill file to understand the workflow
             .get_typed("coder_url")
             .await
             .or_else(|| std::env::var("CODER_URL").ok());
-        let coder_token: Option<String> = std::env::var("CODER_SESSION_TOKEN").ok()
+        let coder_token: Option<String> = std::env::var("CODER_SESSION_TOKEN")
+            .ok()
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
-        let coder_token = if coder_token.as_deref().map_or(false, |t| !t.is_empty()) {
+        let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
         } else {
             store.get_typed("coder_session_token").await

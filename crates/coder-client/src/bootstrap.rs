@@ -302,8 +302,12 @@ impl CoderBootstrapper {
     async fn delete_stale_nexus_workspace(client: &CoderClient) {
         let nexus_workspace_name = std::env::var("OPENFLOWS_NEXUS_WORKSPACE_NAME")
             .unwrap_or_else(|_| "openflows-nexus".to_string());
-        let Ok(me) = client.get_me().await else { return };
-        let Ok(workspaces) = client.list_workspaces(&me.id).await else { return };
+        let Ok(me) = client.get_me().await else {
+            return;
+        };
+        let Ok(workspaces) = client.list_workspaces(&me.id).await else {
+            return;
+        };
         let Some(existing) = workspaces.iter().find(|w| w.name == nexus_workspace_name) else {
             return;
         };
@@ -684,11 +688,7 @@ fn save_template_hashes(hashes: &std::collections::HashMap<String, String>) {
 /// skipped because the content hash matched the last-pushed version, or `None`
 /// if the push attempt failed. Callers use `None` to determine whether bootstrap
 /// should fail due to a template management error.
-async fn push_template_silently(
-    client: &CoderClient,
-    name: &str,
-    data: &[u8],
-) -> Option<bool> {
+async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -> Option<bool> {
     let current_hash = template_hash(data);
 
     // Check whether the template exists on the Coder server.

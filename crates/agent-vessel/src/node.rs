@@ -151,9 +151,10 @@ impl VesselNode {
 
     async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
         let coder_url: Option<String> = store.get_typed("coder_url").await;
-        let coder_token: Option<String> = std::env::var("CODER_SESSION_TOKEN").ok()
+        let coder_token: Option<String> = std::env::var("CODER_SESSION_TOKEN")
+            .ok()
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
-        let coder_token = if coder_token.as_deref().map_or(false, |t| !t.is_empty()) {
+        let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
         } else {
             store.get_typed("coder_api_token").await
