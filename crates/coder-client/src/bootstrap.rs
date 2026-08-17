@@ -104,6 +104,33 @@ impl CoderBootstrapper {
             .await?;
         info!("  ✓ Coder server healthy");
 
+        // 1a. If a valid session token is already configured, reuse it and
+        //     operate as that user instead of creating/logging in as admin.
+        //     This lets the system run under any pre-existing Coder user
+        //     (e.g. a GitHub-authenticated user) rather than hardcoding admin.
+        if let Ok(existing_token) = std::env::var("CODER_SESSION_TOKEN") {
+            if !existing_token.is_empty() {
+                let probe_client = self
+                    .client
+                    .with_token(existing_token.clone())
+                    .with_session_token(&existing_token);
+                if let Ok(me) = probe_client.get_me().await {
+                    info!(
+                        username = %me.username,
+                        user_id = %me.id,
+                        "  ✓ Reusing existing CODER_SESSION_TOKEN for user '{}' — skipping admin bootstrap",
+                        me.username
+                    );
+                    let api_key = probe_client.create_api_token(&me.id, "openflows").await?;
+                    let client = probe_client
+                        .with_token(api_key.key.clone())
+                        .with_session_token(&existing_token);
+                    info!("  ✓ API token generated for '{}'", me.username);
+                    return Self::push_templates_and_create_nexus(client).await;
+                }
+            }
+        }
+
         // 2. Create first user (idempotent)
         let user = self
             .client
