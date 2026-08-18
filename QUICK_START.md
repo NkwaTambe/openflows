@@ -136,12 +136,13 @@ When a team member signs in with GitHub OAuth, Coder creates them as a **regular
 |------|-----|
 | `organization-admin` | Grants `workspace:create` (create the `openflows-nexus` control-plane workspace) and template management in the org. |
 | `organization-template-admin` | Grants template management (push/update the `openflows-*` templates). |
+| `organization-workspace-access` | OAuth users get this by default; it grants access to org workspaces and is required to create/build the `openflows-nexus` workspace. Keep it — `edit-roles` replaces the whole role set. |
 
 > **⚠️ Important — the `organization-workspace-creation-ban` trap:** This role carries a *negative* `workspace:create` permission that **overrides** `organization-admin`. A user who is org-admin but also has this role still gets `403 Unauthorized to create workspace`. If you see that error, check that this role is **not** assigned.
 
 **Via CLI:**
 
-> **Note:** `edit-roles` **replaces** the user's entire organization-role set rather than appending to it. If the user already has custom or Coder Agents roles, include them on this command too — otherwise they'll be removed.
+> **Note:** `edit-roles` **replaces** the user's entire organization-role set rather than appending to it. In particular, a GitHub OAuth user already has `organization-workspace-access` — dropping it removes their ability to create and use org workspaces, so bootstrap would still fail with `403 Unauthorized to create workspace`. Include ALL existing roles (custom, Coder Agents, and `organization-workspace-access`) on this command, or they'll be removed.
 
 ```bash
 export CODER_URL=http://localhost:7080
@@ -150,10 +151,11 @@ export CODER_SESSION_TOKEN=<your-token>
 # List your organizations (note the org name, e.g. "coder")
 coder organizations list
 
-# Grant the roles (replace <org> and <username>; include ANY existing roles as well)
+# Grant the roles (replace <org> and <username>; include ANY existing roles as well, e.g. organization-workspace-access)
 coder organizations members edit-roles -O=<org> <username> \
   organization-admin \
-  organization-template-admin
+  organization-template-admin \
+  organization-workspace-access
 
 # Verify the user's roles
 coder organizations members list -O=<org>
