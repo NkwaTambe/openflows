@@ -141,6 +141,8 @@ When a team member signs in with GitHub OAuth, Coder creates them as a **regular
 
 **Via CLI:**
 
+> **Note:** `edit-roles` **replaces** the user's entire organization-role set rather than appending to it. If the user already has custom or Coder Agents roles, include them on this command too — otherwise they'll be removed.
+
 ```bash
 export CODER_URL=http://localhost:7080
 export CODER_SESSION_TOKEN=<your-token>
@@ -148,7 +150,7 @@ export CODER_SESSION_TOKEN=<your-token>
 # List your organizations (note the org name, e.g. "coder")
 coder organizations list
 
-# Grant the roles (replace <org> and <username>)
+# Grant the roles (replace <org> and <username>; include ANY existing roles as well)
 coder organizations members edit-roles -O=<org> <username> \
   organization-admin \
   organization-template-admin
