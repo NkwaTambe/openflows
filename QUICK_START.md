@@ -164,7 +164,7 @@ coder organizations members list -O=<org>
 **Via the dashboard:**
 1. Open **http://localhost:7080**
 2. Go to **Admin settings → Organizations → `<your org>` → Members**
-3. Find the user, click **Edit roles**, and select `organization-admin` (and `organization-template-admin` if you prefer not to grant full admin).
+3. Find the user, click **Edit roles**, and select `organization-admin` and `organization-template-admin`. Keep `organization-workspace-access` selected as well.
 4. Confirm `organization-workspace-creation-ban` is **not** selected.
 
 Then set that user's token in `.env` as `CODER_SESSION_TOKEN` and re-run `./scripts/prod.sh bootstrap` — OpenFlows will run as that user instead of `admin`.
