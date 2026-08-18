@@ -22,75 +22,7 @@ You create a GitHub issue → NEXUS picks it up → FORGE writes code → SENTIN
 
 You stay in the loop only when needed — security concerns, ambiguous specs, or major decisions. Otherwise, the team runs autonomously, with NEXUS's `reconcile()` detecting orphans, stale workers, and unmerged PRs and recovering automatically.
 
-### Gated Planning Approval
-
-OpenFlows enforces a critical checkpoint before FORGE begins implementation:
-
-```
-FORGE writes plan (PLAN.md) → Sets status to 'planning' → HALTS
-                             ↓
-                    SENTINEL reviews plan
-                             ↓
-           SENTINEL approves: openflows gate approve --phase planning
-                             ↓
-        Gate unlock recorded in Redis → FORGE receives approval
-                             ↓
-        FORGE transitions status to 'building' → Implementation begins
-```
-
-**Key behaviors:**
-- When FORGE attempts to transition from `planning` to `building`, the system checks for gate approval
-- Without SENTINEL's explicit approval, FORGE receives error: `"Cannot transition from 'planning' to 'building' without SENTINEL approval"`
-- Gate approval is stored with timestamp and approver role, enabling audit trails
-- Only the `planning` → `building` transition is gated; subsequent phases are unconstrained
-
-This ensures every issue is carefully planned before coding begins, catching scope creep and spec mismatches early.
-
-### A2A Delegated Verification (Issue #143)
-
-SENTINEL needs to verify acceptance criteria without direct access to FORGE's workspace. OpenFlows provides a secure A2A relay for this:
-
-```
-SENTINEL reads CONTRACT.md → Wants to run acceptance tests
-            ↓
-SENTINEL calls: openflows-harness verify request --argv "cargo test --features acceptance" --timeout-secs 300 --expect-exit 0
-            ↓
-Nexus A2A Relay (HTTP on port 3000)
-  - Validates pair_id, command (allowlist only: cargo test, npm test, make test, bun test)
-  - Deduplicates requests (pair_id + sha256 hash)
-  - Routes to FORGE's verify serve executor
-            ↓
-FORGE executor runs in sandbox:
-  - Spawns process with timeout enforcement (default 600s max)
-  - Captures stdout/stderr (bounded 10KB tail per stream)
-  - Enforces resource limits
-            ↓
-Result mirrored to Redis → SENTINEL polls and checks exit code
-            ↓
-If exit_code == 0: acceptance satisfied ✅
-If timeout/failure: acceptance failed ❌
-```
-
-**Key guarantees:**
-- ✅ SENTINEL cannot execute arbitrary code (allowlist enforced at relay)
-- ✅ Commands always have a timeout (prevents hanging)
-- ✅ Output is bounded (prevents memory explosion)
-- ✅ Results are durable (persisted to Redis before ACK)
-- ✅ Full audit trail (all commands logged to `audit:a2a:*` keys)
-
-See [`docs/architecture/a2a-verification.md`](docs/architecture/a2a-verification.md) for full protocol and error handling.
-
-### Coder governs *where* agents run — OpenFlows governs *how* they coordinate
-
-The integration is deliberate and asymmetrical:
-- **Coder** provides the governed environment: ephemeral workspaces, control-plane AI agents, model governance, identity, audit logging, cost tracking. The workspace has zero AI software and zero LLM keys.
-- **OpenFlows** provides the brain: the flow graph, typed SharedStore contracts, the Node trait's `prep → exec → post` separation, and the FORGE↔SENTINEL planning cycle.
-
-Coder Agents run in the **control plane** (not in workspaces). They execute tool calls by connecting to workspaces over the same secure tunnel as IDEs. You watch agents coding live in the Coder Agents chat UI with diffs, status, and message streaming.
-
-### The `openflows-harness` CLI
-
-Each worker workspace gets a small `openflows-harness` binary. The Coder Agent invokes it via shell (guided by skills) to read/write the Redis SharedStore with typed, validated schemas. Agents never run `redis-cli` directly — the harness is the only Redis client in a workspace.
+OpenFlows also enforces a **gated planning checkpoint** — FORGE writes a plan and halts until SENTINEL reviews and approves it before any code is written — and provides **secure, sandboxed A2A verification** so SENTINEL can run acceptance tests against FORGE's workspace without arbitrary code execution. The integration is deliberately asymmetrical: **Coder** governs *where* agents run (governed, ephemeral workspaces with zero AI software and zero LLM keys), while **OpenFlows** governs *how* they coordinate (the flow graph, typed state contracts, and the FORGE↔SENTINEL planning cycle).
 
 ## The Team
 

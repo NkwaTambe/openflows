@@ -126,6 +126,45 @@ Then:
    CODER_SESSION_TOKEN=your_token_here
    ```
 
+### Step 4a — Grant a non-admin (OAuth) user the permissions OpenFlows needs
+
+When a team member signs in with GitHub OAuth, Coder creates them as a **regular member**. A regular member can *access* templates but **cannot create workspaces or push templates**. If you want OpenFlows to run as that user (instead of the hardcoded `admin`), you must grant them the right roles — otherwise bootstrap fails with `403 Unauthorized to create workspace`.
+
+**Roles OpenFlows needs:**
+
+| Role | Why |
+|------|-----|
+| `organization-admin` | Grants `workspace:create` (create the `openflows-nexus` control-plane workspace) and template management in the org. |
+| `organization-template-admin` | Grants template management (push/update the `openflows-*` templates). |
+
+> **⚠️ Important — the `organization-workspace-creation-ban` trap:** This role carries a *negative* `workspace:create` permission that **overrides** `organization-admin`. A user who is org-admin but also has this role still gets `403 Unauthorized to create workspace`. If you see that error, check that this role is **not** assigned.
+
+**Via CLI:**
+
+```bash
+export CODER_URL=http://localhost:7080
+export CODER_SESSION_TOKEN=<your-token>
+
+# List your organizations (note the org name, e.g. "coder")
+coder organizations list
+
+# Grant the roles (replace <org> and <username>)
+coder organizations members edit-roles -O=<org> <username> \
+  organization-admin \
+  organization-template-admin
+
+# Verify the user's roles
+coder organizations members list -O=<org>
+```
+
+**Via the dashboard:**
+1. Open **http://localhost:7080**
+2. Go to **Admin settings → Organizations → `<your org>` → Members**
+3. Find the user, click **Edit roles**, and select `organization-admin` (and `organization-template-admin` if you prefer not to grant full admin).
+4. Confirm `organization-workspace-creation-ban` is **not** selected.
+
+Then set that user's token in `.env` as `CODER_SESSION_TOKEN` and re-run `./scripts/prod.sh bootstrap` — OpenFlows will run as that user instead of `admin`.
+
 ---
 
 ## Step 5 — Add a tenant
