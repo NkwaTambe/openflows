@@ -70,12 +70,22 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
-      # Pin exact tool versions so published binaries are reproducible and not
-      # at the mercy of mutable PyPI packages (a substituted package could alter
-      # artifacts before they are uploaded).
+      # Install the Zig compiler from the official ziglang.org releases and
+      # cargo-zigbuild as a prebuilt binary from GitHub Releases. Both are
+      # SHA-256 verified by their respective pinned actions, so the toolchain
+      # that produces the release artifacts is integrity-checked independently of
+      # the checksums generated from those artifacts (no unauthenticated PyPI).
+      - name: Install Zig
+        if: matrix.use_zigbuild
+        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
+        with:
+          version: 0.13.0
+
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
-        run: pip3 install cargo-zigbuild==0.19.4 ziglang==0.13.0
+        uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
+        with:
+          tool: cargo-zigbuild@0.23.0
 
       - name: Build binaries
         run: >
