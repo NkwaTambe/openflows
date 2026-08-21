@@ -1,11 +1,13 @@
 # release-plz configuration.
 #
-# Drives the release workflow (`.github/workflows/release.yml`):
-#   - `release-pr` : on push to `develop`, scans Conventional Commits since the
-#                    last tag, computes the next version, and opens a
-#                    `release-plz-*` PR that bumps both manifests + CHANGELOG.
-#   - `release`    : on push to `main`, creates the single `vX.Y.Z` tag and the
-#                    GitHub Release.
+# Drives the release workflow (`.github/workflows/release.yml`), which runs ONLY
+# on pushes to `main` (the default branch):
+#   - `release-pr` : scans Conventional Commits since the last tag, computes the
+#                    next version, and opens a `release-plz-*` PR to `main` that
+#                    bumps both manifests + CHANGELOG.
+#   - `release`    : creates the single `vX.Y.Z` tag + GitHub Release when the
+#                    main push is the merge of a `release-plz-*` PR
+#                    (`release_always = false`).
 #
 # GitHub integration is via git tags only (`git_only = true`) — the shipped
 # packages are application binaries that are NOT published to crates.io, so
@@ -16,6 +18,9 @@
 git_only = true
 # Explicitly disable crates.io publishing (no CARGO_REGISTRY_TOKEN is provided).
 publish = false
+# Only release when the main push is the merge of a `release-plz-*` release PR
+# (not on every push), avoiding premature tags before the bump PR merges.
+release_always = false
 # Use a single `vX.Y.Z` tag that covers both packages.
 git_tag_name = "v{{ version }}"
 # Only the packages explicitly opted in below are processed. The rest of the
