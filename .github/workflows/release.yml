@@ -1,413 +1,44 @@
 name: Release
 
+# Sole publisher for the two shipped packages (`openflows` binary and
+# `openflows-harness`). On every merged release branch to `main`, release-plz:
+#   - bumps package versions + regenerates the CHANGELOG from Conventional
+#     Commits,
+#   - creates the `vX.Y.Z` tag,
+#   - opens the GitHub Release.
+#
+# Publications to npm / Homebrew / Docker (GHCR) / crates.io are intentionally
+# removed. Cross-platform binary tarballs are attached to the release by
+# `release-assets.yml`, which is triggered by the `v*` tag push that release-plz
+# creates here.
+
 on:
   push:
-    tags:
-      - 'v*'
-    paths-ignore:
-      - 'packaging/homebrew/**'
+    branches:
+      - main
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version (e.g., v0.1.0)'
-        required: true
-        type: string
+
+permissions:
+  contents: write
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  resolve-version:
-    name: Resolve Version
+  release-plz:
+    name: release-plz
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
-      prerelease_flag: ${{ steps.version.outputs.prerelease_flag }}
-      npm_version: ${{ steps.version.outputs.npm_version }}
-      npm_tag: ${{ steps.version.outputs.npm_tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - name: Resolve version
-        id: version
-        env:
-          INPUT_VERSION: ${{ github.event.inputs.version }}
-        run: |
-          if [[ -n "${INPUT_VERSION}" ]]; then
-            VERSION="${INPUT_VERSION}"
-            if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
-          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME}"
-            if [[ "${VERSION}" =~ (rc|beta|alpha) ]]; then IS_PRERELEASE="true"; else IS_PRERELEASE="false"; fi
-          elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
-            LAST_STABLE_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | grep -v -- '-dev\.' | head -1 || echo "")
-            if [ -z "$LAST_STABLE_TAG" ]; then LAST_STABLE_TAG="v0.0.0"; fi
-            LAST_VERSION="${LAST_STABLE_TAG#v}"
-            COMMIT_COUNT=$(git rev-list --count "${LAST_STABLE_TAG}..HEAD" 2>/dev/null || echo "0")
-            SHORT_SHA=$(git rev-parse --short HEAD)
-            VERSION="v${LAST_VERSION}-dev.${COMMIT_COUNT}.${SHORT_SHA}"
-            IS_PRERELEASE="true"
-          else
-            echo "::error::Unexpected ref: ${GITHUB_REF}"
-            exit 1
-          fi
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
-
-          if [[ "${IS_PRERELEASE}" == "true" ]]; then
-            echo "prerelease_flag=--prerelease" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease_flag=" >> "$GITHUB_OUTPUT"
-          fi
-
-          NPM_VERSION="${VERSION#v}"
-          NPM_TAG="latest"
-          if [[ "${IS_PRERELEASE}" == "true" ]]; then
-            NPM_TAG="next"
-          fi
-          echo "npm_version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "npm_tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
-
-          echo "Resolved version: ${VERSION}"
-          echo "Is prerelease: ${IS_PRERELEASE}"
-          echo "npm version: ${NPM_VERSION}"
-          echo "npm dist-tag: ${NPM_TAG}"
-
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    needs: resolve-version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            zigbuild_target: x86_64-unknown-linux-gnu.2.17
-            archive_ext: tar.gz
-            use_zigbuild: true
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            archive_ext: tar.gz
-            use_zigbuild: false
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            zigbuild_target: aarch64-unknown-linux-gnu.2.17
-            archive_ext: tar.gz
-            use_zigbuild: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive_ext: tar.gz
-            use_zigbuild: false
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive_ext: tar.gz
-            use_zigbuild: false
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      # `command: release` creates the tag + GitHub release. No
+      # CARGO_REGISTRY_TOKEN is configured, so release-plz never publishes to
+      # crates.io — it only tags and opens the release.
+      - uses: release-plz/action@b11437f8c0e955c306676ceaf8ce8c54eba6004f # v0.5
         with:
-          target: ${{ matrix.target }}
-
-      - name: Install build dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools libssl-dev pkg-config
-          if [[ "${{ matrix.target }}" == "aarch64"* ]]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
-
-      - name: Configure cross-linker for aarch64
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
-
-      - name: Install cargo-zigbuild
-        if: matrix.use_zigbuild
-        run: pip3 install cargo-zigbuild ziglang
-
-      - name: Build binaries
-        run: >
-           ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release
-           --target ${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}
-           --bin openflows
-           --bin openflows-doctor
-           --bin openflows-harness
-
-      - name: Create tarball
-        run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
-          PLATFORM="${{ matrix.target }}"
-          ARCHIVE="openflows-${VERSION}-${PLATFORM}"
-          mkdir -p "dist/${ARCHIVE}"
-
-          for bin in openflows openflows-doctor openflows-harness; do
-            cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
-          done
-
-          cp -r orchestration "dist/${ARCHIVE}/"
-          cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
-
-          tar -czf "dist/${ARCHIVE}.tar.gz" -C dist "${ARCHIVE}"
-          echo "ARCHIVE_NAME=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Generate checksum
-        run: |
-          cd dist
-          sha256sum "${{ env.ARCHIVE_NAME }}" > "${{ env.ARCHIVE_NAME }}.sha256"
-
-      # Copy harness standalone as a tarball and upload as a direct release asset.
-      # Uses PREDICTABLE fixed asset name so GitHub auto-replaces it on each publish.
-      - name: Copy standalone harness (linux-musl only)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          mkdir -p "dist/_harness_tmp"
-          cp "target/${{ matrix.target }}/release/openflows-harness" "dist/_harness_tmp/"
-          chmod +x "dist/_harness_tmp/openflows-harness"
-          # Fixed asset name: same for every release (GitHub replaces existing asset)
-          tar -czf "dist/openflows-harness-x86_64-unknown-linux-musl.tar.gz" \
-            -C dist "_harness_tmp/openflows-harness"
-          rm -rf "dist/_harness_tmp"
-          echo "Standalone harness tarball created"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: binaries-${{ matrix.target }}
-          path: dist/*
-          retention-days: 5
-
-  docker:
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    needs: [build, resolve-version]
-    permissions:
-      packages: write
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version and tags
-        id: version
-        run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
-          VERSION="${VERSION#v}"
-          VERSION=$(echo "$VERSION" | sed 's|/|-|g')
-          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
-
-          if [[ "${{ needs.resolve-version.outputs.is_prerelease }}" == "true" ]]; then
-            echo "CHANNEL_TAG=edge" >> "$GITHUB_OUTPUT"
-          else
-            echo "CHANNEL_TAG=latest" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Build and push
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.CHANNEL_TAG }}
-            ghcr.io/the-agenticflow/openflows:${{ steps.version.outputs.VERSION }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    needs: [build, docker, resolve-version]
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: dist/
-          pattern: binaries-*
-          merge-multiple: true
-
-      - name: Generate changelog
-        id: changelog
-        run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
-          IS_PRERELEASE="${{ needs.resolve-version.outputs.is_prerelease }}"
-
-          PREV_TAG=$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || echo "")
-
-          echo "## What's Changed" >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
-
-          if [[ "${IS_PRERELEASE}" == "true" ]]; then
-            echo "### Continuous build from main" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            echo "This is an automated pre-release build from the \`main\` branch." >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            echo "**Note:** This build may contain unstable changes. For production use, install the latest stable release." >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-          fi
-
-          if [ -n "$PREV_TAG" ]; then
-            echo "### Changes since $PREV_TAG" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log --pretty=format:"- %s (%h)" "${PREV_TAG}..${VERSION}" >> CHANGELOG.md
-          else
-            echo "### Initial Release" >> CHANGELOG.md
-            echo "" >> CHANGELOG.md
-            git log --pretty=format:"- %s (%h)" >> CHANGELOG.md
-          fi
-
-          echo "" >> CHANGELOG.md
-          echo "## Installation" >> CHANGELOG.md
-          echo "" >> CHANGELOG.md
-          echo '```bash' >> CHANGELOG.md
-          echo 'curl -fsSL https://raw.githubusercontent.com/The-AgenticFlow/openflows/main/scripts/install.sh | bash' >> CHANGELOG.md
-          echo '```' >> CHANGELOG.md
-
-          cat CHANGELOG.md
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ needs.resolve-version.outputs.version }}
-          name: "OpenFlows ${{ needs.resolve-version.outputs.version }}"
-          body_path: CHANGELOG.md
-          files: |
-            dist/*.tar.gz
-            dist/*.sha256
-          draft: false
-          prerelease: ${{ needs.resolve-version.outputs.is_prerelease == 'true' }}
-          generate_release_notes: false
+          command: release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Upload the harness standalone asset via gh CLI — same predictable fixed asset name
-      # that harness-publish.yml uses. Since it always uses the same basename and both
-      # workflows upload to the same named release tag, GitHub silently OVERWRITES the old
-      # asset — no delete step needed.
-      - name: Upload harness standalone asset
-        run: |
-          if [ "${{ needs.resolve-version.outputs.is_prerelease }}" == "true" ]; then
-            echo "Pre-release: standalone harness uploaded to harness-edge by harness-publish.yml instead."
-          else
-            # Find the standalone harness tarball. It's in the x86_64-unknown-linux-musl
-            # build dir; the release job downloads all artifacts into dist/.
-            STANDALONE="openflows-harness-x86_64-unknown-linux-musl.tar.gz"
-            if [ -f "dist/${STANDALONE}" ]; then
-              echo "Uploading openflows-harness standalone to ${{ needs.resolve-version.outputs.version }}..."
-              gh release upload "${{ needs.resolve-version.outputs.version }}" \
-                "dist/${STANDALONE}" \
-                --repo "${{ github.repository }}"
-              echo ""
-              echo "Standalone harness published to:"
-              echo "  https://github.com/${{ github.repository }}/releases/tag/${{ needs.resolve-version.outputs.version }}"
-              echo "  Direct URL: https://github.com/${{ github.repository }}/releases/download/${{ needs.resolve-version.outputs.version }}/${STANDALONE}"
-            else
-              echo "WARNING: standalone harness tarball not found in dist/. Finding harness files:"
-              find dist/ -name "openflows-harness*" -ls 2>/dev/null || true
-            fi
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  publish-npm:
-    name: Publish to npm
-    runs-on: ubuntu-latest
-    needs: [build, resolve-version]
-    if: needs.resolve-version.outputs.is_prerelease == 'false' || github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          path: dist/
-          pattern: binaries-*
-          merge-multiple: true
-
-      - name: Update package version
-        working-directory: packaging/npm
-        run: |
-          npm version ${{ needs.resolve-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
-
-      - name: Publish to npm
-        working-directory: packaging/npm
-        run: |
-          npm publish --access public --tag ${{ needs.resolve-version.outputs.npm_tag }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-  publish-crates:
-    name: Publish to crates.io
-    runs-on: ubuntu-latest
-    needs: [build, resolve-version]
-    if: needs.resolve-version.outputs.is_prerelease == 'false'
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-
-      - name: Publish crates
-        run: |
-          for crate in pocketflow-core config agent-client github agent-nexus agent-forge agent-sentinel agent-vessel agent-lore pair-harness agentflow-tui; do
-            echo "Publishing ${crate}..."
-            cargo publish -p ${crate} --token ${{ secrets.CARGO_REGISTRY_TOKEN }} --allow-dirty 2>&1 || echo "⚠ ${crate} already published or skipped"
-          done
-
-  update-homebrew:
-    name: Update Homebrew Formula
-    runs-on: ubuntu-latest
-    needs: [build, resolve-version]
-    if: needs.resolve-version.outputs.is_prerelease == 'false'
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: main
-          fetch-depth: 0
-
-      - name: Update Homebrew formula
-        run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
-          VERSION="${VERSION#v}"
-          SHA=$(git rev-parse HEAD)
-
-          sed -i "s/tag:.*/tag:      \"v${VERSION}\",/" packaging/homebrew/openflows.rb
-          sed -i "s/revision:.*/revision: \"${SHA}\"/" packaging/homebrew/openflows.rb
-
-      - name: Commit and push Homebrew formula
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add packaging/homebrew/openflows.rb
-          git commit -m "chore: update Homebrew formula for ${{ needs.resolve-version.outputs.version }} [skip ci]" || { echo "No changes"; exit 0; }
-          git push origin HEAD:main

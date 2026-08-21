@@ -1,0 +1,35 @@
+name: Release Branch Guard
+
+# Enforces the release branching model: the only PRs allowed to target `main`
+# must come from a branch named `release/vX.Y.Z`. `develop` is the integration
+# branch; `main` is release-only and otherwise `develop`/feature branches cannot
+# merge into it.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release-branch:
+    name: Validate release branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR head branch naming
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          if [[ ! "${HEAD_BRANCH}" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::PRs to 'main' must come from a 'release/vX.Y.Z' branch (got '${HEAD_BRANCH}')."
+            echo "::error::Cut a release branch from 'develop' (e.g. 'release/v1.2.0'), bump versions there, then open the PR to 'main'."
+            exit 1
+          fi
+          echo "Release branch '${HEAD_BRANCH}' passes the naming guard."
