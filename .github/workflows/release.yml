@@ -2,23 +2,26 @@ name: Release
 
 # Auto-releases from Conventional Commits (see release-plz.toml).
 #
-#   - `release-pr`   : runs on pushes to `develop`, scans Conventional
-#                      Commits since the last tag, computes the next version
-#                      (feat→minor, fix→patch, BREAKING CHANGE→major), and opens
-#                      a `release-plz-*` PR that bumps both manifests + CHANGELOG.
-#                      Merge that PR; you never type a version.
-#   - `release`      : runs on pushes to `main`, creates the `vX.Y.Z` tag and the
-#                      GitHub Release. The `release-assets.yml` workflow then
-#                      attaches the cross-platform binary tarballs.
+# Runs ONLY on pushes to `main` (the default branch). Two jobs:
+#   - `release-plz (release-pr)` : scans Conventional Commits since the last tag,
+#     computes the next version (feat→minor, fix→patch, BREAKING CHANGE→major),
+#     and opens a `release-plz-*` PR to `main` bumping both manifests + CHANGELOG.
+#     You merge that PR; you never type a version.
+#   - `release-plz (release)`     : creates the `vX.Y.Z` tag + GitHub Release when
+#     the push is the merge of a `release-plz-*` PR (release_always = false).
+#     The `release-assets.yml` workflow then attaches the cross-platform binaries.
 #
 # Publications to npm / Homebrew / Docker (GHCR) / crates.io are removed.
 
 on:
   push:
     branches:
-      - develop
       - main
   workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,11 +30,7 @@ concurrency:
 jobs:
   release-plz:
     name: release-plz (release-pr)
-    if: github.ref == 'refs/heads/develop' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -45,10 +44,8 @@ jobs:
 
   release-plz-release:
     name: release-plz (release)
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    needs: release-plz
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
