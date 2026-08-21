@@ -35,6 +35,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
             zigbuild_target: x86_64-unknown-linux-gnu.2.17
             use_zigbuild: true
+            zig_url: https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+            zig_sha256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             use_zigbuild: false
@@ -42,6 +44,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
             zigbuild_target: aarch64-unknown-linux-gnu.2.17
             use_zigbuild: true
+            zig_url: https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz
+            zig_sha256: ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
           - os: macos-latest
             target: x86_64-apple-darwin
             use_zigbuild: false
@@ -70,16 +74,27 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
-      # Install the Zig compiler from the official ziglang.org releases and
-      # cargo-zigbuild as a prebuilt binary from GitHub Releases. Both are
-      # SHA-256 verified by their respective pinned actions, so the toolchain
-      # that produces the release artifacts is integrity-checked independently of
-      # the checksums generated from those artifacts (no unauthenticated PyPI).
-      - name: Install Zig
+      # Install the Zig compiler from the official ziglang.org download and
+      # verify its SHA-256 against the official digest for this version before
+      # using it, and install cargo-zigbuild as a prebuilt binary from GitHub
+      # Releases (SHA-256 pinned in the install-action manifest). The toolchain
+      # that produces the release artifacts is therefore integrity-checked
+      # independently of the checksums generated from those artifacts.
+      - name: Install Zig (verified)
         if: matrix.use_zigbuild
-        uses: goto-bus-stop/setup-zig@abea47f85e598557f500fa1fd2ab7464fcb39406 # v2.2.1
-        with:
-          version: 0.13.0
+        run: |
+          set -euo pipefail
+          TMP="$(mktemp -d)"
+          ARCHIVE="${ZIG_URL##*/}"
+          curl -fsSL "$ZIG_URL" -o "$TMP/$ARCHIVE"
+          echo "$ZIG_SHA256  $TMP/$ARCHIVE" | sha256sum -c -
+          tar -xJf "$TMP/$ARCHIVE" -C "$TMP"
+          TOPDIR="$(tar -tf "$TMP/$ARCHIVE" | head -1)"
+          sudo mv "$TMP/${TOPDIR%/}" /opt/zig
+          echo "/opt/zig" >> "$GITHUB_PATH"
+        env:
+          ZIG_URL: ${{ matrix.zig_url }}
+          ZIG_SHA256: ${{ matrix.zig_sha256 }}
 
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
