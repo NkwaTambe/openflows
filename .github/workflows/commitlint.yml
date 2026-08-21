@@ -1,0 +1,33 @@
+name: Conventional Commits
+
+# Enforces Conventional Commits on every PR (both the PR title and each commit
+# message). This is what feeds release-plz's automatic version computation and
+# CHANGELOG generation, so keeping messages conventional guarantees meaningful
+# releases: `feat:` → minor, `fix:` → patch, `BREAKING CHANGE:` → major.
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    name: Commitlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: wagoid/commitlint-github-action@6cf16efdf4da5277c791d335142c03a0bdf1766e # v6.2.1
+        with:
+          configFile: commitlint.config.js
