@@ -4,6 +4,7 @@ name: Release Branch Guard
 # PR sources may target `main`:
 #   - `develop`          : the integration branch is merged into `main` normally.
 #   - `release-plz-*`    : release-plz's auto-generated version-bump PRs.
+#   - `release/*`        : release branches cut from `develop` (release/vX.Y.Z).
 # Any other PR to `main` is rejected. Additionally, the PR must originate from
 # this repository (not a fork), so contributors cannot impersonate an allowed
 # source branch name.
@@ -41,9 +42,10 @@ jobs:
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
           if [[ "${HEAD_BRANCH}" == "develop" ]] \
-            || [[ "${HEAD_BRANCH}" == release-plz-* ]]; then
+            || [[ "${HEAD_BRANCH}" == release-plz-* ]] \
+            || [[ "${HEAD_BRANCH}" == release/* ]]; then
             echo "PR source '${HEAD_BRANCH}' is allowed to target main."
             exit 0
           fi
-          echo "::error::PRs to 'main' must come from 'develop' or a 'release-plz-*' branch (got '${HEAD_BRANCH}')."
+          echo "::error::PRs to 'main' must come from 'develop', a 'release-plz-*' branch, or a 'release/*' branch (got '${HEAD_BRANCH}')."
           exit 1

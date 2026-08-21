@@ -11,7 +11,7 @@ name: Release Assets
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
 
 concurrency:
@@ -70,9 +70,12 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
 
+      # Pin exact tool versions so published binaries are reproducible and not
+      # at the mercy of mutable PyPI packages (a substituted package could alter
+      # artifacts before they are uploaded).
       - name: Install cargo-zigbuild
         if: matrix.use_zigbuild
-        run: pip3 install cargo-zigbuild ziglang
+        run: pip3 install cargo-zigbuild==0.19.4 ziglang==0.13.0
 
       - name: Build binaries
         run: >
