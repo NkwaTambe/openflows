@@ -1,9 +1,12 @@
 name: Release Branch Guard
 
-# Enforces the release branching model: the only PRs allowed to target `main`
-# must come from a branch named `release/vX.Y.Z`. `develop` is the integration
-# branch; `main` is release-only and otherwise `develop`/feature branches cannot
-# merge into it.
+# Enforces the release-source model for `main` (the default branch). Only these
+# PR sources may target `main`:
+#   - `develop`          : the integration branch is merged into `main` normally.
+#   - `release-plz-*`    : release-plz's auto-generated version-bump PRs.
+# Any other PR to `main` is rejected. Additionally, the PR must originate from
+# this repository (not a fork), so contributors cannot impersonate an allowed
+# source branch name.
 
 on:
   pull_request:
@@ -20,16 +23,27 @@ permissions:
 
 jobs:
   validate-release-branch:
-    name: Validate release branch
+    name: Validate PR source
     runs-on: ubuntu-latest
     steps:
+      - name: Check PR source repository
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          if [[ "${HEAD_REPO}" != "${BASE_REPO}" ]]; then
+            echo "::error::PRs to 'main' must originate from this repository (${BASE_REPO}); got fork '${HEAD_REPO}'. Branch names are not a substitute for source-repository provenance."
+            exit 1
+          fi
+
       - name: Check PR head branch naming
         env:
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
-          if [[ ! "${HEAD_BRANCH}" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::PRs to 'main' must come from a 'release/vX.Y.Z' branch (got '${HEAD_BRANCH}')."
-            echo "::error::Cut a release branch from 'develop' (e.g. 'release/v1.2.0'), bump versions there, then open the PR to 'main'."
-            exit 1
+          if [[ "${HEAD_BRANCH}" == "develop" ]] \
+            || [[ "${HEAD_BRANCH}" == release-plz-* ]]; then
+            echo "PR source '${HEAD_BRANCH}' is allowed to target main."
+            exit 0
           fi
-          echo "Release branch '${HEAD_BRANCH}' passes the naming guard."
+          echo "::error::PRs to 'main' must come from 'develop' or a 'release-plz-*' branch (got '${HEAD_BRANCH}')."
+          exit 1
