@@ -39,10 +39,14 @@ jobs:
 
       # commitlint-github-action only checks commit messages, not the PR title.
       # Lint the title separately against the same conventional ruleset so the
-      # "PR title and commit messages are conventional" policy holds.
+      # "PR title and commit messages are conventional" policy holds. The title
+      # is passed via env (not interpolated into the script) to avoid shell
+      # injection.
       - name: Lint PR title
         if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          echo "${{ github.event.pull_request.title }}" \
+          printf '%s\n' "$PR_TITLE" \
             | npx --yes --package commitlint --package '@commitlint/config-conventional' \
                 commitlint --config commitlint.config.mjs
