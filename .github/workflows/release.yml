@@ -24,9 +24,23 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Enforce main branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check ref
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "${REF}" != "refs/heads/main" ]]; then
+            echo "::error::The release workflow must run on 'main'; got '${REF}'. Manual dispatch on another branch would compute release contents from the wrong history."
+            exit 1
+          fi
+
   release-plz:
     name: release-plz (release-pr)
     runs-on: ubuntu-latest
+    needs: gate
     permissions:
       contents: write
       pull-requests: write
@@ -44,7 +58,7 @@ jobs:
   release-plz-release:
     name: release-plz (release)
     runs-on: ubuntu-latest
-    needs: release-plz
+    needs: [gate, release-plz]
     permissions:
       contents: write
     steps:

@@ -4,8 +4,9 @@ name: Release Branch Guard
 # PR sources may target `main`:
 #   - `develop`          : the integration branch is merged into `main` normally.
 #   - `release-plz-*`    : release-plz's auto-generated version-bump PRs.
-#   - `release/vX.Y.Z`   : (optional) manual release branches.
-# Any other PR to `main` is rejected.
+# Any other PR to `main` is rejected. Additionally, the PR must originate from
+# this repository (not a fork), so contributors cannot impersonate an allowed
+# source branch name.
 
 on:
   pull_request:
@@ -25,15 +26,24 @@ jobs:
     name: Validate PR source
     runs-on: ubuntu-latest
     steps:
+      - name: Check PR source repository
+        env:
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          if [[ "${HEAD_REPO}" != "${BASE_REPO}" ]]; then
+            echo "::error::PRs to 'main' must originate from this repository (${BASE_REPO}); got fork '${HEAD_REPO}'. Branch names are not a substitute for source-repository provenance."
+            exit 1
+          fi
+
       - name: Check PR head branch naming
         env:
           HEAD_BRANCH: ${{ github.head_ref }}
         run: |
           if [[ "${HEAD_BRANCH}" == "develop" ]] \
-            || [[ "${HEAD_BRANCH}" == release-plz-* ]] \
-            || [[ "${HEAD_BRANCH}" =~ ^release/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            || [[ "${HEAD_BRANCH}" == release-plz-* ]]; then
             echo "PR source '${HEAD_BRANCH}' is allowed to target main."
             exit 0
           fi
-          echo "::error::PRs to 'main' must come from 'develop', a 'release-plz-*' branch, or a 'release/vX.Y.Z' branch (got '${HEAD_BRANCH}')."
+          echo "::error::PRs to 'main' must come from 'develop' or a 'release-plz-*' branch (got '${HEAD_BRANCH}')."
           exit 1
