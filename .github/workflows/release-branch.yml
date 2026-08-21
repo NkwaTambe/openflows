@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   validate-release-branch:
-    name: Validate PR source
+    name: validate-release-branch
     runs-on: ubuntu-latest
     steps:
       - name: Check PR source repository
