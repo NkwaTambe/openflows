@@ -18,6 +18,7 @@ on:
     branches:
       - develop
       - main
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
@@ -26,7 +27,7 @@ concurrency:
 jobs:
   release-plz:
     name: release-plz (release-pr)
-    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/develop' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -44,7 +45,7 @@ jobs:
 
   release-plz-release:
     name: release-plz (release)
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write

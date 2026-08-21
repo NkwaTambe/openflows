@@ -15,6 +15,10 @@ on:
       - edited
       - synchronize
       - reopened
+  push:
+    branches:
+      - develop
+      - main
 
 permissions:
   contents: read
@@ -28,6 +32,17 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: wagoid/commitlint-github-action@6cf16efdf4da5277c791d335142c03a0bdf1766e # v6.2.1
+      - name: Lint commit messages
+        uses: wagoid/commitlint-github-action@6cf16efdf4da5277c791d335142c03a0bdf1766e # v6.2.1
         with:
           configFile: commitlint.config.mjs
+
+      # commitlint-github-action only checks commit messages, not the PR title.
+      # Lint the title separately against the same conventional ruleset so the
+      # "PR title and commit messages are conventional" policy holds.
+      - name: Lint PR title
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "${{ github.event.pull_request.title }}" \
+            | npx --yes --package commitlint --package '@commitlint/config-conventional' \
+                commitlint --config commitlint.config.mjs
