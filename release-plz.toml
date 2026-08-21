@@ -1,8 +1,11 @@
 # release-plz configuration.
 #
-# Drives the release workflow (`.github/workflows/release.yml`): on a push to
-# `main` it updates package versions + CHANGELOGs, creates the single `vX.Y.Z`
-# tag and the GitHub Release.
+# Drives the release workflow (`.github/workflows/release.yml`):
+#   - `release-pr` : on push to `develop`, scans Conventional Commits since the
+#                    last tag, computes the next version, and opens a
+#                    `release-plz-*` PR that bumps both manifests + CHANGELOG.
+#   - `release`    : on push to `main`, creates the single `vX.Y.Z` tag and the
+#                    GitHub Release.
 #
 # GitHub integration is via git tags only (`git_only = true`) — the shipped
 # packages are application binaries that are NOT published to crates.io, so
@@ -15,14 +18,19 @@ git_only = true
 publish = false
 # Use a single `vX.Y.Z` tag that covers both packages.
 git_tag_name = "v{{ version }}"
+# Only the packages explicitly opted in below are processed. The rest of the
+# workspace crates are libraries/sub-crates and are intentionally not released.
+release = false
 
 # `openflows` and `openflows-harness` are kept in lock-step so that one tag and
 # one GitHub Release cover both binaries. `version_group` forces both packages
 # to share the same version.
 [[package]]
 name = "openflows"
+release = true
 version_group = "openflows"
 
 [[package]]
 name = "openflows-harness"
+release = true
 version_group = "openflows"

@@ -1,20 +1,22 @@
 name: Release
 
-# Sole publisher for the two shipped packages (`openflows` binary and
-# `openflows-harness`). On every merged release branch to `main`, release-plz:
-#   - bumps package versions + regenerates the CHANGELOG from Conventional
-#     Commits,
-#   - creates the `vX.Y.Z` tag,
-#   - opens the GitHub Release.
+# Auto-releases from Conventional Commits (see release-plz.toml).
 #
-# Publications to npm / Homebrew / Docker (GHCR) / crates.io are intentionally
-# removed. Cross-platform binary tarballs are attached to the release by
-# `release-assets.yml`, which is triggered by the `v*` tag push that release-plz
-# creates here.
+#   - `release-pr`   : runs on pushes to `develop`, scans Conventional
+#                      Commits since the last tag, computes the next version
+#                      (feat→minor, fix→patch, BREAKING CHANGE→major), and opens
+#                      a `release-plz-*` PR that bumps both manifests + CHANGELOG.
+#                      Merge that PR; you never type a version.
+#   - `release`      : runs on pushes to `main`, creates the `vX.Y.Z` tag and the
+#                      GitHub Release. The `release-assets.yml` workflow then
+#                      attaches the cross-platform binary tarballs.
+#
+# Publications to npm / Homebrew / Docker (GHCR) / crates.io are removed.
 
 on:
   push:
     branches:
+      - develop
       - main
   workflow_dispatch:
 
@@ -24,7 +26,26 @@ concurrency:
 
 jobs:
   release-plz:
-    name: release-plz
+    name: release-plz (release-pr)
+    if: github.ref == 'refs/heads/develop' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: release-plz/action@b11437f8c0e955c306676ceaf8ce8c54eba6004f # v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-release:
+    name: release-plz (release)
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -33,9 +54,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # `command: release` creates the tag + GitHub release. No
-      # CARGO_REGISTRY_TOKEN is configured, so release-plz never publishes to
-      # crates.io — it only tags and opens the release.
       - uses: release-plz/action@b11437f8c0e955c306676ceaf8ce8c54eba6004f # v0.5
         with:
           command: release
