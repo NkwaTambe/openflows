@@ -178,15 +178,18 @@ install_orchestration() {
 }
 
 # Download a single release tarball into /tmp, trying the musl fallback for
-# platforms without a native binary.
+# platforms without a native binary. `out_var` receives the extraction
+# directory name (which reflects the platform actually downloaded, e.g. the
+# musl fallback) so the caller knows where the unpacked files live.
 download_one() {
     local pkg="$1"
     local version="$2"
     local platform="$3"
-    local out_var="$4"          # name of the var to set with the downloaded archive
+    local out_var="$4"          # var to set with the extraction directory name
     local asset_name="${pkg}-${version}-${platform}.tar.gz"
     local url="https://github.com/${REPO}/releases/download/${pkg}-${version}/${asset_name}"
     local downloaded=""
+    local resolved_platform="$platform"
 
     if has_cmd curl; then
         if curl -fsSL "$url" -o "/tmp/${asset_name}" 2>/dev/null; then
@@ -214,8 +217,10 @@ download_one() {
             warn "No ${pkg} binary for ${platform}, trying ${alt_platform}..."
             if has_cmd curl && curl -fsSL "$alt_url" -o "/tmp/${alt_asset}" 2>/dev/null; then
                 downloaded="$alt_asset"
+                resolved_platform="$alt_platform"
             elif has_cmd wget && wget -q "$alt_url" -O "/tmp/${alt_asset}" 2>/dev/null; then
                 downloaded="$alt_asset"
+                resolved_platform="$alt_platform"
             fi
         fi
     fi
@@ -224,9 +229,9 @@ download_one() {
         return 1
     fi
 
-    printf -v "$out_var" "%s" "$downloaded"
     tar -xzf "/tmp/${downloaded}" -C /tmp/
     rm -f "/tmp/${downloaded}"
+    printf -v "$out_var" "%s" "${pkg}-${version}-${resolved_platform}"
     return 0
 }
 
@@ -237,9 +242,8 @@ download_binary() {
 
     info "Downloading OpenFlows ${main_version} for ${platform}..."
 
-    local main_archive=""
-    local harness_archive=""
-    if ! download_one "openflows" "$main_version" "$platform" main_archive; then
+    local main_dir=""
+    if ! download_one "openflows" "$main_version" "$platform" main_dir; then
         fail "Failed to download openflows binary for ${platform}"
         info "Falling back to building from source..."
         return 1
@@ -248,14 +252,15 @@ download_binary() {
     # The harness ships in its own release, possibly at its own version;
     # download it too, but don't fail the whole install if a particular
     # platform has no harness build.
+    local harness_dir=""
     local harness_copied=false
-    if download_one "openflows-harness" "$harness_version" "$platform" harness_archive; then
+    if download_one "openflows-harness" "$harness_version" "$platform" harness_dir; then
         harness_copied=true
     else
         warn "No openflows-harness binary for ${platform}; skipping harness"
     fi
 
-    local extract_dir="/tmp/openflows-${main_version}-${platform}"
+    local extract_dir="/tmp/${main_dir}"
     for bin in "${BINARIES[@]}"; do
         if [ -f "${extract_dir}/${bin}" ]; then
             cp "${extract_dir}/${bin}" "${INSTALL_DIR}/"
@@ -266,13 +271,12 @@ download_binary() {
     # The harness archive extracts to its own package-named directory, so copy
     # it separately rather than searching the main package's directory.
     if [ "$harness_copied" = true ]; then
-        local harness_dir="/tmp/openflows-harness-${harness_version}-${platform}"
-        if [ -f "${harness_dir}/openflows-harness" ]; then
-            cp "${harness_dir}/openflows-harness" "${INSTALL_DIR}/"
+        if [ -f "/tmp/${harness_dir}/openflows-harness" ]; then
+            cp "/tmp/${harness_dir}/openflows-harness" "${INSTALL_DIR}/"
             chmod +x "${INSTALL_DIR}/openflows-harness"
             success "Installed openflows-harness"
         fi
-        rm -rf "${harness_dir}"
+        rm -rf "/tmp/${harness_dir}"
     fi
 
     if [ -d "${extract_dir}/orchestration" ]; then
@@ -309,6 +313,28 @@ build_from_source() {
     fi
 }
 
+# Build a jq filter for `gh release list -q` matching the exact tag prefix,
+# optionally excluding a longer prefix, and selecting only the requested
+# channel. The values are inlined as `__PFX__`/`__EX__`/`__PRE__` placeholders
+# (safe characters only) and substituted below, so no `--arg` bindings are
+# passed to gh — gh's `-q` accepts only the jq expression. gh runs its own
+# embedded jq, so no external `jq` is needed on the gh path.
+build_gh_filter() {
+    local tag_prefix="$1"
+    local prerelease="$2"
+    local exclude_prefix="$3"
+    local filter
+    if [ -n "$exclude_prefix" ]; then
+        filter='[.[] | select(.tagName | startswith("__PFX__")) | select((.tagName | startswith("__EX__")) | not)] | map(select((.isPrerelease | tostring) == "__PRE__")) | .[0].tagName'
+    else
+        filter='[.[] | select(.tagName | startswith("__PFX__"))] | map(select((.isPrerelease | tostring) == "__PRE__")) | .[0].tagName'
+    fi
+    filter=${filter//__PFX__/$tag_prefix}
+    filter=${filter//__EX__/$exclude_prefix}
+    filter=${filter//__PRE__/$prerelease}
+    printf '%s' "$filter"
+}
+
 # Resolve the version (without prefix) of the latest release for a package.
 #
 # `tag_prefix` must be the exact tag prefix for that package: `openflows-` for
@@ -325,17 +351,12 @@ resolve_tag() {
     local exclude_prefix="${3:-}"
     local tag=""
     if has_cmd gh; then
-        if [ -n "$exclude_prefix" ]; then
-            tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
-                -q --arg pfx "$tag_prefix" --arg ex "$exclude_prefix" --arg pre "$prerelease" \
-                '[.[] | select(.tagName | startswith($pfx)) | select((.tagName | startswith($ex)) | not)] | map(select((.isPrerelease | tostring) == $pre)) | .[0].tagName' 2>/dev/null || echo "")
-        else
-            tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
-                -q --arg pfx "$tag_prefix" --arg pre "$prerelease" \
-                '[.[] | select(.tagName | startswith($pfx))] | map(select((.isPrerelease | tostring) == $pre)) | .[0].tagName' 2>/dev/null || echo "")
-        fi
+        local filter
+        filter=$(build_gh_filter "$tag_prefix" "$prerelease" "$exclude_prefix")
+        tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
+            -q "$filter" 2>/dev/null || echo "")
     fi
-    if [ -z "$tag" ]; then
+    if [ -z "$tag" ] && has_cmd jq; then
         if [ -n "$exclude_prefix" ]; then
             tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
                 | jq -r --arg pfx "$tag_prefix" --arg ex "$exclude_prefix" --arg pre "$prerelease" \
