@@ -238,7 +238,7 @@ download_one() {
 download_binary() {
     local platform="$1"
     local main_version="$2"
-    local harness_version="${3:-$main_version}"
+    local harness_version="${3:-}"
 
     info "Downloading OpenFlows ${main_version} for ${platform}..."
 
@@ -249,12 +249,14 @@ download_binary() {
         return 1
     fi
 
-    # The harness ships in its own release, possibly at its own version;
-    # download it too, but don't fail the whole install if a particular
-    # platform has no harness build.
+    # The harness ships in its own release, possibly at its own version.
+    # Only download it when a harness release exists in the current channel
+    # (harness_version is non-empty); never fall back to the main version, since
+    # the tag encodes no channel and could pull a same-version harness from the
+    # other (stable/edge) channel.
     local harness_dir=""
     local harness_copied=false
-    if download_one "openflows-harness" "$harness_version" "$platform" harness_dir; then
+    if [ -n "$harness_version" ] && download_one "openflows-harness" "$harness_version" "$platform" harness_dir; then
         harness_copied=true
     else
         warn "No openflows-harness binary for ${platform}; skipping harness"
@@ -360,11 +362,11 @@ resolve_tag() {
         if [ -n "$exclude_prefix" ]; then
             tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
                 | jq -r --arg pfx "$tag_prefix" --arg ex "$exclude_prefix" --arg pre "$prerelease" \
-                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx)) | select((.tag_name | startswith($ex)) | not)] | .[0].tag_name' 2>/dev/null || echo "")
+                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx)) | select((.tag_name | startswith($ex)) | not)] | .[0].tag_name // ""' 2>/dev/null || echo "")
         else
             tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
                 | jq -r --arg pfx "$tag_prefix" --arg pre "$prerelease" \
-                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx))] | .[0].tag_name' 2>/dev/null || echo "")
+                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx))] | .[0].tag_name // ""' 2>/dev/null || echo "")
         fi
     fi
     echo "${tag#${tag_prefix}}"
