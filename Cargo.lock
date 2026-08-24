@@ -1279,7 +1279,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openflows"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "agent-forge",
  "agent-lore",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "openflows-harness"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "a2a-protocol",
  "anyhow",
