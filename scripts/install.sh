@@ -177,73 +177,109 @@ install_orchestration() {
     fi
 }
 
-download_binary() {
-    local platform="$1"
-    local tag="$2"
-    local asset_name="openflows-${tag}-${platform}.tar.gz"
+# Download a single release tarball into /tmp, trying the musl fallback for
+# platforms without a native binary. `out_var` receives the extraction
+# directory name (which reflects the platform actually downloaded, e.g. the
+# musl fallback) so the caller knows where the unpacked files live.
+download_one() {
+    local pkg="$1"
+    local version="$2"
+    local platform="$3"
+    local out_var="$4"          # var to set with the extraction directory name
+    local asset_name="${pkg}-${version}-${platform}.tar.gz"
+    local url="https://github.com/${REPO}/releases/download/${pkg}-${version}/${asset_name}"
+    local downloaded=""
+    local resolved_platform="$platform"
 
-    info "Downloading OpenFlows ${tag} for ${platform}..."
-
-    local download_url="https://github.com/${REPO}/releases/download/${tag}/${asset_name}"
-
-    local download_ok=false
     if has_cmd curl; then
-        if curl -fsSL "$download_url" -o "/tmp/${asset_name}" 2>/dev/null; then
-            download_ok=true
+        if curl -fsSL "$url" -o "/tmp/${asset_name}" 2>/dev/null; then
+            downloaded="$asset_name"
         fi
     elif has_cmd wget; then
-        if wget -q "$download_url" -O "/tmp/${asset_name}" 2>/dev/null; then
-            download_ok=true
+        if wget -q "$url" -O "/tmp/${asset_name}" 2>/dev/null; then
+            downloaded="$asset_name"
         fi
     else
         fail "Neither curl nor wget found"
         return 1
     fi
 
-    if [ "$download_ok" = false ]; then
+    if [ -z "$downloaded" ]; then
         local alt_platform=""
         case "$platform" in
             x86_64-unknown-linux-gnu)  alt_platform="x86_64-unknown-linux-musl" ;;
             aarch64-unknown-linux-gnu) alt_platform="aarch64-unknown-linux-musl" ;;
             *) ;;
         esac
-
         if [ -n "$alt_platform" ]; then
-            local alt_asset="openflows-${tag}-${alt_platform}.tar.gz"
-            local alt_url="https://github.com/${REPO}/releases/download/${tag}/${alt_asset}"
-            warn "No binary for ${platform}, trying ${alt_platform}..."
-            if has_cmd curl; then
-                if curl -fsSL "$alt_url" -o "/tmp/${alt_asset}" 2>/dev/null; then
-                    download_ok=true
-                    asset_name="$alt_asset"
-                    platform="$alt_platform"
-                fi
-            elif has_cmd wget; then
-                if wget -q "$alt_url" -O "/tmp/${alt_asset}" 2>/dev/null; then
-                    download_ok=true
-                    asset_name="$alt_asset"
-                    platform="$alt_platform"
-                fi
+            local alt_asset="${pkg}-${version}-${alt_platform}.tar.gz"
+            local alt_url="https://github.com/${REPO}/releases/download/${pkg}-${version}/${alt_asset}"
+            warn "No ${pkg} binary for ${platform}, trying ${alt_platform}..."
+            if has_cmd curl && curl -fsSL "$alt_url" -o "/tmp/${alt_asset}" 2>/dev/null; then
+                downloaded="$alt_asset"
+                resolved_platform="$alt_platform"
+            elif has_cmd wget && wget -q "$alt_url" -O "/tmp/${alt_asset}" 2>/dev/null; then
+                downloaded="$alt_asset"
+                resolved_platform="$alt_platform"
             fi
-        fi
-
-        if [ "$download_ok" = false ]; then
-            fail "Failed to download binary for ${platform}"
-            info "Falling back to building from source..."
-            return 1
         fi
     fi
 
-    tar -xzf "/tmp/${asset_name}" -C /tmp/
-    rm -f "/tmp/${asset_name}"
+    if [ -z "$downloaded" ]; then
+        return 1
+    fi
 
-    local extract_dir="/tmp/openflows-${tag}-${platform}"
+    tar -xzf "/tmp/${downloaded}" -C /tmp/
+    rm -f "/tmp/${downloaded}"
+    printf -v "$out_var" "%s" "${pkg}-${version}-${resolved_platform}"
+    return 0
+}
+
+download_binary() {
+    local platform="$1"
+    local main_version="$2"
+    local harness_version="${3:-}"
+
+    info "Downloading OpenFlows ${main_version} for ${platform}..."
+
+    local main_dir=""
+    if ! download_one "openflows" "$main_version" "$platform" main_dir; then
+        fail "Failed to download openflows binary for ${platform}"
+        info "Falling back to building from source..."
+        return 1
+    fi
+
+    # The harness ships in its own release, possibly at its own version.
+    # Only download it when a harness release exists in the current channel
+    # (harness_version is non-empty); never fall back to the main version, since
+    # the tag encodes no channel and could pull a same-version harness from the
+    # other (stable/edge) channel.
+    local harness_dir=""
+    local harness_copied=false
+    if [ -n "$harness_version" ] && download_one "openflows-harness" "$harness_version" "$platform" harness_dir; then
+        harness_copied=true
+    else
+        warn "No openflows-harness binary for ${platform}; skipping harness"
+    fi
+
+    local extract_dir="/tmp/${main_dir}"
     for bin in "${BINARIES[@]}"; do
         if [ -f "${extract_dir}/${bin}" ]; then
             cp "${extract_dir}/${bin}" "${INSTALL_DIR}/"
             chmod +x "${INSTALL_DIR}/${bin}"
         fi
     done
+
+    # The harness archive extracts to its own package-named directory, so copy
+    # it separately rather than searching the main package's directory.
+    if [ "$harness_copied" = true ]; then
+        if [ -f "/tmp/${harness_dir}/openflows-harness" ]; then
+            cp "/tmp/${harness_dir}/openflows-harness" "${INSTALL_DIR}/"
+            chmod +x "${INSTALL_DIR}/openflows-harness"
+            success "Installed openflows-harness"
+        fi
+        rm -rf "/tmp/${harness_dir}"
+    fi
 
     if [ -d "${extract_dir}/orchestration" ]; then
         install_orchestration "${extract_dir}"
@@ -279,31 +315,61 @@ build_from_source() {
     fi
 }
 
-resolve_stable_tag() {
-    local tag=""
-    if has_cmd gh; then
-        tag=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || echo "")
+# Build a jq filter for `gh release list -q` matching the exact tag prefix,
+# optionally excluding a longer prefix, and selecting only the requested
+# channel. The values are inlined as `__PFX__`/`__EX__`/`__PRE__` placeholders
+# (safe characters only) and substituted below, so no `--arg` bindings are
+# passed to gh — gh's `-q` accepts only the jq expression. gh runs its own
+# embedded jq, so no external `jq` is needed on the gh path.
+build_gh_filter() {
+    local tag_prefix="$1"
+    local prerelease="$2"
+    local exclude_prefix="$3"
+    local filter
+    if [ -n "$exclude_prefix" ]; then
+        filter='[.[] | select(.tagName | startswith("__PFX__")) | select((.tagName | startswith("__EX__")) | not)] | map(select((.isPrerelease | tostring) == "__PRE__")) | .[0].tagName'
+    else
+        filter='[.[] | select(.tagName | startswith("__PFX__"))] | map(select((.isPrerelease | tostring) == "__PRE__")) | .[0].tagName'
     fi
-    if [ -z "$tag" ]; then
-        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-            | grep '"tag_name"' | head -1 \
-            | sed 's/.*"tag_name": "//;s/".*//' || echo "")
-    fi
-    echo "$tag"
+    filter=${filter//__PFX__/$tag_prefix}
+    filter=${filter//__EX__/$exclude_prefix}
+    filter=${filter//__PRE__/$prerelease}
+    printf '%s' "$filter"
 }
 
-resolve_edge_tag() {
+# Resolve the version (without prefix) of the latest release for a package.
+#
+# `tag_prefix` must be the exact tag prefix for that package: `openflows-` for
+# the main release and `openflows-harness-` for the harness. `openflows-harness-`
+# tags share the `openflows-` prefix with the main package's tags, so `exclude_prefix`
+# (e.g. `openflows-harness-` when resolving the main release) stops a newer harness
+# tag from being mistaken for the main package. Each package is resolved
+# independently so the two can be released at their own versions.
+#
+# `prerelease` selects the channel: "false" for stable, "true" for edge.
+resolve_tag() {
+    local tag_prefix="$1"
+    local prerelease="$2"
+    local exclude_prefix="${3:-}"
     local tag=""
     if has_cmd gh; then
-        tag=$(gh release list --repo "$REPO" --limit 50 --json tagName,isPrerelease \
-            -q '.[] | select(.isPrerelease == true) | .tagName' 2>/dev/null \
-            | head -1 || echo "")
+        local filter
+        filter=$(build_gh_filter "$tag_prefix" "$prerelease" "$exclude_prefix")
+        tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
+            -q "$filter" 2>/dev/null || echo "")
     fi
-    if [ -z "$tag" ]; then
-        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=50" 2>/dev/null \
-            | jq -r '[.[] | select(.prerelease == true)] | .[0].tag_name' 2>/dev/null || echo "")
+    if [ -z "$tag" ] && has_cmd jq; then
+        if [ -n "$exclude_prefix" ]; then
+            tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
+                | jq -r --arg pfx "$tag_prefix" --arg ex "$exclude_prefix" --arg pre "$prerelease" \
+                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx)) | select((.tag_name | startswith($ex)) | not)] | .[0].tag_name // ""' 2>/dev/null || echo "")
+        else
+            tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
+                | jq -r --arg pfx "$tag_prefix" --arg pre "$prerelease" \
+                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx))] | .[0].tag_name // ""' 2>/dev/null || echo "")
+        fi
     fi
-    echo "$tag"
+    echo "${tag#${tag_prefix}}"
 }
 
 ensure_path() {
@@ -374,19 +440,23 @@ main() {
     local tag=""
 
     if [ "$CHANNEL" = "edge" ]; then
-        tag=$(resolve_edge_tag)
+        tag=$(resolve_tag "openflows-" "true" "openflows-harness-")
+        local harness_tag
+        harness_tag=$(resolve_tag "openflows-harness-" "true")
         if [ -n "$tag" ]; then
             info "Found edge release: $tag"
-            if download_binary "$platform" "$tag"; then
+            if download_binary "$platform" "$tag" "$harness_tag"; then
                 installed=true
             fi
         else
             warn "No edge release found. Falling back to building from latest main..."
         fi
     else
-        tag=$(resolve_stable_tag)
+        tag=$(resolve_tag "openflows-" "false" "openflows-harness-")
+        local harness_tag
+        harness_tag=$(resolve_tag "openflows-harness-" "false")
         if [ -n "$tag" ]; then
-            if download_binary "$platform" "$tag"; then
+            if download_binary "$platform" "$tag" "$harness_tag"; then
                 installed=true
             fi
         fi
