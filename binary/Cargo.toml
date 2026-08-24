@@ -16,16 +16,16 @@ name = "openflows-doctor"
 path = "src/bin/doctor.rs"
 
 [dependencies]
-pocketflow-core = { path = "../crates/pocketflow-core" }
-config          = { path = "../crates/config" }
-agent-nexus     = { path = "../crates/agent-nexus" }
-agent-forge     = { path = "../crates/agent-forge" }
-agent-vessel    = { path = "../crates/agent-vessel" }
-agent-sentinel  = { path = "../crates/agent-sentinel" }
-agent-lore      = { path = "../crates/agent-lore" }
-provisioner    = { path = "../crates/provisioner" }
-coder-client    = { path = "../crates/coder-client" }
-openflows-harness = { path = "../crates/openflows-harness" }
+pocketflow-core = { version = "0.1.0", path = "../crates/pocketflow-core" }
+config          = { version = "0.2.0", path = "../crates/config" }
+agent-nexus     = { version = "0.1.0", path = "../crates/agent-nexus" }
+agent-forge     = { version = "0.1.0", path = "../crates/agent-forge" }
+agent-vessel    = { version = "0.1.0", path = "../crates/agent-vessel" }
+agent-sentinel  = { version = "1.1.6", path = "../crates/agent-sentinel" }
+agent-lore      = { version = "0.1.0", path = "../crates/agent-lore" }
+provisioner    = { version = "0.1.0", path = "../crates/provisioner" }
+coder-client    = { version = "0.1.0", path = "../crates/coder-client" }
+openflows-harness = { version = "1.2.0", path = "../crates/openflows-harness" }
 clap            = { version = "4", features = ["derive"] }
 
   anyhow      = { workspace = true }

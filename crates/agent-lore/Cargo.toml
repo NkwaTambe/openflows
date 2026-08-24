@@ -12,6 +12,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = "0.4"
-pocketflow-core = { path = "../pocketflow-core" }
-config = { path = "../config" }
-github = { path = "../github" }
+pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
+config = { version = "0.2.0", path = "../config" }
+github = { version = "0.1.0", path = "../github" }

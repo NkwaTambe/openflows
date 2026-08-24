@@ -13,4 +13,4 @@ tracing       = { workspace = true }
 reqwest       = { workspace = true }
 regex         = "1"
 rand          = { workspace = true }
-pocketflow-core = { path = "../pocketflow-core" }
+pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
