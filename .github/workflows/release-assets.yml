@@ -1,17 +1,22 @@
 name: Release Assets
 
-# Builds the cross-platform binary tarballs for a release and attaches them to
-# the GitHub Release that release-plz created (see `release.yml`).
+# Builds and attaches the cross-platform binary tarballs to the two per-package
+# GitHub Releases that release-plz created (see `release.yml`).
 #
-# This workflow is triggered by the `v*` tag push that release-plz produces when
-# a release branch is merged to `main`. Asset names are predictable/fixed so
-# re-runs overwrite (never error): `openflows-<tag>-<target>.tar.gz(+.sha256)`
-# plus a standalone `openflows-harness-x86_64-unknown-linux-musl.tar.gz`.
+# Each of the two released packages gets its OWN super-tag/release:
+#   - `openflows-<version>`        -> release "openflows"        -> asset `openflows-<version>-<target>.tar.gz`
+#   - `openflows-harness-<version>` -> release "openflows-harness" -> asset `openflows-harness-<version>-<target>.tar.gz`
+#
+# Tag names carry no `v` prefix. The package owning the tag is derived from the
+# tag name (`openflows-` vs `openflows-harness-`), and each run only builds and
+# attaches that package's own binaries. Asset names are predictable/fixed so
+# re-runs overwrite (never error).
 
 on:
   push:
     tags:
-      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - 'openflows-[0-9]*.[0-9]*.[0-9]*'
+      - 'openflows-harness-[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
 
 concurrency:
@@ -61,6 +66,20 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      - name: Resolve package from tag
+        id: pkg
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "${REF_NAME}" == openflows-harness-* ]]; then
+            echo "name=openflows-harness" >> "$GITHUB_OUTPUT"
+          elif [[ "${REF_NAME}" == openflows-* ]]; then
+            echo "name=openflows" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unexpected release tag '${REF_NAME}'"
+            exit 1
+          fi
+
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -103,43 +122,43 @@ jobs:
           tool: cargo-zigbuild@0.23.0
 
       - name: Build binaries
-        run: >
-          ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release
-          --target ${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}
-          --bin openflows
-          --bin openflows-doctor
-          --bin openflows-harness
+        env:
+          PACKAGE: ${{ steps.pkg.outputs.name }}
+        run: |
+          PLATFORM_TARGET="${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}"
+          if [[ "${PACKAGE}" == "openflows-harness" ]]; then
+            ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release \
+              --target "${PLATFORM_TARGET}" --bin openflows-harness
+          else
+            ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release \
+              --target "${PLATFORM_TARGET}" --bin openflows --bin openflows-doctor
+          fi
 
       - name: Create tarball
+        env:
+          PACKAGE: ${{ steps.pkg.outputs.name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          set -euo pipefail
+          PKG="${PACKAGE}"
+          VERSION="${REF_NAME#${PKG}-}"
           PLATFORM="${{ matrix.target }}"
-          ARCHIVE="openflows-${VERSION}-${PLATFORM}"
+          ARCHIVE="${PKG}-${VERSION}-${PLATFORM}"
           mkdir -p "dist/${ARCHIVE}"
 
-          for bin in openflows openflows-doctor openflows-harness; do
-            cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
-          done
-
-          cp -r orchestration "dist/${ARCHIVE}/"
-          cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
+          if [[ "${PKG}" == "openflows-harness" ]]; then
+            cp "target/${{ matrix.target }}/release/openflows-harness" "dist/${ARCHIVE}/"
+          else
+            for bin in openflows openflows-doctor; do
+              cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
+            done
+            cp -r orchestration "dist/${ARCHIVE}/"
+            cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
+          fi
 
           tar -czf "dist/${ARCHIVE}.tar.gz" -C dist "${ARCHIVE}"
           cd dist
           sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
-
-      # Standalone harness tarball with a fixed, predictable asset name so every
-      # upload to the release overwrites the previous one (matches the install
-      # URL convention and the historical harness asset naming).
-      - name: Copy standalone harness (linux-musl only)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          mkdir -p "dist/_harness_tmp"
-          cp "target/${{ matrix.target }}/release/openflows-harness" "dist/_harness_tmp/"
-          chmod +x "dist/_harness_tmp/openflows-harness"
-          tar -czf "dist/openflows-harness-x86_64-unknown-linux-musl.tar.gz" \
-            -C dist "_harness_tmp/openflows-harness"
-          rm -rf "dist/_harness_tmp"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

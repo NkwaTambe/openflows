@@ -4,14 +4,19 @@
 # on pushes to `main` (the default branch):
 #   - `release-pr` : scans Conventional Commits since the last tag, computes the
 #                    next version, and opens a `release-plz-*` PR to `main` that
-#                    bumps both manifests + CHANGELOG.
-#   - `release`    : creates the single `vX.Y.Z` tag + GitHub Release when the
-#                    main push is the merge of a `release-plz-*` PR
+#                    bumps the manifest + CHANGELOG.
+#   - `release`    : creates the per-package tag + GitHub Release when the main
+#                    push is the merge of a `release-plz-*` PR
 #                    (`release_always = false`).
 #
 # GitHub integration is via git tags only (`git_only = true`) — the shipped
 # packages are application binaries that are NOT published to crates.io, so
 # release-plz never runs `cargo publish` and never queries the registry.
+#
+# Each shipped binary gets its OWN github release + git tag. Tag names carry no
+# `v` prefix and are namespaced per package so the two binaries can be released
+# independently at the same version without colliding (`openflows-1.2.0` vs
+# `openflows-harness-1.2.0`).
 
 [workspace]
 # Determine released versions from git tags instead of the crates.io registry.
@@ -21,21 +26,20 @@ publish = false
 # Only release when the main push is the merge of a `release-plz-*` release PR
 # (not on every push), avoiding premature tags before the bump PR merges.
 release_always = false
-# Use a single `vX.Y.Z` tag that covers both packages.
-git_tag_name = "v{{ version }}"
 # Only the packages explicitly opted in below are processed. The rest of the
 # workspace crates are libraries/sub-crates and are intentionally not released.
 release = false
 
-# `openflows` and `openflows-harness` are kept in lock-step so that one tag and
-# one GitHub Release cover both binaries. `version_group` forces both packages
-# to share the same version.
+# `openflows` and `openflows-harness` are released independently: one git tag
+# and one GitHub Release per binary. The per-package `git_tag_name` avoids a
+# tag collision when both are at the same version, and omits the `v` prefix.
+
 [[package]]
 name = "openflows"
 release = true
-version_group = "openflows"
+git_tag_name = "openflows-{{ version }}"
 
 [[package]]
 name = "openflows-harness"
 release = true
-version_group = "openflows"
+git_tag_name = "openflows-harness-{{ version }}"

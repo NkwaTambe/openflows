@@ -5,13 +5,13 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-pocketflow-core = { path = "../pocketflow-core" }
-config = { path = "../config" }
-github = { path = "../github" }
-coder-client = { path = "../coder-client" }
-openflows-notifier = { package = "notifier", path = "../notifier" }
-a2a-protocol = { path = "../a2a-protocol" }
-provisioner = { path = "../provisioner" }
+pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
+config = { version = "0.2.0", path = "../config" }
+github = { version = "0.1.0", path = "../github" }
+coder-client = { version = "0.1.0", path = "../coder-client" }
+openflows-notifier = { package = "notifier", version = "0.1.0", path = "../notifier" }
+a2a-protocol = { version = "0.1.0", path = "../a2a-protocol" }
+provisioner = { version = "0.1.0", path = "../provisioner" }
 
 anyhow = { workspace = true }
 serde = { workspace = true }

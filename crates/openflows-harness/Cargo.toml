@@ -13,8 +13,8 @@ name = "openflows-harness"
 path = "src/main.rs"
 
 [dependencies]
-a2a-protocol = { path = "../a2a-protocol" }
-config = { path = "../config" }
+a2a-protocol = { version = "0.1.0", path = "../a2a-protocol" }
+config = { version = "0.2.0", path = "../config" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

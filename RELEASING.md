@@ -17,8 +17,10 @@ develop ──┐
           └─(create)──▶ release/vX.Y.Z ──PR merge──▶ main
                                                     │  push to main
                                                     ▼
-                          release-plz release → tag vX.Y.Z + GitHub Release
-                          release-assets → attach cross-platform tarballs
+                          release-plz release → tag openflows-X.Y.Z
+                                              + tag openflows-harness-X.Y.Z
+                                              (one GitHub Release per binary, no `v`)
+                          release-assets → attach each binary's tarballs to its own release
 ```
 
 - `develop` is the default branch and the integration point. All feature work
@@ -39,9 +41,9 @@ Conventional Commits merged since the last tag:
 | `feat:`                          | **minor**    |
 | `fix:`, `docs:`, `chore:`, …     | **patch**    |
 
-`release-plz` opens a `release-plz-*` pull request to `develop` that bumps both
-manifest versions in lock-step and regenerates the CHANGELOG. Merging that PR
-"locks in" the new version.
+`release-plz` opens a `release-plz-*` pull request to `develop` that bumps each
+released package's manifest version and regenerates the CHANGELOG. Merging that
+PR "locks in" the new version.
 
 > The very first release (no tags yet in the repo — the old tag history was
 > deleted for a clean start) is treated as an **initial release** and ships at
@@ -80,13 +82,21 @@ manifest versions in lock-step and regenerates the CHANGELOG. Merging that PR
    - The release happens on merge.
 
 5. Merge the PR into `main`. On push to `main`, **release-plz `release`** creates
-   the `vX.Y.Z` tag and the GitHub Release.
+   one tag and GitHub Release per binary:
 
-6. The tag push triggers **release-assets**, which builds and attaches:
+   - `openflows-X.Y.Z` (release **openflows**),
+   - `openflows-harness-X.Y.Z` (release **openflows-harness**).
 
-   - `openflows-<v>-<target>.tar.gz` + `.sha256` for
-     x86_64/aarch64 Linux-GNU (zigbuild), Linux-musl, and macOS,
-   - a standalone `openflows-harness-x86_64-unknown-linux-musl.tar.gz`.
+   Tag/release names carry no `v` prefix.
+
+6. Each tag push triggers **release-assets**, which builds and attaches that
+   package's own cross-platform tarballs:
+
+   - on `openflows-*` tags: `openflows-<X.Y.Z>-<target>.tar.gz` + `.sha256`
+     for x86_64/aarch64 Linux-GNU (zigbuild), Linux-musl, and macOS, containing
+     the `openflows` and `openflows-doctor` binaries plus `orchestration/`;
+   - on `openflows-harness-*` tags: `openflows-harness-<X.Y.Z>-<target>.tar.gz`
+     + `.sha256` containing the `openflows-harness` binary.
 
    Asset names are fixed/predictable, so re-runs overwrite rather than error.
 
@@ -100,7 +110,9 @@ enforces this on every PR.
 
 ## Notes
 
-- Version lock-step: `openflows` and `openflows-harness` are grouped in
-  `release-plz.toml` via `version_group`, so one tag/version covers both.
+- Independent releases: `openflows` and `openflows-harness` are released
+  separately in `release-plz.toml`, each with its own tag
+  (`openflows-X.Y.Z` / `openflows-harness-X.Y.Z`) and GitHub Release, so they can
+  ship independently. The installer fetches both releases at the same version.
 - No crates.io publishing is configured (these are application binaries);
   `release-plz.toml` uses `git_only = true` and `publish = false`.
