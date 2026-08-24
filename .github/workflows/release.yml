@@ -5,13 +5,14 @@ name: Release
 # Runs ONLY on pushes to `main` (the default branch). Two jobs:
 #   - `release-plz (release-pr)` : scans Conventional Commits since the last tag,
 #     computes the next version (feat→minor, fix→patch, BREAKING CHANGE→major),
-#     and opens a `release-plz-*` PR to `main` bumping the manifests + CHANGELOG.
+#     and opens a `release-plz-*` PR to `main` bumping the manifest + CHANGELOG.
 #     You merge that PR; you never type a version.
 #   - `release-plz (release)`     : when the push is the merge of a `release-plz-*`
-#     PR (release_always = false), creates ONE tag + GitHub Release per released
-#     binary: `openflows-<version>` and `openflows-harness-<version>` (no `v`
-#     prefix). The `release-assets.yml` workflow then attaches the cross-platform
-#     binaries to each package's own release.
+#     PR (release_always = false), creates the single tag + GitHub Release for
+#     `openflows` (no `v` prefix: `openflows-<version>`). The `release-assets.yml`
+#     workflow then attaches the cross-platform binaries, all built from this one
+#     release (including `openflows-doctor` and `openflows-harness`, which are not
+#     released as separate packages).
 #
 # Publications to npm / Homebrew / Docker (GHCR) / crates.io are removed.
 

@@ -1,22 +1,18 @@
 name: Release Assets
 
-# Builds and attaches the cross-platform binary tarballs to the two per-package
-# GitHub Releases that release-plz created (see `release.yml`).
+# Builds the cross-platform binary tarballs for a release and attaches them to
+# the single GitHub Release that release-plz created (see `release.yml`).
 #
-# Each of the two released packages gets its OWN super-tag/release:
-#   - `openflows-<version>`        -> release "openflows"        -> asset `openflows-<version>-<target>.tar.gz`
-#   - `openflows-harness-<version>` -> release "openflows-harness" -> asset `openflows-harness-<version>-<target>.tar.gz`
-#
-# Tag names carry no `v` prefix. The package owning the tag is derived from the
-# tag name (`openflows-` vs `openflows-harness-`), and each run only builds and
-# attaches that package's own binaries. Asset names are predictable/fixed so
-# re-runs overwrite (never error).
+# Triggered by the `openflows-<version>` tag push (no `v` prefix) that release-plz
+# produces when the release PR is merged to `main`. Each run builds and bundles
+# all shipped binaries (`openflows`, `openflows-doctor`, `openflows-harness`) into
+# one tarball per platform. Asset names are predictable/fixed so re-runs overwrite
+# (never error): `openflows-<version>-<target>.tar.gz(+.sha256)`.
 
 on:
   push:
     tags:
       - 'openflows-[0-9]*.[0-9]*.[0-9]*'
-      - 'openflows-harness-[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
 
 concurrency:
@@ -66,20 +62,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Resolve package from tag
-        id: pkg
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [[ "${REF_NAME}" == openflows-harness-* ]]; then
-            echo "name=openflows-harness" >> "$GITHUB_OUTPUT"
-          elif [[ "${REF_NAME}" == openflows-* ]]; then
-            echo "name=openflows" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected release tag '${REF_NAME}'"
-            exit 1
-          fi
-
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -122,39 +104,26 @@ jobs:
           tool: cargo-zigbuild@0.23.0
 
       - name: Build binaries
-        env:
-          PACKAGE: ${{ steps.pkg.outputs.name }}
-        run: |
-          PLATFORM_TARGET="${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}"
-          if [[ "${PACKAGE}" == "openflows-harness" ]]; then
-            ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release \
-              --target "${PLATFORM_TARGET}" --bin openflows-harness
-          else
-            ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release \
-              --target "${PLATFORM_TARGET}" --bin openflows --bin openflows-doctor
-          fi
+        run: >
+          ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release
+          --target ${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}
+          --bin openflows
+          --bin openflows-doctor
+          --bin openflows-harness
 
       - name: Create tarball
         env:
-          PACKAGE: ${{ steps.pkg.outputs.name }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          PKG="${PACKAGE}"
-          VERSION="${REF_NAME#${PKG}-}"
+          VERSION="${REF_NAME#openflows-}"
           PLATFORM="${{ matrix.target }}"
-          ARCHIVE="${PKG}-${VERSION}-${PLATFORM}"
+          ARCHIVE="openflows-${VERSION}-${PLATFORM}"
           mkdir -p "dist/${ARCHIVE}"
 
-          if [[ "${PKG}" == "openflows-harness" ]]; then
-            cp "target/${{ matrix.target }}/release/openflows-harness" "dist/${ARCHIVE}/"
-          else
-            for bin in openflows openflows-doctor; do
-              cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
-            done
-            cp -r orchestration "dist/${ARCHIVE}/"
-            cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
-          fi
+          for bin in openflows openflows-doctor openflows-harness; do
+            cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
+          done
 
           tar -czf "dist/${ARCHIVE}.tar.gz" -C dist "${ARCHIVE}"
           cd dist
