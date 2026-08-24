@@ -232,30 +232,48 @@ download_one() {
 
 download_binary() {
     local platform="$1"
-    local version="$2"
+    local main_version="$2"
+    local harness_version="${3:-$main_version}"
 
-    info "Downloading OpenFlows ${version} for ${platform}..."
+    info "Downloading OpenFlows ${main_version} for ${platform}..."
 
     local main_archive=""
     local harness_archive=""
-    if ! download_one "openflows" "$version" "$platform" main_archive; then
+    if ! download_one "openflows" "$main_version" "$platform" main_archive; then
         fail "Failed to download openflows binary for ${platform}"
         info "Falling back to building from source..."
         return 1
     fi
 
-    # The harness ships in its own release; download it too, but don't fail the
-    # whole install if a particular platform has no harness build.
-    download_one "openflows-harness" "$version" "$platform" harness_archive \
-        || warn "No openflows-harness binary for ${platform}; skipping harness"
+    # The harness ships in its own release, possibly at its own version;
+    # download it too, but don't fail the whole install if a particular
+    # platform has no harness build.
+    local harness_copied=false
+    if download_one "openflows-harness" "$harness_version" "$platform" harness_archive; then
+        harness_copied=true
+    else
+        warn "No openflows-harness binary for ${platform}; skipping harness"
+    fi
 
-    local extract_dir="/tmp/openflows-${version}-${platform}"
+    local extract_dir="/tmp/openflows-${main_version}-${platform}"
     for bin in "${BINARIES[@]}"; do
         if [ -f "${extract_dir}/${bin}" ]; then
             cp "${extract_dir}/${bin}" "${INSTALL_DIR}/"
             chmod +x "${INSTALL_DIR}/${bin}"
         fi
     done
+
+    # The harness archive extracts to its own package-named directory, so copy
+    # it separately rather than searching the main package's directory.
+    if [ "$harness_copied" = true ]; then
+        local harness_dir="/tmp/openflows-harness-${harness_version}-${platform}"
+        if [ -f "${harness_dir}/openflows-harness" ]; then
+            cp "${harness_dir}/openflows-harness" "${INSTALL_DIR}/"
+            chmod +x "${INSTALL_DIR}/openflows-harness"
+            success "Installed openflows-harness"
+        fi
+        rm -rf "${harness_dir}"
+    fi
 
     if [ -d "${extract_dir}/orchestration" ]; then
         install_orchestration "${extract_dir}"
@@ -291,34 +309,44 @@ build_from_source() {
     fi
 }
 
-resolve_stable_tag() {
-    # Resolve the version (without prefix) of the latest stable `openflows-*`
-    # release. `openflows` is the main release; harness shares its version.
+# Resolve the version (without prefix) of the latest release for a package.
+#
+# `tag_prefix` must be the exact tag prefix for that package: `openflows-` for
+# the main release and `openflows-harness-` for the harness. `openflows-harness-`
+# tags share the `openflows-` prefix with the main package's tags, so `exclude_prefix`
+# (e.g. `openflows-harness-` when resolving the main release) stops a newer harness
+# tag from being mistaken for the main package. Each package is resolved
+# independently so the two can be released at their own versions.
+#
+# `prerelease` selects the channel: "false" for stable, "true" for edge.
+resolve_tag() {
+    local tag_prefix="$1"
+    local prerelease="$2"
+    local exclude_prefix="${3:-}"
     local tag=""
     if has_cmd gh; then
-        tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
-            -q '[.[] | select(.tagName | startswith("openflows-"))] | map(select(.isPrerelease == false)) | .[0].tagName' 2>/dev/null || echo "")
+        if [ -n "$exclude_prefix" ]; then
+            tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
+                -q --arg pfx "$tag_prefix" --arg ex "$exclude_prefix" --arg pre "$prerelease" \
+                '[.[] | select(.tagName | startswith($pfx)) | select((.tagName | startswith($ex)) | not)] | map(select((.isPrerelease | tostring) == $pre)) | .[0].tagName' 2>/dev/null || echo "")
+        else
+            tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
+                -q --arg pfx "$tag_prefix" --arg pre "$prerelease" \
+                '[.[] | select(.tagName | startswith($pfx))] | map(select((.isPrerelease | tostring) == $pre)) | .[0].tagName' 2>/dev/null || echo "")
+        fi
     fi
     if [ -z "$tag" ]; then
-        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
-            | jq -r '[.[] | select(.prerelease == false) | select(.tag_name | startswith("openflows-"))] | .[0].tag_name' 2>/dev/null || echo "")
+        if [ -n "$exclude_prefix" ]; then
+            tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
+                | jq -r --arg pfx "$tag_prefix" --arg ex "$exclude_prefix" --arg pre "$prerelease" \
+                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx)) | select((.tag_name | startswith($ex)) | not)] | .[0].tag_name' 2>/dev/null || echo "")
+        else
+            tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
+                | jq -r --arg pfx "$tag_prefix" --arg pre "$prerelease" \
+                '[.[] | select((.prerelease | tostring) == $pre) | select(.tag_name | startswith($pfx))] | .[0].tag_name' 2>/dev/null || echo "")
+        fi
     fi
-    echo "${tag#openflows-}"
-}
-
-resolve_edge_tag() {
-    # Resolve the version (without prefix) of the latest pre-release
-    # `openflows-*` build from main.
-    local tag=""
-    if has_cmd gh; then
-        tag=$(gh release list --repo "$REPO" --limit 100 --json tagName,isPrerelease \
-            -q '[.[] | select(.tagName | startswith("openflows-"))] | map(select(.isPrerelease == true)) | .[0].tagName' 2>/dev/null || echo "")
-    fi
-    if [ -z "$tag" ]; then
-        tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases?per_page=100" 2>/dev/null \
-            | jq -r '[.[] | select(.prerelease == true) | select(.tag_name | startswith("openflows-"))] | .[0].tag_name' 2>/dev/null || echo "")
-    fi
-    echo "${tag#openflows-}"
+    echo "${tag#${tag_prefix}}"
 }
 
 ensure_path() {
@@ -389,19 +417,23 @@ main() {
     local tag=""
 
     if [ "$CHANNEL" = "edge" ]; then
-        tag=$(resolve_edge_tag)
+        tag=$(resolve_tag "openflows-" "true" "openflows-harness-")
+        local harness_tag
+        harness_tag=$(resolve_tag "openflows-harness-" "true")
         if [ -n "$tag" ]; then
             info "Found edge release: $tag"
-            if download_binary "$platform" "$tag"; then
+            if download_binary "$platform" "$tag" "$harness_tag"; then
                 installed=true
             fi
         else
             warn "No edge release found. Falling back to building from latest main..."
         fi
     else
-        tag=$(resolve_stable_tag)
+        tag=$(resolve_tag "openflows-" "false" "openflows-harness-")
+        local harness_tag
+        harness_tag=$(resolve_tag "openflows-harness-" "false")
         if [ -n "$tag" ]; then
-            if download_binary "$platform" "$tag"; then
+            if download_binary "$platform" "$tag" "$harness_tag"; then
                 installed=true
             fi
         fi
