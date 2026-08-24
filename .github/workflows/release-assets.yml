@@ -1,23 +1,29 @@
 name: Release Assets
 
-# Builds and attaches the cross-platform binary tarballs to the two per-package
-# GitHub Releases that release-plz created (see `release.yml`).
+# Builds the cross-platform binary tarballs for a release and attaches them to
+# the single GitHub Release that release-plz created (see `release.yml`).
 #
-# Each of the two released packages gets its OWN super-tag/release:
-#   - `openflows-<version>`        -> release "openflows"        -> asset `openflows-<version>-<target>.tar.gz`
-#   - `openflows-harness-<version>` -> release "openflows-harness" -> asset `openflows-harness-<version>-<target>.tar.gz`
+# Triggered by the `openflows-<version>` tag push (no `v` prefix) that release-plz
+# produces when the release PR is merged to `main`. Each run builds and bundles
+# all shipped binaries (`openflows`, `openflows-doctor`, `openflows-harness`) into
+# one tarball per platform. Asset names are predictable/fixed so re-runs overwrite
+# (never error): `openflows-<version>-<target>.tar.gz(+.sha256)`.
 #
-# Tag names carry no `v` prefix. The package owning the tag is derived from the
-# tag name (`openflows-` vs `openflows-harness-`), and each run only builds and
-# attaches that package's own binaries. Asset names are predictable/fixed so
-# re-runs overwrite (never error).
+# Manual dispatch requires the `version` input (a tag push derives it from
+# `github.ref_name`; a branch name like `main` is never mistaken for a version).
 
 on:
   push:
     tags:
       - 'openflows-[0-9]*.[0-9]*.[0-9]*'
-      - 'openflows-harness-[0-9]*.[0-9]*.[0-9]*'
   workflow_dispatch:
+    inputs:
+      # Version to build (e.g. 1.2.1) for manual dispatch. A tag push derives the
+      # version from github.ref_name, but on a manual dispatch github.ref_name is
+      # a branch (e.g. `main`), so callers must supply the release version.
+      version:
+        description: 'Version to build and attach, e.g. 1.2.1 (used for manual dispatch only)'
+        required: true
 
 concurrency:
   group: release-assets-${{ github.ref }}
@@ -66,20 +72,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      - name: Resolve package from tag
-        id: pkg
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          if [[ "${REF_NAME}" == openflows-harness-* ]]; then
-            echo "name=openflows-harness" >> "$GITHUB_OUTPUT"
-          elif [[ "${REF_NAME}" == openflows-* ]]; then
-            echo "name=openflows" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected release tag '${REF_NAME}'"
-            exit 1
-          fi
-
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -122,39 +114,37 @@ jobs:
           tool: cargo-zigbuild@0.23.0
 
       - name: Build binaries
-        env:
-          PACKAGE: ${{ steps.pkg.outputs.name }}
-        run: |
-          PLATFORM_TARGET="${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}"
-          if [[ "${PACKAGE}" == "openflows-harness" ]]; then
-            ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release \
-              --target "${PLATFORM_TARGET}" --bin openflows-harness
-          else
-            ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release \
-              --target "${PLATFORM_TARGET}" --bin openflows --bin openflows-doctor
-          fi
+        run: >
+          ${{ matrix.use_zigbuild && 'cargo zigbuild' || 'cargo build' }} --release
+          --target ${{ matrix.use_zigbuild && matrix.zigbuild_target || matrix.target }}
+          --bin openflows
+          --bin openflows-doctor
+          --bin openflows-harness
 
       - name: Create tarball
         env:
-          PACKAGE: ${{ steps.pkg.outputs.name }}
+          MANUAL_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          PKG="${PACKAGE}"
-          VERSION="${REF_NAME#${PKG}-}"
+          if [ -n "${MANUAL_VERSION}" ]; then
+            VERSION="${MANUAL_VERSION}"
+          else
+            VERSION="${REF_NAME#openflows-}"
+          fi
+          # Guard against non-version values (e.g. a branch name like `main` on
+          # a manual dispatch, or a malformed tag) producing bad asset/tag names.
+          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid release version '${VERSION}' (expected an openflows-X.Y.Z tag or a version input)"
+            exit 1
+          fi
           PLATFORM="${{ matrix.target }}"
-          ARCHIVE="${PKG}-${VERSION}-${PLATFORM}"
+          ARCHIVE="openflows-${VERSION}-${PLATFORM}"
           mkdir -p "dist/${ARCHIVE}"
 
-          if [[ "${PKG}" == "openflows-harness" ]]; then
-            cp "target/${{ matrix.target }}/release/openflows-harness" "dist/${ARCHIVE}/"
-          else
-            for bin in openflows openflows-doctor; do
-              cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
-            done
-            cp -r orchestration "dist/${ARCHIVE}/"
-            cp README.md LICENSE "dist/${ARCHIVE}/" 2>/dev/null || true
-          fi
+          for bin in openflows openflows-doctor openflows-harness; do
+            cp "target/${{ matrix.target }}/release/${bin}" "dist/${ARCHIVE}/"
+          done
 
           tar -czf "dist/${ARCHIVE}.tar.gz" -C dist "${ARCHIVE}"
           cd dist
@@ -174,6 +164,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Resolve release tag
+        id: release
+        env:
+          MANUAL_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "${MANUAL_VERSION}" ]; then
+            VERSION="${MANUAL_VERSION}"
+          else
+            VERSION="${REF_NAME#openflows-}"
+          fi
+          if ! printf '%s' "${VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid release version '${VERSION}' (expected an openflows-X.Y.Z tag or a version input)"
+            exit 1
+          fi
+          echo "tag=openflows-${VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -186,7 +193,7 @@ jobs:
       - name: Upload assets to release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ steps.release.outputs.tag }}
           files: |
             dist/*.tar.gz
             dist/*.sha256
