@@ -2,7 +2,7 @@
 
 **Document type:** Internal architecture (deep-dive)
 **Scope:** Subsystem 04, Channel C of the OpenFlows system — the A2A relay that enables Sentinel↔Forge delegated verification.
-**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative), `openflows-controller.md` (the host process), `a2a-verification.md` (protocol narrative), `docs/ORCHESTRATOR.md` (orchestrator & agents).
+**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative; see §6 for the communication plane and §7 for the orchestration cycle), `openflows-controller.md` (the host process).
 
 ---
 

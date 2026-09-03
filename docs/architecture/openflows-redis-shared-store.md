@@ -2,7 +2,7 @@
 
 **Document type:** Internal architecture (deep-dive)
 **Scope:** The shared Redis layer — the `SharedStore` (pocketflow-core) + the `openflows worker` Redis client — that is the **single source of truth for all durable state** in the OpenFlows system. Covers the two-writer model, the tenant key namespace, the durable key map, the phase state machine, gate `GETDEL` semantics, heartbeats, the event ring buffer, the A2A mirror keys, and the security/operational posture.
-**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative), `openflows-controller.md` (Subsystem 01, the primary Redis writer), `openflows-worker-workspace.md` (Subsystem 03, the harness client), `openflows-a2a-relay.md` (Subsystem 04, A2A mirroring), `tenancy.md` (multi-tenant namespacing), `governance.md` (network policy).
+**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative; see §5.4 for multi-tenancy and §13 for network policy), `openflows-controller.md` (Subsystem 01, the primary Redis writer), `openflows-worker-workspace.md` (Subsystem 03, the harness client), `openflows-a2a-relay.md` (Subsystem 04, A2A mirroring).
 
 ---
 
@@ -89,7 +89,7 @@ The resolved tenant is baked into the store instance, so every operation on that
 
 ### 3.3 Why this is sufficient isolation
 
-Redis namespacing guarantees **data-plane** isolation (which process can address which keys). Coder RBAC guarantees **access-plane** isolation (which user/token may reach the control plane and which workspaces). They compose: a user admitted to tenant B's control plane still cannot address tenant A's keys because the store instance for B simply cannot form tenant-A key strings. This is the multi-tenant model of `tenancy.md`.
+Redis namespacing guarantees **data-plane** isolation (which process can address which keys). Coder RBAC guarantees **access-plane** isolation (which user/token may reach the control plane and which workspaces). They compose: a user admitted to tenant B's control plane still cannot address tenant A's keys because the store instance for B simply cannot form tenant-A key strings. This is the multi-tenant model of `openflows-system-architecture.md` §5.4.
 
 ---
 
@@ -311,6 +311,6 @@ The system is **not** transactionally atomic end-to-end; it converges. This is a
 - `openflows-controller.md` — §4 (SharedStore API + durable key map), §7 (paced poll loop & convergence).
 - `openflows-worker-workspace.md` — §5.1 (Harness A, the only Redis client), §5.6 (the two writers / coordination contract), §6 (heartbeat).
 - `openflows-a2a-relay.md` — §6 (the mirror-before-ACK durability invariant).
-- `tenancy.md` — multi-tenant model and `ns:{tenant}:` namespacing.
-- `governance.md` — AI governance and network policy (Redis egress).
-- `docs/coder-compatibility.md` — pinned Coder version and Chats API stability notes.
+- `tenancy` — multi-tenant model and `ns:{tenant}:` namespacing is covered in §3 above and `openflows-system-architecture.md` §5.4.
+- `governance` — AI governance and network policy (Redis egress) is covered in `openflows-system-architecture.md` §13.
+- `openflows-system-architecture.md` §4 — pinned Coder version and Chats API stability notes.

@@ -2,7 +2,7 @@
 
 **Document type:** Internal architecture (deep-dive)
 **Scope:** Subsystem 03 of the OpenFlows system — the ephemeral worker workspaces (FORGE, SENTINEL, VESSEL, LORE) that the Controller provisions from Coder templates.
-**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative), `openflows-controller.md` (the process that provisions them), `openflows-a2a-relay.md` (the A2A executor surface FORGE hosts), `AGENT_BOOTSTRAP.md` (SessionStart bootstrap), `docs/governance.md` (network policy), `docs/tenancy.md` (multi-tenant isolation).
+**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative; see §5.4 for multi-tenant isolation and §13 for network policy), `openflows-controller.md` (the process that provisions them), `openflows-a2a-relay.md` (the A2A executor surface FORGE hosts).
 
 ---
 
@@ -419,7 +419,7 @@ The contract has four properties:
 
 ## 8. Network & security posture
 
-Worker workspaces have **heavily restricted egress** (`docs/governance.md`):
+Worker workspaces have **heavily restricted egress** (`openflows-system-architecture.md` §13):
 
 ```
 ALLOW tcp/443 → coder-control-plane   (workspace daemon + AI Gateway)
@@ -457,9 +457,8 @@ Recovery is the Controller's job, not the workspace's: a stale heartbeat (>90s) 
 - `docs/architecture/openflows-controller.md` — the process that provisions and binds these workspaces.
 - `docs/architecture/openflows-a2a-relay.md` — the A2A executor surface FORGE hosts (`verify serve`).
 - `docs/architecture/openflows-redis-shared-store.md` — the shared Redis layer (the other writer half of §5.6, the coordination store, heartbeat keys).
-- `docs/AGENT_BOOTSTRAP.md` — the SessionStart hook bootstrap design in depth.
-- `docs/governance.md` — egress policy and audit model.
-- `docs/tenancy.md` — multi-tenant Redis namespacing.
-- `docs/extending.md` — skills, MCP, hooks, and roles extension points.
+- `docs/architecture/openflows-system-architecture.md` §13 — egress policy and audit model (governance).
+- `docs/architecture/openflows-system-architecture.md` §5.4 and `docs/architecture/openflows-redis-shared-store.md` §3 — multi-tenant isolation and Redis namespacing.
+- `docs/architecture/openflows-system-architecture.md` §10 — skills, MCP, hooks, and roles extension points.
 - `release-plz.toml` + `.github/workflows/release-assets.yml` — how the single `openflows` binary (controller + worker surface) is built and published (§3.1).
 - `crates/coder-client/templates/openflows-{forge,sentinel,vessel,lore}/main.tf` — the startup scripts that pull and install Harness A at boot.

@@ -2,7 +2,7 @@
 
 **Document type:** Internal architecture (deep-dive)
 **Scope:** Subsystem 01 of the OpenFlows system — the OpenFlows Controller.
-**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative), `openflows-control-decisions.md` (the three design choices).
+**Companion docs:** `openflows-system-architecture.md` (system-wide, authoritative; the three design choices — dynamic registry, web UI, default Coder chat agent — are decided in §3.5, §4, and §7), `openflows-worker-workspace.md` (the workspaces this Controller provisions).
 
 ---
 
@@ -445,7 +445,7 @@ A human resolves via: comment/close the GitHub issue, `openflows tenant clean` (
 
 ## 11. Control-Plane Design (from the recent decisions)
 
-The system-facing decisions in `openflows-control-decisions.md` integrate with the Controller as follows:
+The system-facing decisions documented in `openflows-system-architecture.md` (dynamic registry, web UI control plane, default Coder chat agent) integrate with the Controller as follows:
 
 ### 11.1 Dynamic agent registry (no file)
 - **Today:** the Controller loads the registry in `agentflow.rs` (from path/env) and writes `registry_json` into the store (see §4.3). `sync_registry` reconciles `worker_slots` from it every pass.
@@ -478,11 +478,8 @@ The system-facing decisions in `openflows-control-decisions.md` integrate with t
 
 ## 13. Related Documents
 
-- `openflows-system-architecture.md` — system-wide architecture (this Controller is Subsystem 01).
-- `openflows-redis-shared-store.md` — the shared Redis layer this Controller writes to (the SharedStore deep-dive).
-- `openflows-control-decisions.md` — the three design choices (dynamic registry, web UI, default Coder chat agent).
-- `docs/ORCHESTRATOR.md` — orchestrator, agents, and A2A relay detail.
-- `docs/AGENT_BOOTSTRAP.md` — SessionStart hook bootstrap and executor setup.
-- `docs/architecture/a2a-verification.md` — full A2A JSON-RPC/SSE protocol.
-- `docs/architecture/vessel-agent.md` — VESSEL deep-dive.
-- `docs/extending.md` / `docs/governance.md` / `docs/tenancy.md` — extension, governance, tenancy.
+- `openflows-system-architecture.md` — system-wide architecture (this Controller is Subsystem 01; see §7 for the orchestration cycle, §8 for the agent harness, and §10 for extension points).
+- `openflows-redis-shared-store.md` — the shared Redis layer this Controller writes to (the SharedStore deep-dive; see §3 for tenancy).
+- `openflows-worker-workspace.md` — the worker workspaces this Controller provisions (see §3 for bootstrapping).
+- `openflows-a2a-relay.md` — the full A2A JSON-RPC/SSE delegated-verification protocol this Controller hosts.
+- `openflows-system-architecture.md` §13 — security model and network policy (governance).

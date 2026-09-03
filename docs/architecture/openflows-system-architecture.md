@@ -283,7 +283,7 @@ All **durable artifacts** live in Redis, tenant-namespaced, and are written **on
 
 ### 6.3 Channel C — A2A protocol (live task exchange via a relay)
 
-The A2A channel is used **only** for live, request/response task exchange — specifically delegated verification. The full protocol is specified in `docs/architecture/a2a-verification.md`.
+The A2A channel is used **only** for live, request/response task exchange — specifically delegated verification. The full protocol is specified in `openflows-a2a-relay.md`.
 
 **Why A2A and not more Redis?** Redis expresses durable *facts*; a `verify` request is a live *task* (running, streaming, cancelling, resubscribing). A2A standardizes that lifecycle. The two are complementary, with a hard rule:
 
@@ -447,7 +447,7 @@ Rationale (recorded in full in the team findings doc):
 - **Single unified protocol** — every role is driven over one Chats API; one integration to maintain. The harness (`openflows worker`) is the role-agnostic coordination contract that sits above the engine.
 - **Security posture** — the LLM loop runs in the control plane via the AI Gateway; worker workspaces hold **no LLM keys**. A CLI agent needs an API key in the workspace, which would reintroduce a key-exfiltration surface and force a broader egress allowlist.
 - **Strategy over framework** — Coder owns and upgrades the agent loop; OpenFlows owns coordination. This preserves the core asymmetry: *Coder governs WHERE agents run, OpenFlows governs HOW agents coordinate*.
-- **Cost acknowledged** — the dependency is Coder's **Chats API stability** (marked experimental). Mitigations: all Chats API calls are isolated in the `coder-client` crate, and a verified Coder version is pinned (see `docs/coder-compatibility.md`).
+- **Cost acknowledged** — the dependency is Coder's **Chats API stability** (marked experimental). Mitigations: all Chats API calls are isolated in the `coder-client` crate, and a verified Coder version is pinned (see §4).
 
 The CLI-backend wiring that exists in the codebase (`CliBackend`, `DEFAULT_CLI`, `resolve_coder_module` — v1 fields) is treated as a **deprecated escape hatch**, not a supported default. Any future CLI-backed role must be added behind the same `SessionStart → harness` contract, with a stricter security variant (Coder-secret-injected scoped key, tighter hooks), and only as an explicit exception.
 
@@ -648,14 +648,11 @@ Entry: `ENTRYPOINT ["openflows"]`.
 
 ## 14. Related Documents
 
-- `docs/architecture/OpenFlows_Coder_Integrated_Architecture.md` — the Coder-integration design (v2).
 - `docs/architecture/openflows-controller.md` — internal architecture of the OpenFlows Controller (Subsystem 01 deep-dive).
-- `docs/ORCHESTRATOR.md` — orchestrator, agents, and A2A relay detail.
-- `docs/AGENT_BOOTSTRAP.md` — SessionStart hook bootstrap and executor setup.
-- `docs/architecture/a2a-verification.md` — full A2A JSON-RPC/SSE protocol.
+- `docs/architecture/openflows-worker-workspace.md` — worker workspaces, SessionStart bootstrap, and executor setup (Subsystem 03 deep-dive).
+- `docs/architecture/openflows-a2a-relay.md` — full A2A JSON-RPC/SSE protocol and the receiver/executor surface (Subsystem 04 deep-dive).
 - `docs/architecture/openflows-redis-shared-store.md` — the shared Redis infrastructure deep-dive (Channel B, the single source of truth).
-- `docs/extending.md` — skills, MCP, models, roles.
-- `docs/governance.md` — AI governance and network policy.
-- `docs/tenancy.md` — multi-tenant model and Redis namespacing.
+- `docs/architecture/openflows-system-architecture.md` §10 — skills, MCP, models, roles (extension points).
+- `docs/architecture/openflows-system-architecture.md` §13 — AI governance and network policy.
+- `docs/architecture/openflows-system-architecture.md` §5.4 — multi-tenant model and Redis namespacing.
 - `QUICK_START.md` — setup, startup, troubleshooting.
-- `docs/architecture/openflows-control-decisions.md` — the three latest design choices (dynamic registry, web UI control plane, default Coder chat agent) and their justifications.
