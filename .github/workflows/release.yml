@@ -2,7 +2,8 @@ name: Release
 
 # Auto-releases from Conventional Commits (see release-plz.toml).
 #
-# Runs ONLY on pushes to `main` (the default branch). Two jobs:
+# Runs ONLY on pushes to `main` (release-only; `develop` is the default branch).
+# Two jobs:
 #   - `release-plz (release-pr)` : scans Conventional Commits since the last tag,
 #     computes the next version (feat→minor, fix→patch, BREAKING CHANGE→major),
 #     and opens a `release-plz-*` PR to `main` bumping the manifest + CHANGELOG.
@@ -13,6 +14,10 @@ name: Release
 #     workflow then attaches the cross-platform binaries, all built from this one
 #     release (including `openflows-doctor` and `openflows-harness`, which are not
 #     released as separate packages).
+#
+# Release flow: only `develop` merges into `main`, which triggers `release-pr`;
+# the resulting `release-plz-*` version-bump PR merges back into `main` and
+# triggers `release`. The `release-branch.yml` guard enforces this source model.
 #
 # Publications to npm / Homebrew / Docker (GHCR) / crates.io are removed.
 
