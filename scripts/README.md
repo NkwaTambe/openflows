@@ -93,7 +93,7 @@ openflows tenant add → Coder creates nexus workspace
 Workspace starts (docker container)
     ↓
 Startup script runs:
-  → Installs openflows-harness binary
+  → Installs openflows binary
   → Sets up orchestration volume
   → Starts heartbeat daemon
   → Executes: openflows run

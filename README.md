@@ -9,7 +9,7 @@
 
 ## Why architecture-first
 
-AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/architecture/OpenFlows_Coder_Integrated_Architecture.md`](docs/architecture/OpenFlows_Coder_Integrated_Architecture.md) for the full design.
+AI can generate code against a spec, but it can't write the spec. As models make boilerplate cheap, the real difficulty shifts *up the stack* — into architectural thinking, product judgment, and security awareness. OpenFlows encodes that discipline: a declared flow graph (PocketFlow), typed SharedStore state contracts, an explicit routing table, and recovery built into every step. **Engineering goes in, software comes out.** See [`docs/architecture/openflows-system-architecture.md`](docs/architecture/openflows-system-architecture.md) for the full design.
 
 ## How It Works
 
@@ -49,7 +49,7 @@ OpenFlows is an actively developed, functioning system that already ships merged
 - End-to-end flow: GitHub issue → planning gate → FORGE implementation → SENTINEL adversarial review → VESSEL merge → merged PR.
 - Gated planning approval with audit-trailed gate records in Redis.
 - `reconcile()` failure recovery: orphan / stale worker detection, retry with backoff, and unmerged-PR resume.
-- Typed SharedStore contracts and the `openflows-harness` CLI as the only Redis client inside workspaces.
+- Typed SharedStore contracts and the `openflows worker` CLI as the only Redis client inside workspaces.
 - Multi-tenancy via per-tenant Redis keyspace prefixes and Coder RBAC.
 - Production controller deployment inside a Nexus workspace (auto-start via startup script).
 - A pluggable skill / MCP / model registry.
@@ -62,7 +62,7 @@ See [QUICK_START.md](QUICK_START.md) to run it, and the planning-gate / architec
 - **Add an MCP server**: Add it to the role's `mcp` object in `registry.json`, or register it centrally in the Coder dashboard (AI Settings → MCP Servers). Both coexist.
 - **Enable a new model**: Configure it in the Coder dashboard (AI Settings → Coder Agents → Models). Reference it in `registry.json` via the `model` field.
 
-See [`docs/extending.md`](docs/extending.md) for details.
+See [`docs/architecture/openflows-system-architecture.md` §10](docs/architecture/openflows-system-architecture.md) for details.
 
 ## Documentation
 
@@ -71,13 +71,11 @@ See [`docs/extending.md`](docs/extending.md) for details.
 | [QUICK_START.md](QUICK_START.md) | Complete setup, startup, and troubleshooting |
 | [TOKEN_GUIDE.md](TOKEN_GUIDE.md) | Token acquisition step-by-step |
 | [TESTING_QUICK_START.md](TESTING_QUICK_START.md) | Testing & debugging walkthrough |
-| [docs/coder-compatibility.md](docs/coder-compatibility.md) | Coder version compatibility and verification |
-| [docs/tenancy.md](docs/tenancy.md) | Multi-tenant model and Redis namespacing |
-| [docs/governance.md](docs/governance.md) | AI governance controls and network policy |
-| [docs/extending.md](docs/extending.md) | Adding skills, MCP servers, and models |
-| [docs/architecture/a2a-verification.md](docs/architecture/a2a-verification.md) | A2A delegated verification protocol and executor sandbox |
-| [docs/ORCHESTRATOR.md](docs/ORCHESTRATOR.md) | Nexus orchestrator, agents, and A2A relay architecture |
-| [docs/AGENT_BOOTSTRAP.md](docs/AGENT_BOOTSTRAP.md) | Session bootstrap, hook system, and executor setup |
+| [docs/architecture/openflows-system-architecture.md](docs/architecture/openflows-system-architecture.md) | Complete system architecture (authoritative) |
+| [docs/architecture/openflows-controller.md](docs/architecture/openflows-controller.md) | Controller deep-dive (Subsystem 01) |
+| [docs/architecture/openflows-worker-workspace.md](docs/architecture/openflows-worker-workspace.md) | Worker workspaces, bootstrap, and executor setup (Subsystem 03) |
+| [docs/architecture/openflows-redis-shared-store.md](docs/architecture/openflows-redis-shared-store.md) | Shared Redis store, tenancy, and namespacing |
+| [docs/architecture/openflows-a2a-relay.md](docs/architecture/openflows-a2a-relay.md) | A2A delegated verification protocol and executor sandbox (Subsystem 04) |
 
 ## License
 
