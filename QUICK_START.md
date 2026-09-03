@@ -11,7 +11,7 @@ This guide covers everything you need to get OpenFlows running on a fresh machin
 ## Prerequisites
 
 - **Docker 24+** — runs Redis, the Coder database, and Coder itself.
-- **Rust 1.70+** — builds the `openflows` and `openflows-harness` binaries during bootstrap.
+- **Rust 1.70+** — builds the `openflows` binary during bootstrap.
 - **Node 18+** — for the GitHub MCP tooling used by agents.
 - **The `coder` CLI** on your `PATH` — `prod.sh bootstrap` shells out to `coder templates push`. Install it if missing:
   ```bash
@@ -93,7 +93,7 @@ Run this from the **project root** to initialize Coder with the templates and co
 
 **What this does and why each step matters:**
 
-1. **Build and sync dev binaries** — compiles the `openflows` controller and `openflows-harness` worker binary in release mode, then copies both to `.dev-binaries/`. This directory is mounted into Coder workspaces so they have the latest version of the tools.
+1. **Build and sync dev binaries** — compiles the `openflows` binary in release mode, then copies it to `.dev-binaries/`. This directory is mounted into Coder workspaces so they have the latest version of the tool.
 2. **Create the admin user in Coder** — creates the initial admin account using the credentials from `.env` (see Step 4 for defaults).
 3. **Push workspace templates** — deploys the `nexus`, `forge`, `sentinel`, `vessel`, and `lore` templates to Coder. These templates define the workspaces that each AI agent will run in.
 4. **Verify LLM/GitHub auth** — checks that a GitHub token is present and that at least one LLM model is configured in Coder's AI settings.

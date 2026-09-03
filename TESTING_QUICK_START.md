@@ -122,8 +122,8 @@ To test: Check that the harness is installed and wired into Claude settings.
 
 ```bash
 # Inside the workspace:
-which openflows-harness     # Should exist
-openflows-harness --help    # Should show commands
+which openflows         # Should exist
+openflows --help        # Should show commands
 
 # Check hooks are installed
 ls -la ~/.openflows/hooks/
@@ -180,8 +180,8 @@ Worker returns to Idle → Next issue is picked up → Human fixes T-001 separat
 ### Heartbeat not appearing
 - Harness may have failed to install or start
 - Check workspace logs: `coder ssh <workspace> -- cat /tmp/startup.log`
-- Verify: `coder ssh <workspace> -- which openflows-harness`
-- If missing: manually run `openflows-harness heartbeat start`
+- Verify: `coder ssh <workspace> -- which openflows`
+- If missing: manually run `openflows worker heartbeat start`
 
 ### Hooks not firing
 - Check settings.json was generated:

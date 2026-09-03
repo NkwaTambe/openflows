@@ -49,7 +49,7 @@ OpenFlows is an actively developed, functioning system that already ships merged
 - End-to-end flow: GitHub issue → planning gate → FORGE implementation → SENTINEL adversarial review → VESSEL merge → merged PR.
 - Gated planning approval with audit-trailed gate records in Redis.
 - `reconcile()` failure recovery: orphan / stale worker detection, retry with backoff, and unmerged-PR resume.
-- Typed SharedStore contracts and the `openflows-harness` CLI as the only Redis client inside workspaces.
+- Typed SharedStore contracts and the `openflows worker` CLI as the only Redis client inside workspaces.
 - Multi-tenancy via per-tenant Redis keyspace prefixes and Coder RBAC.
 - Production controller deployment inside a Nexus workspace (auto-start via startup script).
 - A pluggable skill / MCP / model registry.
