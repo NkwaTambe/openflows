@@ -94,7 +94,7 @@ pub async fn run_checks() -> Result<()> {
         }
     }
 
-    // 4. GitHub external auth configured (optional — only needed for private repos)
+    // 4. GitHub external auth configured (needed for agent authentication)
     let has_github_auth = std::env::var("CODER_EXTERNAL_AUTH_0_ID").is_ok()
         && std::env::var("CODER_EXTERNAL_AUTH_0_SECRET").is_ok();
     if has_github_auth {

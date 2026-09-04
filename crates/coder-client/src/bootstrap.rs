@@ -552,9 +552,9 @@ impl CoderBootstrapper {
     }
 
     /// Verify that GitHub external auth is configured on the Coder server.
-    /// Optional — only needed for agents pushing to private repos.
+    ///  needed for agents authentication
     pub fn verify_external_auth_configured() -> Result<()> {
-        info!("  ✓ GitHub external auth: optional — configure in the Coder dashboard if agents push to private repos");
+        info!("  ✓ GitHub external auth configure in the Coder dashboard if agents authentication");
         Ok(())
     }
 
