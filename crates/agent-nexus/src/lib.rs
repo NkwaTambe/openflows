@@ -743,7 +743,12 @@ Before significant work, read the relevant skill file to understand the workflow
         let coder_url: Option<String> = store
             .get_typed("coder_url")
             .await
-            .or_else(|| std::env::var("CODER_URL").ok());
+            .or_else(|| {
+                std::env::var("CODER_URL")
+                    .ok()
+                    .filter(|u| !u.trim().is_empty())
+            })
+            .or_else(|| Some("http://localhost:7080".to_string()));
         let coder_token: Option<String> = std::env::var("CODER_SESSION_TOKEN")
             .ok()
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
