@@ -19,13 +19,18 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 
 ## Step 1 — Start Docker
 
-First, stop any existing containers already using OpenFlows' ports (6379 for Redis, 7080 for Coder) so there's no port conflict:
+First, make sure ports 6379 (Redis) and 7080 (Coder) are free so there's no conflict. If you ran OpenFlows before, cleanly stop this project's containers:
 
 ```bash
-docker rm -f $(docker ps -aq --filter "publish=6379" --filter "publish=7080") 2>/dev/null; true
+docker compose down
 ```
 
-> **Note:** the `2>/dev/null; true` just suppresses the harmless "no matching containers" error when nothing is running. If a specific container is holding a port (e.g. `streamr-redis` on 6379), remove it by name: `docker rm -f <container>`.
+If another, unrelated container is already holding one of those ports (e.g. a `streamr-redis` on 6379), find it and remove only that one by name:
+
+```bash
+docker ps --filter "publish=6379" --filter "publish=7080"
+docker rm -f <conflicting-container-name>
+```
 
 Then bring up Redis, the Coder database, and the Coder server:
 

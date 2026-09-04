@@ -224,7 +224,7 @@ case "$CMD" in
             echo "Open issues in ${GITHUB_REPOSITORY}:"
             ISSUE_COUNT=$(curl -s "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
                 -H "Authorization: token ${GITHUB_TOKEN:-}" \
-                -H "Accept: application/vnd.github.v3+json" | jq 'if type == "array" then length else 0 end' 2>/dev/null || echo "0")
+                -H "Accept: application/vnd.github.v3+json" | jq 'if type == "array" then ([.[] | select(.pull_request == null)] | length) else 0 end' 2>/dev/null || echo "0")
             echo "  • $ISSUE_COUNT open issues will be synced as tickets"
             echo "  • Each ticket will provision a forge workspace agent when started"
             echo ""
