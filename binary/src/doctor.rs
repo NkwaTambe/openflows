@@ -15,10 +15,13 @@ pub async fn run_checks() -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
-    let mut pinned = config::CoderConfig::init_from_env()?.image_tag;
-    if !pinned.starts_with('v') {
-        pinned = format!("v{pinned}");
-    }
+    let pinned = config::CoderConfig::init_from_env()?.image_tag;
+    let semver = is_semver_tag(&pinned);
+    let pinned = match &pinned[..] {
+        _ if !semver => pinned,
+        t if t.starts_with('v') => t.to_string(),
+        t => format!("v{t}"),
+    };
     match client
         .get(format!(
             "{}/api/v2/buildinfo",
@@ -34,7 +37,7 @@ pub async fn run_checks() -> Result<()> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             println!("  ✓ Coder server reachable at {}", coder_url);
-            if !version.is_empty() && version != pinned {
+            if semver && !version.is_empty() && version != pinned {
                 println!(
                     "  ⚠ Coder reports {} but the pinned tag is {} — models/chat may drift",
                     version, pinned
@@ -42,6 +45,15 @@ pub async fn run_checks() -> Result<()> {
                 println!(
                     "    Fix: Set CODER_IMAGE_TAG={} in docker-compose (or match the running image)",
                     pinned
+                );
+            } else if !semver {
+                println!(
+                    "  ℹ Running Coder {}",
+                    if version.is_empty() {
+                        "(unknown)"
+                    } else {
+                        version
+                    }
                 );
             }
         }
@@ -188,4 +200,17 @@ async fn resolve_default_org_id(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
         .filter(|s| !s.is_empty())
+}
+
+/// Return true when `tag` looks like a semantic version (e.g. `v2.37.0` or
+/// `2.37.0`). Floating tags such as `latest` or branch names return false so
+/// they are never coerced into an invalid `vlatest` and never compared exactly.
+fn is_semver_tag(tag: &str) -> bool {
+    let t = tag.strip_prefix('v').unwrap_or(tag);
+    let bytes = t.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > 0 && i < bytes.len() && bytes[i] == b'.'
 }
