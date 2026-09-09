@@ -63,7 +63,7 @@ pub struct CoderClient {
     cached_username: Arc<RwLock<Option<String>>>,
 }
 
-/// Parse the JSON body returned by `GET /api/experimental/chats/models`.
+/// Parse the JSON body returned by `GET /api/v2/organizations/{org}/chats/models`.
 ///
 /// Coder nests models under a top-level `providers` array:
 /// `{"providers":[{"provider":"openai-compat","models":[
@@ -1227,13 +1227,13 @@ impl CoderClient {
     }
 
     /// Create a new Chat session bound to a workspace.
-    /// POST /api/experimental/chats
+    /// POST /api/v2/chats
     pub async fn create_chat(
         &self,
         req: &crate::types::CreateChatRequest,
     ) -> Result<crate::types::Chat> {
         let resp = self
-            .authenticated_request(reqwest::Method::POST, "/api/experimental/chats")
+            .authenticated_request(reqwest::Method::POST, "/api/v2/chats")
             .json(req)
             .send()
             .await
@@ -1251,7 +1251,7 @@ impl CoderClient {
     }
 
     /// Get a Chat by ID.
-    /// GET /api/experimental/chats/{chat}
+    /// GET /api/v2/chats/{chat}
     ///
     /// Returns `Err` for transient failures (timeouts, rate limits, 5xx,
     /// network errors). Callers that need to distinguish "the chat no longer
@@ -1262,10 +1262,7 @@ impl CoderClient {
     /// [`get_chat_opt`]: CoderClient::get_chat_opt
     pub async fn get_chat(&self, chat_id: &str) -> Result<crate::types::Chat> {
         let resp = self
-            .authenticated_request(
-                reqwest::Method::GET,
-                &format!("/api/experimental/chats/{}", chat_id),
-            )
+            .authenticated_request(reqwest::Method::GET, &format!("/api/v2/chats/{}", chat_id))
             .send()
             .await
             .context("Failed to get chat")?;
@@ -1289,10 +1286,7 @@ impl CoderClient {
     /// [`get_chat`]: CoderClient::get_chat
     pub async fn get_chat_opt(&self, chat_id: &str) -> Result<Option<crate::types::Chat>> {
         let resp = self
-            .authenticated_request(
-                reqwest::Method::GET,
-                &format!("/api/experimental/chats/{}", chat_id),
-            )
+            .authenticated_request(reqwest::Method::GET, &format!("/api/v2/chats/{}", chat_id))
             .send()
             .await
             .context("Failed to get chat")?;
@@ -1309,10 +1303,10 @@ impl CoderClient {
     }
 
     /// List all Chats for the current user.
-    /// GET /api/experimental/chats
+    /// GET /api/v2/chats
     pub async fn list_chats(&self) -> Result<Vec<crate::types::Chat>> {
         let resp = self
-            .authenticated_request(reqwest::Method::GET, "/api/experimental/chats")
+            .authenticated_request(reqwest::Method::GET, "/api/v2/chats")
             .send()
             .await
             .context("Failed to list chats")?;
@@ -1337,7 +1331,7 @@ impl CoderClient {
     }
 
     /// Send a message to an existing Chat.
-    /// POST /api/experimental/chats/{chat_id}/messages
+    /// POST /api/v2/chats/{chat_id}/messages
     pub async fn send_chat_message(
         &self,
         chat_id: &str,
@@ -1346,7 +1340,7 @@ impl CoderClient {
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
-                &format!("/api/experimental/chats/{}/messages", chat_id),
+                &format!("/api/v2/chats/{}/messages", chat_id),
             )
             .json(&serde_json::json!({
                 "content": content,
@@ -1367,7 +1361,7 @@ impl CoderClient {
     }
 
     /// Get recent messages from a Chat.
-    /// GET /api/experimental/chats/{chat_id}/messages?after_id={id}&limit={n}
+    /// GET /api/v2/chats/{chat_id}/messages?after_id={id}&limit={n}
     pub async fn get_chat_messages(
         &self,
         chat_id: &str,
@@ -1376,10 +1370,7 @@ impl CoderClient {
         let resp = self
             .authenticated_request(
                 reqwest::Method::GET,
-                &format!(
-                    "/api/experimental/chats/{}/messages?limit={}",
-                    chat_id, limit
-                ),
+                &format!("/api/v2/chats/{}/messages?limit={}", chat_id, limit),
             )
             .send()
             .await
@@ -1405,12 +1396,12 @@ impl CoderClient {
     }
 
     /// Archive a Chat (soft delete).
-    /// PATCH /api/experimental/chats/{chat_id}
+    /// PATCH /api/v2/chats/{chat_id}
     pub async fn archive_chat(&self, chat_id: &str) -> Result<()> {
         let resp = self
             .authenticated_request(
                 reqwest::Method::PATCH,
-                &format!("/api/experimental/chats/{}", chat_id),
+                &format!("/api/v2/chats/{}", chat_id),
             )
             .json(&serde_json::json!({ "archived": true }))
             .send()
@@ -1428,12 +1419,12 @@ impl CoderClient {
     }
 
     /// Interrupt a running Chat.
-    /// POST /api/experimental/chats/{chat_id}/interrupt
+    /// POST /api/v2/chats/{chat_id}/interrupt
     pub async fn interrupt_chat(&self, chat_id: &str) -> Result<()> {
         let resp = self
             .authenticated_request(
                 reqwest::Method::POST,
-                &format!("/api/experimental/chats/{}/interrupt", chat_id),
+                &format!("/api/v2/chats/{}/interrupt", chat_id),
             )
             .send()
             .await
@@ -1450,7 +1441,10 @@ impl CoderClient {
     }
 
     /// List available models for chats.
-    /// GET /api/experimental/chats/models
+    /// GET /api/v2/organizations/{organization}/chats/models
+    ///
+    /// Models are organization-scoped in Coder v2.37+; the default organization
+    /// is resolved via [`CoderClient::get_default_organization_id`].
     ///
     /// Uses an internal cache (5-minute TTL) to reduce API calls.
     /// Call `invalidate_cache()` to force a refresh.
@@ -1465,9 +1459,15 @@ impl CoderClient {
             }
         }
 
+        // Models are organization-scoped in Coder v2.37+.
+        let organization_id = self.get_default_organization_id().await?;
+
         // Fetch from API
         let resp = self
-            .authenticated_request(reqwest::Method::GET, "/api/experimental/chats/models")
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/chats/models", organization_id),
+            )
             .send()
             .await
             .context("Failed to list chat models")?;
@@ -1489,11 +1489,17 @@ impl CoderClient {
     }
 
     /// List available models for chats without caching.
-    /// GET /api/experimental/chats/models
+    /// GET /api/v2/organizations/{organization}/chats/models
     #[cfg(not(feature = "chats-api"))]
     pub async fn list_chat_models(&self) -> Result<Vec<crate::types::ModelInfo>> {
+        // Models are organization-scoped in Coder v2.37+.
+        let organization_id = self.get_default_organization_id().await?;
+
         let resp = self
-            .authenticated_request(reqwest::Method::GET, "/api/experimental/chats/models")
+            .authenticated_request(
+                reqwest::Method::GET,
+                &format!("/api/v2/organizations/{}/chats/models", organization_id),
+            )
             .send()
             .await
             .context("Failed to list chat models")?;
@@ -1562,17 +1568,12 @@ impl CoderClient {
         self.wait_for_workspace_ssh(&workspace.id, std::time::Duration::from_secs(120))
             .await?;
 
-        // Resolve the default organization ID required by the Coder chats API.
-        let organization_id = match self.get_default_organization_id().await {
-            Ok(id) => Some(id),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "Failed to resolve default organization ID; chat creation may fail"
-                );
-                None
-            }
-        };
+        // Resolve the default organization ID. In the Coder v2 GA Chats API the
+        // organization_id is REQUIRED — the caller must be a member of the org the
+        // chat belongs to. A failure to resolve it is fatal, not a soft warning.
+        let organization_id = self.get_default_organization_id().await.context(
+            "Failed to resolve default organization ID (required by the Coder v2 Chats API)",
+        )?;
 
         // Let Coder use the workspace's default model.
         // model_config_id expects a UUID, not a model name, so we pass None.
@@ -1584,7 +1585,7 @@ impl CoderClient {
             .to_string();
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
         let chat_req = CreateChatRequest {
-            organization_id,
+            organization_id: Some(organization_id),
             workspace_id: workspace.id.clone(),
             model_config_id,
             content: vec![ChatInputPart::text(prompt)],
