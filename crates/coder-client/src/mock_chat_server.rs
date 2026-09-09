@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -105,19 +105,10 @@ impl MockChatServer {
                     tokio::spawn(async move {
                         // Echo the requested subprotocol so the client's
                         // `Sec-WebSocket-Protocol: chat-stream-v1` handshake
-                        // succeeds (the real Coder server negotiates it too).
-                        if let Ok(ws_stream) = tokio_tungstenite::accept_hdr_async(
-                            stream,
-                            |_req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                             mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-                                resp.headers_mut().insert(
-                                    "Sec-WebSocket-Protocol",
-                                    "chat-stream-v1".parse().expect("valid static header value"),
-                                );
-                                Ok(resp)
-                            },
-                        )
-                        .await
+                        // succeeds (the real Coder server negotiates it too),
+                        // and reject connections to any non-stream route so the
+                        // mock independently verifies the client's target URL.
+                        if let Ok(ws_stream) = accept_v2_stream_handshake(stream).await
                         {
                             let (mut _ws_sink, _ws_stream) = ws_stream.split();
 
@@ -156,6 +147,51 @@ impl MockChatServer {
             }
         }
     }
+}
+
+/// Accept a WebSocket connection for the mock chat server, but only when the
+/// client is connecting to the Coder v2 chat stream route
+/// `/api/v2/chats/{chat_id}/stream`. Any other URI is rejected so the mock
+/// independently verifies the client's target endpoint rather than accepting
+/// every path.
+///
+/// The handshake callback's `Err` variant is inherently large (tungstenite's
+/// `Error` type), so `result_large_err` is suppressed here.
+#[allow(clippy::result_large_err)]
+async fn accept_v2_stream_handshake(
+    stream: TcpStream,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<TcpStream>,
+    tokio_tungstenite::tungstenite::error::Error,
+> {
+    tokio_tungstenite::accept_hdr_async(
+        stream,
+        |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+         mut resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let path = req.uri().path();
+            let is_v2_stream = path.starts_with("/api/v2/chats/") && path.ends_with("/stream");
+            if !is_v2_stream {
+                warn!(
+                    uri = %req.uri(),
+                    "Mock chat server: rejecting handshake for non-v2-stream path"
+                );
+                let err_resp: tokio_tungstenite::tungstenite::handshake::server::ErrorResponse =
+                    tokio_tungstenite::tungstenite::http::Response::builder()
+                        .status(tokio_tungstenite::tungstenite::http::StatusCode::NOT_FOUND)
+                        .body(None)
+                        .expect("valid static error response");
+                return Err(err_resp);
+            }
+
+            // Echo the negotiated subprotocol so the client's handshake succeeds.
+            resp.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                "chat-stream-v1".parse().expect("valid static header value"),
+            );
+            Ok(resp)
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
