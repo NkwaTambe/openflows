@@ -15,6 +15,10 @@ pub async fn run_checks() -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
+    let mut pinned = config::CoderConfig::init_from_env()?.image_tag;
+    if !pinned.starts_with('v') {
+        pinned = format!("v{pinned}");
+    }
     match client
         .get(format!(
             "{}/api/v2/buildinfo",
@@ -24,7 +28,22 @@ pub async fn run_checks() -> Result<()> {
         .await
     {
         Ok(resp) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let version = body
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
             println!("  ✓ Coder server reachable at {}", coder_url);
+            if !version.is_empty() && version != pinned {
+                println!(
+                    "  ⚠ Coder reports {} but the pinned tag is {} — models/chat may drift",
+                    version, pinned
+                );
+                println!(
+                    "    Fix: Set CODER_IMAGE_TAG={} in docker-compose (or match the running image)",
+                    pinned
+                );
+            }
         }
         Ok(resp) => {
             println!(
