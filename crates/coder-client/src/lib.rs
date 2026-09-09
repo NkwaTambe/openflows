@@ -1547,6 +1547,15 @@ impl CoderClient {
         let repo_url = format!("https://github.com/{}.git", repository);
         let template_name = format!("openflows-{}", role);
 
+        // Resolve the default organization ID BEFORE provisioning the workspace.
+        // In the Coder v2 GA Chats API the organization_id is REQUIRED — the caller
+        // must be a member of the org the chat belongs to. Failing fast here avoids
+        // consuming workspace resources (create/start/await) when the org cannot be
+        // resolved, since the chat could never be created without it.
+        let organization_id = self.get_default_organization_id().await.context(
+            "Failed to resolve default organization ID (required by the Coder v2 Chats API)",
+        )?;
+
         // Create (or find existing) workspace
         info!(
             workspace_name,
@@ -1567,13 +1576,6 @@ impl CoderClient {
 
         self.wait_for_workspace_ssh(&workspace.id, std::time::Duration::from_secs(120))
             .await?;
-
-        // Resolve the default organization ID. In the Coder v2 GA Chats API the
-        // organization_id is REQUIRED — the caller must be a member of the org the
-        // chat belongs to. A failure to resolve it is fatal, not a soft warning.
-        let organization_id = self.get_default_organization_id().await.context(
-            "Failed to resolve default organization ID (required by the Coder v2 Chats API)",
-        )?;
 
         // Let Coder use the workspace's default model.
         // model_config_id expects a UUID, not a model name, so we pass None.

@@ -104,12 +104,12 @@ impl ChatStream {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
         let ws_url = if coder_url.starts_with("ws") {
-            format!("{}/api/v2/chats/{}/events", coder_url, chat_id)
+            format!("{}/api/v2/chats/{}/stream", coder_url, chat_id)
         } else {
             coder_url
                 .replace("http://", "ws://")
                 .replace("https://", "wss://")
-                + &format!("/api/v2/chats/{}/events", chat_id)
+                + &format!("/api/v2/chats/{}/stream", chat_id)
         };
 
         debug!(url = %ws_url, chat_id, "Connecting to chat WebSocket stream");

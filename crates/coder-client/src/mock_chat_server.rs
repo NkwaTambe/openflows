@@ -1,7 +1,7 @@
 // crates/coder-client/src/mock_chat_server.rs
 //! Mock WebSocket chat server for testing the ChatStream implementation.
 //!
-//! Provides a lightweight server that mimics Coder's `/api/v2/chats/{id}/events`
+//! Provides a lightweight server that mimics Coder's `/api/v2/chats/{id}/stream`
 //! WebSocket endpoint, emitting predetermined events for testing.
 
 use futures_util::{SinkExt, StreamExt};
