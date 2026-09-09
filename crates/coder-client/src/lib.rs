@@ -1724,6 +1724,160 @@ fn canonicalize_host_path(p: &str) -> String {
 }
 
 #[cfg(test)]
+mod http_mock {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex;
+
+    /// A minimal in-process HTTP/1.1 server for exercising the Coder client
+    /// against mocked `/api/v2` routes without a real Coder deployment.
+    pub struct HttpMock {
+        addr: SocketAddr,
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        handle: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct RecordedRequest {
+        pub method: String,
+        pub path: String,
+        pub body: String,
+    }
+
+    impl HttpMock {
+        pub async fn new() -> anyhow::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let handle = tokio::spawn(Self::run(listener, Arc::clone(&requests)));
+            Ok(Self {
+                addr,
+                requests,
+                handle: Some(handle),
+            })
+        }
+
+        pub fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        pub async fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests.lock().await.clone()
+        }
+
+        pub async fn shutdown(self) {
+            if let Some(handle) = self.handle {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+
+        async fn run(listener: TcpListener, requests: Arc<Mutex<Vec<RecordedRequest>>>) {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = Arc::clone(&requests);
+                tokio::spawn(async move {
+                    let _ = Self::handle_conn(stream, requests).await;
+                });
+            }
+        }
+
+        async fn handle_conn(
+            mut stream: TcpStream,
+            requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        ) -> std::io::Result<()> {
+            let mut buf: Vec<u8> = Vec::with_capacity(4096);
+            loop {
+                // Read until a full header terminator is in the buffer.
+                let header_end = loop {
+                    if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    let mut chunk = [0u8; 512];
+                    let n = stream.read(&mut chunk).await?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                };
+
+                let head = String::from_utf8_lossy(&buf[..header_end]);
+                let mut lines = head.lines();
+                let mut req_parts = lines.next().unwrap_or("").split_whitespace();
+                let method = req_parts.next().unwrap_or("").to_string();
+                let path = req_parts.next().unwrap_or("").to_string();
+                let mut content_length = 0usize;
+                for line in lines {
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+
+                while buf.len() < header_end + content_length {
+                    let mut chunk = [0u8; 512];
+                    let n = stream.read(&mut chunk).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF while reading body",
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+
+                let body = String::from_utf8_lossy(&buf[header_end..header_end + content_length])
+                    .to_string();
+                requests.lock().await.push(RecordedRequest {
+                    method: method.clone(),
+                    path: path.clone(),
+                    body,
+                });
+
+                let (status, content) = route(&method, &path);
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                    status,
+                    content.len(),
+                    content
+                );
+                stream.write_all(response.as_bytes()).await?;
+                stream.flush().await?;
+
+                buf.drain(..header_end + content_length);
+            }
+        }
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    fn route(method: &str, path: &str) -> (&'static str, String) {
+        match (method, path) {
+            ("GET", "/api/v2/organizations") => (
+                "200 OK",
+                r#"[{"id":"org-abc","name":"default","is_default":true}]"#.to_string(),
+            ),
+            ("GET", "/api/v2/organizations/org-abc/chats/models") => (
+                "200 OK",
+                r#"{"providers":[{"provider":"openai-compat","available":true,"models":[{"id":"openai-compat:reviewer-pro","provider":"openai-compat","model":"reviewer-pro","display_name":"Reviewer Pro"}]}]}"#
+                    .to_string(),
+            ),
+            ("POST", "/api/v2/chats") => (
+                "201 Created",
+                r#"{"id":"chat-1","organization_id":"org-abc"}"#.to_string(),
+            ),
+            _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::parse_chat_models_body;
 
@@ -1803,5 +1957,74 @@ mod tests {
         let models = parse_chat_models_body(&body);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "x");
+    }
+
+    #[tokio::test]
+    async fn list_chat_models_resolves_default_org_and_hits_org_scoped_path() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+
+        let models = client
+            .list_chat_models()
+            .await
+            .expect("list_chat_models should succeed against mock");
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "reviewer-pro");
+        assert_eq!(models[0].provider, "openai-compat");
+
+        let requests = server.requests().await;
+        let orgs_hit = requests
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/api/v2/organizations");
+        assert!(
+            orgs_hit,
+            "expected org resolution to hit /api/v2/organizations"
+        );
+        let models_hit = requests
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/api/v2/organizations/org-abc/chats/models");
+        assert!(
+            models_hit,
+            "expected models fetch to hit /api/v2/organizations/'{{org}}'/chats/models"
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_chat_sends_required_non_empty_organization_id() {
+        use crate::types::CreateChatRequest;
+
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+
+        let req = CreateChatRequest {
+            organization_id: Some("org-abc".to_string()),
+            workspace_id: "ws-1".to_string(),
+            model_config_id: None,
+            content: vec![crate::types::ChatInputPart::text("hello")],
+            labels: None,
+        };
+        let chat = client
+            .create_chat(&req)
+            .await
+            .expect("create_chat should succeed against mock");
+        assert_eq!(chat.id, "chat-1");
+
+        let requests = server.requests().await;
+        let create = requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v2/chats")
+            .expect("expected a POST /api/v2/chats request");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&create.body).expect("recorded body should be valid JSON");
+        let org_id = body
+            .get("organization_id")
+            .and_then(|v| v.as_str())
+            .expect("organization_id must be present and a string");
+        assert!(!org_id.is_empty(), "organization_id must not be empty");
+        assert_eq!(org_id, "org-abc");
+        server.shutdown().await;
     }
 }
