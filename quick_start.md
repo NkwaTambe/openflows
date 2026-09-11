@@ -40,10 +40,10 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 
 OpenFlows agents authenticate to your GitHub repositories (including private repos) through a **GitHub App** using GitHub OIDC / Coder external auth. Creating the app is free.
 
-1. On GitHub, go to **Settings → Developer settings → GitHub Apps → New GitHub App**.
+1. On GitHub, create a new GitHub App.
 2. Fill in:
    - **GitHub App name** — this becomes your app's URL slug (e.g. `my-openflows-app`).
-   - **Homepage URL** — any URL you own.
+   - **Homepage URL** — GitHub requires a value here, but it's not used for a local setup. Put any URL you own, e.g. your repo page or `http://localhost:7080`.
    - **Callback URL** — exactly:
      ```
      http://localhost:7080/external-auth/primary-github/callback
