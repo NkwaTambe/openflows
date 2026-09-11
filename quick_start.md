@@ -76,7 +76,7 @@ Fill in the required values:
 | `GITHUB_REPOSITORY` | The repo the controller watches, as `owner/repo`. |
 | `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
 
-Then uncomment the GitHub external auth block in `.env` and set the three values from [Step 1](#step-1--create-a-github-app):
+Then set the three GitHub external auth values in `.env` from [Step 1](#step-1--create-a-github-app):
 
 ```bash
 CODER_EXTERNAL_AUTH_0_ID=primary-github
