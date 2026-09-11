@@ -120,6 +120,8 @@ docker compose ps
 
 Open **http://localhost:7080** and sign in with your GitHub account (Coder's device flow).
 
+To confirm the GitHub App was set up correctly, open **http://localhost:7080/deployment/external-auth** — you should see a row with **ID `primary-github`** (with its Client ID and Match). If the row is missing, the external auth vars weren't picked up; see the troubleshooting note below.
+
 ---
 
 ## Step 5 — Get your Coder session token
