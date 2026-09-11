@@ -44,7 +44,7 @@ OpenFlows agents authenticate to your GitHub repositories (including private rep
 2. Fill in:
    - **GitHub App name** — this becomes your app's URL slug (e.g. `my-openflows-app`).
    - **Homepage URL** — GitHub requires a value here, but it's not used for a local setup. Put any URL you own, e.g. your repo page or `http://localhost:7080`.
-   - **Callback URL** — exactly:
+   - **Redirect URI** (under "Identifying and authorizing users") — this is the callback Coder expects. Enter exactly:
      ```
      http://localhost:7080/external-auth/primary-github/callback
      ```
