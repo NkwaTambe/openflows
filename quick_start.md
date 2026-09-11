@@ -54,11 +54,7 @@ OpenFlows agents authenticate to your GitHub repositories (including private rep
 3. Click **Create GitHub App**.
 4. On the app's page, copy the **Client ID** (top of the page).
 5. In the **Client secrets** section, click **Generate a new client secret** and copy it now — it is shown only once.
-6. Your **Install URL** is:
-   ```
-   https://github.com/apps/<your-app-slug>/installations/new
-   ```
-   The `<your-app-slug>` is just your app **name as it appears in the URL** (lowercased, spaces become hyphens). E.g. an app named `my-openflows-app` → slug `my-openflows-app`. After creating the app, GitHub opens its page at `https://github.com/apps/<your-slug>` — the slug is the last part of that URL. This install URL is how you (and your agents) install the app on your org/repos.
+6. Your **Install URL** is `https://github.com/apps/my-openflows-app/installations/new` (replace `my-openflows-app` with your app name). This is how you (and your agents) install the app on your org/repos.
 
 Keep the Client ID, Client Secret, and Install URL — you'll need all three in the next step.
 
