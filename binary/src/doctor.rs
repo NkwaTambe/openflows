@@ -149,7 +149,9 @@ pub async fn run_checks() -> Result<()> {
             "  ⚠ GitHub external auth not configured — optional, only needed for private repos"
         );
         println!("    If agents must push to private repos, create a GitHub App and set");
-        println!("         CODER_EXTERNAL_AUTH_0_ID and CODER_EXTERNAL_AUTH_0_CLIENT_SECRET in .env");
+        println!(
+            "         CODER_EXTERNAL_AUTH_0_ID and CODER_EXTERNAL_AUTH_0_CLIENT_SECRET in .env"
+        );
     }
 
     // 5. Redis reachable
