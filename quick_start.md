@@ -49,12 +49,22 @@ OpenFlows agents authenticate to your GitHub repositories (including private rep
      http://localhost:7080/external-auth/primary-github/callback
      ```
    - **Webhook** — can be left **Active: false** (blank).
-   - **Permissions → Repository permissions → Contents** — set to **Read and write** (needed to clone/push private repos).
+   - **Permissions → Repository permissions**, set all of these to **Read and write** (agents clone/push code, open PRs, and push CI/CD workflow files):
+     | Permission | Why |
+     |------------|-----|
+     | **Contents** | Clone/push repo code (required for private repos). |
+     | **Pull requests** | Open/update PRs via the API. |
+     | **Workflows** | Push/create `.github/workflows/` files (e.g. the "set up CI" ticket type). |
+     | **Metadata** | Read-only — auto-required by GitHub for repo access. |
    - **Where can this GitHub App be installed?** — choose **Any account** (or limit to specific orgs).
 3. Click **Create GitHub App**.
 4. On the app's page, copy the **Client ID** (top of the page).
 5. In the **Client secrets** section, click **Generate a new client secret** and copy it now — it is shown only once.
 6. Your **Install URL** is `https://github.com/apps/my-openflows-app/installations/new` (replace `my-openflows-app` with your app name). This is how you (and your agents) install the app on your org/repos.
+
+> **If you add permissions *after* installing the app:** editing the app's developer-settings permissions only *requests* the new permission — you must then **approve/update the installation** at `https://github.com/settings/installations` (open your app's installation and click **Approve/Update**), then get a **fresh token** (restart the workspace). Changing an app's permissions does **not** update already-issued tokens. The most common blockers:
+> - *"refusing to allow a GitHub App to create or update workflow … without workflows permission"* → grant **Workflows** (≠ **Actions**) and approve the installation.
+> - *"Resource not accessible by integration"* when creating a PR → grant **Pull requests** (read/write) and approve the installation.
 
 Keep the Client ID, Client Secret, and Install URL — you'll need all three in the next step.
 
@@ -292,6 +302,14 @@ docker compose restart coder
 ```
 
 Then verify the provider at **http://localhost:7080/external-auth** (or the admin external-auth page).
+
+### Agents can't push `.github/workflows/` files ("without workflows permission")
+
+Grant the GitHub App **Workflows → Read and write** (this is a *different* permission from **Actions**), then **approve/update the installation** and get a fresh token — see the note in [Step 1](#step-1--create-a-github-app).
+
+### Agents can't create a PR ("Resource not accessible by integration")
+
+Grant the GitHub App **Pull requests → Read and write**, then **approve/update the installation** and get a fresh token — see the note in [Step 1](#step-1--create-a-github-app).
 
 ### Controller not picking up issues
 
