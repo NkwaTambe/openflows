@@ -122,6 +122,19 @@ Open **http://localhost:7080** and sign in with your GitHub account (Coder's dev
 
 To confirm the GitHub App was set up correctly, open **http://localhost:7080/deployment/external-auth** — you should see a row with **ID `primary-github`** (with its Client ID and Match). If the row is missing, the external auth vars weren't picked up; see the troubleshooting note below.
 
+### Link the GitHub App (required for private repos)
+
+Signing in is **not** enough. You must also **link** the GitHub App so Coder can hand your agents a token to clone/push your repos (including private ones):
+
+1. Make sure you are logged into the Coder dashboard **as the account that owns the workspaces** — the one whose session token you put in `CODER_SESSION_TOKEN` (bootstrap creates the control-plane workspace under this account).
+2. Visit:
+   ```
+   http://localhost:7080/external-auth/primary-github
+   ```
+3. On GitHub, click **Authorize**. You'll be redirected back to Coder once linked.
+
+> **Why this is required:** the `CODER_EXTERNAL_AUTH_0_*` vars only *configure* the provider. The actual grant happens when you complete this link — until then Coder has no token to give your agents. If you skip it, bootstrap later fails with `403 External authentication is required to create a workspace with this template`; see [Troubleshooting](#troubleshooting).
+
 ---
 
 ## Step 5 — Get your Coder session token
@@ -285,6 +298,20 @@ Then verify the provider at **http://localhost:7080/external-auth** (or the admi
 1. Confirm a tenant is bound (`./scripts/prod.sh tenant <owner/repo> --name <my-team>`).
 2. Watch the controller's foreground terminal for errors.
 3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
+
+### `403 External authentication is required to create a workspace with this template`
+
+Coder refuses to build a workspace until the owning account links the GitHub App (the templates now declare `data "coder_external_auth"`). Fix it by completing the link in [Step 4](#step-4--sign-in-with-github) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, re-run bootstrap.
+
+### Agents can't clone/push the private repo
+
+Even with the provider configured, git access only works when all three are true:
+
+1. The workspace owner has **linked** the GitHub App (see [Step 4](#step-4--sign-in-with-github)).
+2. The GitHub App is **installed** on the account/org that owns the repo, with access to it (`https://github.com/apps/<your-app-slug>/installations/new`).
+3. The App is set to **public** (App → Advanced → "Make this GitHub App public") so other accounts can link it.
+
+Check inside a workspace with `cat ~/.git-credentials` — a valid install shows a real `x-access-token:...` line.
 
 ---
 
