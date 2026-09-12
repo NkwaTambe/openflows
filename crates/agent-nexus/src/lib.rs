@@ -3006,6 +3006,24 @@ Use `openflows-harness` for all coordination:
                         );
                         slot.status = WorkerStatus::Idle;
                         changed_slots = true;
+                    } else if tickets.iter().any(|t| {
+                        t.id == *ticket_id
+                            && matches!(
+                                t.status,
+                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
+                            )
+                    }) {
+                        // A ticket whose PR was merged/completed no longer needs its
+                        // worker, but the slot was never recycled (issue #215 /
+                        // #222). Free the slot so queued tickets can start.
+                        info!(
+                            worker_id = slot.id,
+                            ticket_id,
+                            "Recovering worker slot — ticket completed/merged, recycling to Idle"
+                        );
+                        slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
+                        changed_slots = true;
                     }
                 }
                 _ => {}
@@ -4500,6 +4518,48 @@ mod tests {
         // Must not panic when the slot doesn't exist.
         let _: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+    }
+
+    #[tokio::test]
+    async fn test_recover_orphans_recycles_slot_when_ticket_merged() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-001",
+                    "title": "t",
+                    "body": "",
+                    "priority": 0,
+                    "status": { "type": "merged", "worker_id": "forge-1", "pr_number": 7 }
+                }]),
+            )
+            .await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": {
+                            "type": "assigned",
+                            "ticket_id": "T-001",
+                            "issue_url": "https://github.com/owner/repo/issues/1"
+                        },
+                        "workspace_id": "ws-merged"
+                    }
+                }),
+            )
+            .await;
+
+        // Ticket T-001 is merged but forge-1 was never recycled → recover_orphans
+        // must free the slot so queued tickets can start (issue #215 / #222).
+        NexusNode::recover_orphans(&store).await.unwrap();
+
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let forge = slots.get("forge-1").expect("forge slot present");
+        assert!(matches!(forge.status, WorkerStatus::Idle));
+        assert!(forge.workspace_id.is_none());
     }
 
     #[test]
