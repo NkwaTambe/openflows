@@ -49,7 +49,7 @@ OpenFlows agents authenticate to your GitHub repositories (including private rep
      http://localhost:7080/external-auth/primary-github/callback
      ```
    - **Webhook** — can be left **Active: false** (blank).
-   - **Permissions → Repository permissions**, set all of these to **Read and write** (agents clone/push code, open PRs, and push CI/CD workflow files):
+   - **Permissions → Repository permissions**, set the following to **Read and write** (note: **Metadata** stays **Read-only** — GitHub does not allow raising it, so it is not part of the read/write instruction):
      | Permission | Why |
      |------------|-----|
      | **Contents** | Clone/push repo code (required for private repos). |
@@ -60,7 +60,7 @@ OpenFlows agents authenticate to your GitHub repositories (including private rep
 3. Click **Create GitHub App**.
 4. On the app's page, copy the **Client ID** (top of the page).
 5. In the **Client secrets** section, click **Generate a new client secret** and copy it now — it is shown only once.
-6. Your **Install URL** is `https://github.com/apps/my-openflows-app/installations/new` (replace `my-openflows-app` with your app name). This is how you (and your agents) install the app on your org/repos.
+6. Your **Install URL** is `https://github.com/apps/<your-app-slug>/installations/new`. Replace `<your-app-slug>` with the app's **URL slug** — the value that appears in the app's page URL (e.g. `my-openflows-app`). The slug can differ from the display name if it contains spaces or capitals; copy it from the app page URL to be safe. This is how you (and your agents) install the app on your org/repos.
 
 > **If you add permissions *after* installing the app:** editing the app's developer-settings permissions only *requests* the new permission — you must then **approve/update the installation** at `https://github.com/settings/installations` (open your app's installation and click **Approve/Update**), then get a **fresh token** (restart the workspace). Changing an app's permissions does **not** update already-issued tokens. The most common blockers:
 > - *"refusing to allow a GitHub App to create or update workflow … without workflows permission"* → grant **Workflows** (≠ **Actions**) and approve the installation.
@@ -319,7 +319,7 @@ Grant the GitHub App **Pull requests → Read and write**, then **approve/update
 
 ### `403 External authentication is required to create a workspace with this template`
 
-Coder refuses to build a workspace until the owning account links the GitHub App (the templates now declare `data "coder_external_auth"`). Fix it by completing the link in [Step 4](#step-4--sign-in-with-github) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, re-run bootstrap.
+Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link in [Step 4](#step-4--sign-in-with-github) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, re-run bootstrap.
 
 ### Agents can't clone/push the private repo
 
@@ -329,7 +329,7 @@ Even with the provider configured, git access only works when all three are true
 2. The GitHub App is **installed** on the account/org that owns the repo, with access to it (`https://github.com/apps/<your-app-slug>/installations/new`).
 3. The App is set to **public** (App → Advanced → "Make this GitHub App public") so other accounts can link it.
 
-Check inside a workspace with `cat ~/.git-credentials` — a valid install shows a real `x-access-token:...` line.
+Verify inside a workspace **without printing the token**: `test -s ~/.git-credentials && echo 'git credentials configured'` (or run `git ls-remote <your-repo-url>` to confirm auth works). **Never** `cat ~/.git-credentials` — it prints your live GitHub token to the terminal/session logs.
 
 ---
 
