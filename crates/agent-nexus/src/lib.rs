@@ -1718,7 +1718,15 @@ Use `openflows-harness` for all coordination:
                         // later tickets can get a plan review. Without this, the single
                         // sentinel slot stays Assigned forever, deadlocking every ticket
                         // that enters planning afterwards (issue #215).
-                        Self::recycle_sentinel_slot(store, &ticket.id).await;
+                        for ws in Self::recycle_sentinel_slot(store, &ticket.id).await {
+                            if let Err(e) = self.destroy_coder_workspace(store, &ws).await {
+                                warn!(
+                                    workspace_id = %ws,
+                                    error = %e,
+                                    "Failed to destroy sentinel workspace after recycling"
+                                );
+                            }
+                        }
                         // Deduplication: skip if we already notified FORGE about
                         // this gate approval on a previous poll cycle.
                         let notification_key = format!("ticket:{}:planning_notified", ticket.id);
@@ -2912,10 +2920,15 @@ Use `openflows-harness` for all coordination:
     /// provisions a fresh (healthy) workspace rather than reusing a possibly
     /// crashed/stale one. Without this the single sentinel slot stays `Assigned`
     /// forever and every later planning ticket deadlocks (issue #215).
-    async fn recycle_sentinel_slot(store: &SharedStore, ticket_id: &str) {
+    ///
+    /// Returns the workspace ids that were detached so the caller can destroy
+    /// them (archiving chats) through the standard `destroy_coder_workspace`
+    /// path rather than leaving them orphaned.
+    async fn recycle_sentinel_slot(store: &SharedStore, ticket_id: &str) -> Vec<String> {
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let mut changed = false;
+        let mut to_destroy = Vec::new();
         for slot in slots.values_mut() {
             if Self::worker_role(&slot.id) != "sentinel" {
                 continue;
@@ -2934,7 +2947,9 @@ Use `openflows-harness` for all coordination:
                 "Planning gate approved — recycling sentinel slot to Idle"
             );
             slot.status = WorkerStatus::Idle;
-            slot.workspace_id = None;
+            if let Some(ws) = slot.workspace_id.take() {
+                to_destroy.push(ws);
+            }
             changed = true;
         }
         if changed {
@@ -2945,9 +2960,10 @@ Use `openflows-harness` for all coordination:
                 )
                 .await;
         }
+        to_destroy
     }
 
-    async fn recover_orphans(store: &SharedStore) -> Result<()> {
+    async fn recover_orphans(&self, store: &SharedStore) -> Result<()> {
         let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
@@ -3034,7 +3050,15 @@ Use `openflows-harness` for all coordination:
                             "Recovering sentinel slot — planning gate approved, recycling to Idle"
                         );
                         slot.status = WorkerStatus::Idle;
-                        slot.workspace_id = None;
+                        if let Some(ws) = slot.workspace_id.take() {
+                            if let Err(e) = self.destroy_coder_workspace(store, &ws).await {
+                                warn!(
+                                    workspace_id = %ws,
+                                    error = %e,
+                                    "Failed to destroy sentinel workspace during recovery"
+                                );
+                            }
+                        }
                         changed_slots = true;
                     }
                 }
@@ -4259,7 +4283,7 @@ impl Node for NexusNode {
         if decision.action == "work_assigned" {
             store.set(KEY_NO_WORK_COUNT, json!(0)).await;
 
-            Self::recover_orphans(store).await?;
+            self.recover_orphans(store).await?;
 
             if let Some(worker_id) = &decision.assign_to {
                 if let Some(ticket_id) = &decision.ticket_id {
