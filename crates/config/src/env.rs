@@ -41,6 +41,9 @@ pub struct CoderConfig {
     #[envconfig(from = "CODER_GITHUB_TOKEN")]
     pub github_token: Option<String>,
 
+    #[envconfig(from = "CODER_EXTERNAL_AUTH_0_ID")]
+    pub external_auth_id: Option<String>,
+
     #[envconfig(from = "CODER_EXTERNAL_AUTH_0_CLIENT_ID")]
     pub external_auth_client_id: Option<String>,
 
@@ -65,6 +68,7 @@ impl fmt::Debug for CoderConfig {
             .field("admin_username", &self.admin_username)
             .field("image_tag", &self.image_tag)
             .field("github_token", &redact(&self.github_token))
+            .field("external_auth_id", &self.external_auth_id)
             .field("external_auth_client_id", &self.external_auth_client_id)
             .field(
                 "external_auth_client_secret",
