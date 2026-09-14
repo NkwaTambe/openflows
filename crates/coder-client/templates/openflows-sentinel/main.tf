@@ -130,6 +130,9 @@ resource "coder_agent" "main" {
     # Declared via data "coder_external_auth" -> this also surfaces the
     # "Login with GitHub" button in the workspace UI, which is how the
     # workspace owner links the GitHub App and grants repo access.
+    # A persistent store is a deliberate fallback over Coder's automatic
+    # GIT_ASKPASS auth: agent-executed git (push) can run in a subprocess
+    # environment without GIT_ASKPASS, so we pin the token once here.
     GITHUB_TOKEN="${data.coder_external_auth.github.access_token}"
     if [ -n "$GITHUB_TOKEN" ]; then
       git config --global credential.helper store
