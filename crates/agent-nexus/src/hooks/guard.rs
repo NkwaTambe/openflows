@@ -56,6 +56,58 @@ fn is_shell(name: &str) -> bool {
     )
 }
 
+fn shell_command_writes(command: &str) -> bool {
+    let cmd = command.to_lowercase();
+    if cmd.contains(" > ")
+        || cmd.contains(">>")
+        || cmd.contains(" tee ")
+        || cmd.contains("|tee ")
+        || cmd.contains(" cat >")
+        || cmd.contains("printf ")
+        || cmd.contains("echo ")
+        || cmd.contains("sed -i")
+        || cmd.contains("perl -i")
+        || cmd.contains("python ")
+        || cmd.contains("python3 ")
+        || cmd.contains("node ")
+        || cmd.contains("cargo fmt")
+        || cmd.contains("git apply")
+        || cmd.contains("apply_patch")
+    {
+        return true;
+    }
+
+    cmd.split_whitespace().any(|part| {
+        matches!(
+            part,
+            "mv" | "cp" | "touch" | "mkdir" | "rm" | "truncate" | "install"
+        )
+    })
+}
+
+fn shell_writes_source(command: &str) -> bool {
+    if !shell_command_writes(command) {
+        return false;
+    }
+    let cmd = command.to_lowercase();
+    let artifact_only = [
+        "plan.md",
+        "status.json",
+        "blocker.md",
+        "blockers.md",
+        "handoff.md",
+        "final-review.md",
+        "-eval.md",
+    ]
+    .iter()
+    .any(|needle| cmd.contains(needle));
+    !artifact_only
+}
+
+fn is_write_attempt(tool_name: &str, input: &Value) -> bool {
+    is_write_tool(tool_name) || (is_shell(tool_name) && shell_writes_source(&command_text(input)))
+}
+
 /// Is the tool a read-only probe (bash read of status/dispatch/plan)?
 fn is_probe_command(command: &str) -> bool {
     let cmd = command.to_lowercase();
@@ -122,11 +174,12 @@ fn is_plan_write(tool_name: &str, input: &Value) -> bool {
     if tool_name.to_lowercase().contains("plan") {
         return true;
     }
-    if input.get("is_plan").is_some() {
+    if input.get("is_plan").and_then(|v| v.as_bool()) == Some(true) {
         return true;
     }
     let path = target_path(input).to_lowercase();
-    if path.ends_with("plan.md") || path.ends_with("plan") || path.contains("/plan") {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path.as_str());
+    if matches!(file, "plan.md" | "plan") {
         return true;
     }
     // A harness `plan write` call uploads the plan.
@@ -146,7 +199,11 @@ fn is_plan_write(tool_name: &str, input: &Value) -> bool {
 /// Is a write targeting the blocker report (allowed in the `blocked` phase)?
 fn is_blocker_write(tool_name: &str, input: &Value) -> bool {
     let path = target_path(input).to_lowercase();
-    if path.ends_with("status.json") || path.ends_with("blocker") || path.contains("blocker") {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path.as_str());
+    if matches!(
+        file,
+        "status.json" | "blocker" | "blocker.md" | "blockers.md"
+    ) {
         return true;
     }
     let _ = tool_name;
@@ -232,7 +289,7 @@ pub async fn phase_guard(
     let lower = tool_name.to_lowercase();
 
     // SENTINEL: readonly reviewer → deny all writes.
-    if role.eq_ignore_ascii_case("sentinel") && is_write_tool(&lower) {
+    if role.eq_ignore_ascii_case("sentinel") && is_write_attempt(&lower, input) {
         return HookDecision::deny(
             "openflows policy: SENTINEL is a readonly reviewer — writes are blocked",
         )
@@ -262,7 +319,7 @@ pub async fn phase_guard(
 
     // ── PLANNING ──────────────────────────────────────────────────────────
     if phase == "planning" {
-        if is_write_tool(&lower) && !st.plan_exists && !is_plan_write(&lower, input) {
+        if is_write_attempt(&lower, input) && !st.plan_exists && !is_plan_write(&lower, input) {
             // First write must be the plan.
             decision = HookDecision::deny(
                 "openflows policy: FORGE is in the planning phase and must write \
@@ -305,7 +362,7 @@ pub async fn phase_guard(
 
     // ── REVIEW_READY ──────────────────────────────────────────────────────
     if phase == "review_ready" {
-        if is_write_tool(&lower) {
+        if is_write_attempt(&lower, input) {
             // Under review: source must not change; re-enter an earlier phase.
             decision = HookDecision::deny(
                 "openflows policy: FORGE is in review_ready (PR under review). Do not \

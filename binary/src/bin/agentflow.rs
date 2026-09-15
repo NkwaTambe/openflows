@@ -487,35 +487,28 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         // Wait either for the full poll interval or for a hook kick to wake us
         // early (Slice B/D). The reconciliation pass is idempotent, so an early
         // wake only shortens latency. Guard against a kick-in-every-pass
-        // livelock by only honoring a kick if the last pass was >1s ago.
+        // livelock by enforcing a small minimum delay after each pass.
         if let Some(rx) = &mut hook_kick_rx {
-            let too_soon = last_pass.elapsed().as_secs() < 1;
             let kick = tokio::select! {
                 _ = tokio::time::sleep(CONTROLLER_POLL_INTERVAL) => None,
                 k = rx.recv() => k,
             };
-            match kick {
-                Some(k) if !too_soon => {
-                    if cfg.hooks.hook_logs {
-                        tracing::info!(
-                            event = %k.event,
-                            hint = %k.hint,
-                            "Hook kick woke the Controller early"
-                        );
-                    }
-                    continue; // re-run the reconciliation pass immediately
+            if let Some(k) = kick {
+                let elapsed = last_pass.elapsed();
+                const MIN_HOOK_WAKE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+                if elapsed < MIN_HOOK_WAKE_DELAY {
+                    tokio::time::sleep(MIN_HOOK_WAKE_DELAY - elapsed).await;
                 }
-                Some(_) => {
-                    if cfg.hooks.hook_logs {
-                        tracing::debug!(
-                            "Hook kick arrived too soon after last pass; waiting full interval"
-                        );
-                    }
-                    tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
-                    continue;
+                if cfg.hooks.hook_logs {
+                    tracing::info!(
+                        event = %k.event,
+                        hint = %k.hint,
+                        "Hook kick woke the Controller early"
+                    );
                 }
-                None => {} // poll interval elapsed; fall through to next pass
+                continue; // re-run the reconciliation pass immediately
             }
+            // poll interval elapsed; fall through to next pass
         } else {
             tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
         }
@@ -544,10 +537,21 @@ async fn run_bootstrap() -> Result<()> {
     Ok(())
 }
 
+fn validate_tenant_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "tenant name must not be empty");
+    anyhow::ensure!(
+        name.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+        "tenant name '{name}' contains characters that are not allowed in Redis namespace operations; use only ASCII letters, numbers, '.', '_' and '-'"
+    );
+    Ok(())
+}
+
 async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     let TenantCommands::Clean { name, reset_all } = action else {
         unreachable!("run_tenant_clean called with non-clean action");
     };
+    validate_tenant_name(name)?;
 
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
     // Scope the store to the tenant we are cleaning: SharedStore namespaces
@@ -647,6 +651,7 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
         TenantCommands::Add { repo, name } => {
             let tenant_name =
                 name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
+            validate_tenant_name(&tenant_name)?;
 
             println!(
                 "Adding tenant '{}' for repository '{}'...",
@@ -692,6 +697,7 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             }
         }
         TenantCommands::Remove { name, purge } => {
+            validate_tenant_name(&name)?;
             println!("Removing tenant '{}'...", name);
 
             if purge {
@@ -792,6 +798,7 @@ async fn run_store(action: StoreCommands) -> Result<()> {
             }
         }
         StoreCommands::Purge { name, yes } => {
+            validate_tenant_name(&name)?;
             let pattern = format!("ns:{}:*", name);
             let keys: Vec<String> = store.raw_keys(&pattern).await;
             if keys.is_empty() {
@@ -814,6 +821,7 @@ async fn run_store(action: StoreCommands) -> Result<()> {
             println!("  (Restart the controller to pick up changes)");
         }
         StoreCommands::Reset { name, yes } => {
+            validate_tenant_name(&name)?;
             let tenant_store = match pocketflow_core::SharedStore::new_redis_with_tenant(
                 &redis_url,
                 Some(name.clone()),

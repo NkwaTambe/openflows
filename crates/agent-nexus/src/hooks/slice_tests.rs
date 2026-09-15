@@ -114,6 +114,44 @@ async fn phase_guard_allows_plan_write_before_plan() {
 }
 
 #[tokio::test]
+async fn phase_guard_rejects_plan_named_source_file_before_plan() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-20", "forge", "chat-20").await;
+    seed_status(&store, "T-20", "planning").await;
+
+    let input = json!({ "path": "src/plan_helpers.rs", "is_plan": false });
+    let d = phase_guard(
+        &store,
+        "chat-20",
+        "forge",
+        "write",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(d.deny, "source paths containing 'plan' are not PLAN.md");
+}
+
+#[tokio::test]
+async fn phase_guard_denies_shell_source_write_before_plan() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-21", "forge", "chat-21").await;
+    seed_status(&store, "T-21", "planning").await;
+
+    let input = json!({ "command": "printf 'oops' > src/lib.rs" });
+    let d = phase_guard(
+        &store,
+        "chat-21",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(d.deny, "shell redirection source writes are write attempts");
+}
+
+#[tokio::test]
 async fn phase_guard_allows_source_write_once_plan_exists() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-5", "forge", "chat-5").await;
@@ -446,6 +484,18 @@ async fn sentinel_allows_eval_report_write_but_denies_source() {
     )
     .await;
     assert!(d2.deny, "sentinel may not write source");
+
+    let shell_source = json!({ "command": "printf 'oops' > src/main.rs" });
+    let d3 = sentinel_phase_guard(
+        &store,
+        "T-15",
+        &st,
+        "Bash",
+        &shell_source,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(d3.deny, "sentinel shell writes to source are blocked");
 }
 
 #[tokio::test]

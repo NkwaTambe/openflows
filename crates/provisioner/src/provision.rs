@@ -188,9 +188,32 @@ impl Provisioner {
             // copied scripts (client-side execution).
             if !script_entries.is_empty() {
                 let settings = build_hook_settings(role, &script_entries);
-                if let Ok(json) = serde_json::to_string_pretty(&settings) {
-                    let _ = transport.write_file(".claude/settings.json", &json).await;
-                    let _ = transport.write_file(".agents/settings.json", &json).await;
+                let claude_settings = merge_hook_settings(
+                    transport
+                        .read_file(".claude/settings.json")
+                        .await
+                        .ok()
+                        .as_deref(),
+                    settings.clone(),
+                );
+                let agents_settings = merge_hook_settings(
+                    transport
+                        .read_file(".agents/settings.json")
+                        .await
+                        .ok()
+                        .as_deref(),
+                    settings,
+                );
+                if let (Ok(claude_json), Ok(agents_json)) = (
+                    serde_json::to_string_pretty(&claude_settings),
+                    serde_json::to_string_pretty(&agents_settings),
+                ) {
+                    let _ = transport
+                        .write_file(".claude/settings.json", &claude_json)
+                        .await;
+                    let _ = transport
+                        .write_file(".agents/settings.json", &agents_json)
+                        .await;
                     info!(
                         role,
                         count = script_entries.len(),
@@ -239,6 +262,84 @@ fn build_hook_settings(role: &str, scripts: &[(String, std::path::PathBuf)]) -> 
         "hooks": events,
         "openflows": { "role": role }
     })
+}
+
+fn merge_hook_settings(existing: Option<&str>, generated: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut out = existing
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    let generated_obj = generated.as_object().cloned().unwrap_or_default();
+
+    if let Some(generated_hooks) = generated_obj.get("hooks").and_then(|v| v.as_object()) {
+        let mut hooks = out
+            .remove("hooks")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+
+        for (event, generated_event) in generated_hooks {
+            match hooks.get_mut(event) {
+                Some(existing_event) => {
+                    merge_hook_event(existing_event, generated_event.clone());
+                }
+                None => {
+                    hooks.insert(event.clone(), generated_event.clone());
+                }
+            }
+        }
+        out.insert("hooks".to_string(), Value::Object(hooks));
+    }
+
+    if let Some(generated_openflows) = generated_obj.get("openflows").and_then(|v| v.as_object()) {
+        let mut openflows = out
+            .remove("openflows")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        for (key, value) in generated_openflows {
+            openflows.insert(key.clone(), value.clone());
+        }
+        out.insert("openflows".to_string(), Value::Object(openflows));
+    }
+
+    for (key, value) in generated_obj {
+        out.entry(key).or_insert(value);
+    }
+
+    Value::Object(out)
+}
+
+fn merge_hook_event(existing: &mut serde_json::Value, generated: serde_json::Value) {
+    use serde_json::Value;
+
+    let Some(existing_obj) = existing.as_object_mut() else {
+        *existing = generated;
+        return;
+    };
+    let Some(generated_obj) = generated.as_object() else {
+        return;
+    };
+
+    if let Some(generated_hooks) = generated_obj.get("hooks").and_then(|v| v.as_array()) {
+        let existing_hooks = existing_obj
+            .entry("hooks")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(existing_hooks) = existing_hooks.as_array_mut() {
+            for hook in generated_hooks {
+                if !existing_hooks.contains(hook) {
+                    existing_hooks.push(hook.clone());
+                }
+            }
+        }
+    }
+
+    for (key, value) in generated_obj {
+        if key != "hooks" {
+            existing_obj.entry(key.clone()).or_insert(value.clone());
+        }
+    }
 }
 
 /// Translate an OpenFlows hook stem to the canonical (Claude Code / Codex)
@@ -452,6 +553,39 @@ mod tests {
         assert!(hooks.contains_key("SessionStart"));
         assert!(hooks.contains_key("Stop"));
         assert_eq!(settings["openflows"]["role"], "forge");
+    }
+
+    #[test]
+    fn merges_hook_settings_without_dropping_existing_fields() {
+        let existing = serde_json::json!({
+            "permissions": { "allow": ["Bash(cargo test)"] },
+            "hooks": {
+                "PreToolUse": {
+                    "hooks": [
+                        { "type": "command", "command": "custom/pre.sh" }
+                    ],
+                    "enabled": true
+                }
+            },
+            "openflows": { "tenant": "demo" }
+        })
+        .to_string();
+        let generated = build_hook_settings(
+            "forge",
+            &[("pre_bash_guard.sh".to_string(), PathBuf::from("unused"))],
+        );
+
+        let merged = merge_hook_settings(Some(&existing), generated);
+        assert_eq!(merged["permissions"]["allow"][0], "Bash(cargo test)");
+        assert_eq!(merged["openflows"]["tenant"], "demo");
+        assert_eq!(merged["openflows"]["role"], "forge");
+
+        let hooks = merged["hooks"]["PreToolUse"]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert!(hooks
+            .iter()
+            .any(|h| h["command"] == ".agents/hooks/forge/pre_bash_guard.sh"));
+        assert!(hooks.iter().any(|h| h["command"] == "custom/pre.sh"));
     }
 
     #[tokio::test]

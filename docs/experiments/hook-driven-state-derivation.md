@@ -271,13 +271,10 @@ why it wants to stop."
 
 - All new routes/handlers are behind `CoderHooksConfig::enabled()`; no change to the default
   (non-experiment) control path.
-- The consumer already binds only when the experiment is on. New behavior (model_context
-  injection, kick publishing, stateful guards) is further gated by per-feature env flags so
-  each slice can be toggled independently:
-  - `OPENFLOWS_HOOK_BOOTSTRAP=1` (slice A)
-  - `OPENFLOWS_HOOK_KICK=1` (slice B)
-  - `OPENFLOWS_HOOK_PHASE_GUARD=1` (slice C)
-  - `OPENFLOWS_HOOK_STOP_MONITOR=1` (slice D)
+- The consumer binds only when hooks are enabled and `CODER_CHAT_HOOK_SECRET` is set.
+  Slice A-D behavior is intentionally deployed together in this experiment; the supported
+  operator controls are the top-level hook enablement, the shared signing secret, bind/host
+  overrides for custom network topology, and `OPENFLOWS_HOOK_LOGS` for trace logging.
 - All decisions still tail `_hook_events_tail` (and, per-ticket, `ticket:{T}:hooks:events`).
 
 ---
@@ -287,7 +284,7 @@ why it wants to stop."
 | File | Change |
 |------|--------|
 | `crates/pocketflow-core/src/store.rs` | Add `publish_hook_kick` + `subscribe_hook_kicks` (Redis PUB/SUB + in-memory broadcast) |
-| `crates/config/src/env.rs` | Add `CoderHooksConfig` feature flags (`OPENFLOWS_HOOK_BOOTSTRAP/KICK/PHASE_GUARD/STOP_MONITOR`) |
+| `crates/config/src/env.rs` | Add `CoderHooksConfig` enablement, bind/host, timeout, insecure-dev, secret, and logging settings |
 | `crates/agent-nexus/src/hooks/types.rs` | Add `HookContext` (role/ticket resolution result), `classify_stop`, new event-payload helpers |
 | `crates/agent-nexus/src/hooks/server.rs` | Route `session_start`→bootstrap, `post_tool_use`→maybe-publish-kick, `pre_tool_use`→stateful guard, `stop`→classify+maybe-kick; plus kick publishing helper |
 | `crates/agent-nexus/src/hooks/` (new `bootstrap.rs`, `kick.rs`, `guard.rs`, `stop.rs`) | Slice logic modules (kept testable in isolation) |

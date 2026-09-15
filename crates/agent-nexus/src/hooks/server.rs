@@ -337,18 +337,15 @@ async fn post_tool_use_feedback(
         .map(|r| r.eq_ignore_ascii_case("sentinel"))
         .unwrap_or(false)
     {
+        let tool_name = data
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let path = data
             .get("tool_input")
-            .and_then(|i| i.get("path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let is_eval = path.ends_with("-eval.md")
-            || path.ends_with("eval.md")
-            || path.ends_with("final-review.md")
-            || path.ends_with("review.md")
-            || path.contains("review-report");
-        if is_eval {
+            .and_then(review_report_path)
+            .unwrap_or_default();
+        if tool_succeeded(data) && is_write_like_tool(tool_name) && is_eval_report_path(&path) {
             super::context::record_review_report_marker(store, &ticket).await;
         }
     }
@@ -371,6 +368,52 @@ async fn post_tool_use_feedback(
     }
     let context = format!("[openflows hook policy]\n{}", reasons.join("\n"));
     HookDecision::observe().with_model_context(context)
+}
+
+fn review_report_path(input: &Value) -> Option<String> {
+    input
+        .get("path")
+        .or_else(|| input.get("file_path"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn is_write_like_tool(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "write" | "edit" | "create" | "patch"
+    )
+}
+
+fn is_eval_report_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    let file = p.rsplit(['/', '\\']).next().unwrap_or(p.as_str());
+    file.ends_with("-eval.md")
+        || file == "eval.md"
+        || file == "final-review.md"
+        || file == "review.md"
+        || file == "review-report.md"
+}
+
+fn tool_succeeded(data: &Value) -> bool {
+    let Some(response) = data
+        .get("tool_response")
+        .or_else(|| data.get("tool_result"))
+        .or_else(|| data.get("result"))
+    else {
+        return false;
+    };
+
+    if response.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        return true;
+    }
+    if response.get("exit_code").and_then(|v| v.as_i64()) == Some(0) {
+        return true;
+    }
+    if response.get("status").and_then(|v| v.as_str()) == Some("success") {
+        return true;
+    }
+    false
 }
 
 /// Feed the agent's current lifecycle status to the model ahead of a prompt.
@@ -762,6 +805,50 @@ mod tests {
         );
         let d = decide_pre_tool_use(&data);
         assert!(!d.deny);
+    }
+
+    #[test]
+    fn review_marker_requires_successful_write_tool_to_exact_report() {
+        let failed_write = json!({
+            "tool_name": "Write",
+            "tool_input": { "path": "final-review.md" },
+            "tool_response": { "exit_code": 1 }
+        });
+        assert!(!tool_succeeded(&failed_write));
+
+        let read_tool = json!({
+            "tool_name": "Read",
+            "tool_input": { "path": "final-review.md" },
+            "tool_response": { "exit_code": 0 }
+        });
+        assert!(!is_write_like_tool(
+            read_tool["tool_name"].as_str().unwrap()
+        ));
+
+        let source_path = json!({
+            "tool_name": "Write",
+            "tool_input": { "path": "src/review-report.rs" },
+            "tool_response": { "exit_code": 0 }
+        });
+        assert!(tool_succeeded(&source_path));
+        assert!(!is_eval_report_path(
+            review_report_path(&source_path["tool_input"])
+                .unwrap()
+                .as_str()
+        ));
+
+        let ok_report = json!({
+            "tool_name": "Write",
+            "tool_input": { "path": "reports/final-review.md" },
+            "tool_response": { "exit_code": 0 }
+        });
+        assert!(tool_succeeded(&ok_report));
+        assert!(is_write_like_tool(ok_report["tool_name"].as_str().unwrap()));
+        assert!(is_eval_report_path(
+            review_report_path(&ok_report["tool_input"])
+                .unwrap()
+                .as_str()
+        ));
     }
 
     #[test]

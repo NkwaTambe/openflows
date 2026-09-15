@@ -6,7 +6,7 @@
 //! Safe to call on every restart.
 
 use crate::{CoderClient, CreateWorkspaceRequest};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::{CoderConfig, GithubConfig};
 use envconfig::Envconfig;
 use serde_json::json;
@@ -497,7 +497,8 @@ impl CoderBootstrapper {
             .hooks
             .chat_hook_secret
             .clone()
-            .unwrap_or_else(|| config::env::DEFAULT_CODER_CHAT_HOOK_SECRET.to_string());
+            .filter(|s| !s.trim().is_empty())
+            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the Nexus workspace")?;
 
         let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
@@ -775,7 +776,8 @@ impl CoderBootstrapper {
                     .ok()
                     .and_then(|c| c.hooks.chat_hook_secret)
             })
-            .unwrap_or_else(|| config::env::DEFAULT_CODER_CHAT_HOOK_SECRET.to_string());
+            .filter(|s| !s.trim().is_empty())
+            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the tenant Nexus workspace")?;
         let workspace = client
             .create_workspace_for_user(
                 &tenant_user.id,

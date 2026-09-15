@@ -92,17 +92,17 @@ pub async fn record_review_report_marker(store: &SharedStore, ticket_id: &str) {
         .await;
 }
 
-/// Resolve role + ticket from a chat id by scanning the chat keys.
+/// Resolve role + ticket from a chat id by scanning this tenant's chat keys.
 pub async fn resolve_chat(store: &SharedStore, chat_id: &str) -> HookContext {
     if chat_id.is_empty() {
         return HookContext::default();
     }
-    // `raw_keys` returns full keys like `ns:{tenant}:ticket:{T}:chat:{role}`.
-    // We scan broadly (`*`) and filter in Rust so the same code works on both the
-    // in-memory and Redis backends, then read each candidate's un-namespaced key.
-    let keys = store.raw_keys("*").await;
+    // `keys` applies the store's tenant namespace and returns full keys like
+    // `ns:{tenant}:ticket:{T}:chat:{role}`. This avoids scanning unrelated
+    // tenants on high-frequency hook dispatches.
+    let keys = store.keys("ticket:*").await;
     for key in keys {
-        if !key.contains(":ticket:") || !key.contains(":chat:") {
+        if !key.contains(":chat:") {
             continue;
         }
         let un_ns = strip_namespace(&key);

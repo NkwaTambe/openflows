@@ -42,11 +42,53 @@ pub fn sentinel_job(st: &TicketState) -> SentinelJob {
 /// its evaluation/verdict artifacts, never source.
 fn is_review_artifact(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.ends_with("-eval.md")
-        || p.ends_with("eval.md")
-        || p.ends_with("final-review.md")
-        || p.ends_with("review.md")
-        || p.contains("review-report")
+    let file = p.rsplit(['/', '\\']).next().unwrap_or(p.as_str());
+    file.ends_with("-eval.md")
+        || file == "eval.md"
+        || file == "final-review.md"
+        || file == "review.md"
+        || file == "review-report.md"
+}
+
+fn command_text(input: &Value) -> String {
+    if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
+        return command.to_string();
+    }
+    if let Some(argv) = input.get("argv").and_then(|v| v.as_array()) {
+        return argv
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    input.as_str().unwrap_or_default().to_string()
+}
+
+fn shell_writes_source(command: &str) -> bool {
+    let cmd = command.to_lowercase();
+    let writes = cmd.contains(" > ")
+        || cmd.contains(">>")
+        || cmd.contains(" tee ")
+        || cmd.contains("|tee ")
+        || cmd.contains(" cat >")
+        || cmd.contains("printf ")
+        || cmd.contains("echo ")
+        || cmd.contains("sed -i")
+        || cmd.contains("perl -i")
+        || cmd.contains("git apply")
+        || cmd.split_whitespace().any(|part| {
+            matches!(
+                part,
+                "mv" | "cp" | "touch" | "mkdir" | "rm" | "truncate" | "install"
+            )
+        });
+    if !writes {
+        return false;
+    }
+    let review_artifact = command
+        .split_whitespace()
+        .any(|part| is_review_artifact(part.trim_matches(['"', '\'', ';'])));
+    !review_artifact
 }
 
 /// Sentinel-level guidance injected so the model knows what job it is on.
@@ -99,6 +141,16 @@ pub async fn sentinel_phase_guard(
         return HookDecision::deny(
             "openflows policy: SENTINEL is a readonly reviewer — source writes are blocked \
              (only *-eval.md / final-review.md review reports may be written)",
+        )
+        .with_model_context(guidance);
+    }
+
+    if matches!(lower.as_str(), "bash" | "sh" | "shell" | "exec")
+        && shell_writes_source(&command_text(input))
+    {
+        return HookDecision::deny(
+            "openflows policy: SENTINEL is a readonly reviewer — shell source writes are blocked \
+             (only review report artifacts may be written)",
         )
         .with_model_context(guidance);
     }

@@ -12,12 +12,6 @@ use envconfig::Envconfig;
 use std::fmt;
 use std::path::PathBuf;
 
-/// Local-stack default shared hook secret. Production deployments should
-/// override `CODER_CHAT_HOOK_SECRET`; the default exists so the bundled compose
-/// stack and Nexus workspace agree without operator plumbing.
-pub const DEFAULT_CODER_CHAT_HOOK_SECRET: &str =
-    "openflows-local-hook-secret-change-me-000000000000000000";
-
 /// Coder-related configuration.
 ///
 /// `Debug` is implemented manually to redact credentials.
@@ -573,7 +567,7 @@ mod tests {
         std::env::set_var("CODER_EXPERIMENTS", "agent-lifecycle-hooks");
         assert!(!EnvConfig::from_env().unwrap().hooks.enabled());
 
-        std::env::set_var("CODER_CHAT_HOOK_SECRET", DEFAULT_CODER_CHAT_HOOK_SECRET);
+        std::env::set_var("CODER_CHAT_HOOK_SECRET", "0123456789abcdef0123456789abcdef");
         assert!(EnvConfig::from_env().unwrap().hooks.enabled());
 
         std::env::set_var("CODER_CHAT_HOOK_ENABLED", "false");

@@ -73,8 +73,8 @@ data "coder_parameter" "github_pat" {
 
 data "coder_parameter" "coder_chat_hook_secret" {
   name        = "coder_chat_hook_secret"
-  description = "Shared OpenFlows/Coder lifecycle hook signing secret"
-  default     = "openflows-local-hook-secret-change-me-000000000000000000"
+  description = "Required shared OpenFlows/Coder lifecycle hook signing secret (32+ random bytes)"
+  default     = ""
   type        = "string"
   mutable     = false
 }
