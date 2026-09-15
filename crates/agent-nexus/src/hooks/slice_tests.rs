@@ -152,6 +152,47 @@ async fn phase_guard_denies_shell_source_write_before_plan() {
 }
 
 #[tokio::test]
+async fn phase_guard_denies_shell_copy_from_plan_to_source() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-22", "forge", "chat-22").await;
+    seed_status(&store, "T-22", "planning").await;
+
+    let input = json!({ "command": "cp PLAN.md src/lib.rs" });
+    let d = phase_guard(
+        &store,
+        "chat-22",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "artifact source operands must not hide source write targets"
+    );
+}
+
+#[tokio::test]
+async fn phase_guard_allows_shell_write_to_plan_artifact() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-23", "forge", "chat-23").await;
+    seed_status(&store, "T-23", "planning").await;
+
+    let input = json!({ "command": "printf '# plan' > PLAN.md" });
+    let d = phase_guard(
+        &store,
+        "chat-23",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(!d.deny, "shell writes to PLAN.md stay allowed");
+}
+
+#[tokio::test]
 async fn phase_guard_allows_source_write_once_plan_exists() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-5", "forge", "chat-5").await;
@@ -496,6 +537,33 @@ async fn sentinel_allows_eval_report_write_but_denies_source() {
     )
     .await;
     assert!(d3.deny, "sentinel shell writes to source are blocked");
+
+    let shell_copy = json!({ "command": "cp final-review.md src/main.rs" });
+    let d4 = sentinel_phase_guard(
+        &store,
+        "T-15",
+        &st,
+        "Bash",
+        &shell_copy,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d4.deny,
+        "review artifact source operands must not hide source write targets"
+    );
+
+    let report_redirect = json!({ "command": "printf 'ok' > final-review.md" });
+    let d5 = sentinel_phase_guard(
+        &store,
+        "T-15",
+        &st,
+        "Bash",
+        &report_redirect,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(!d5.deny, "sentinel may write review report artifacts");
 }
 
 #[tokio::test]

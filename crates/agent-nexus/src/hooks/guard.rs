@@ -57,51 +57,160 @@ fn is_shell(name: &str) -> bool {
 }
 
 fn shell_command_writes(command: &str) -> bool {
+    match shell_write_targets(command) {
+        Some(targets) => !targets.is_empty(),
+        None => true,
+    }
+}
+
+fn shell_writes_source(command: &str) -> bool {
+    match shell_write_targets(command) {
+        Some(targets) => targets
+            .iter()
+            .any(|target| !is_allowed_lifecycle_artifact(target)),
+        None => shell_command_writes(command),
+    }
+}
+
+fn shell_write_targets(command: &str) -> Option<Vec<String>> {
+    let words = shell_words(command);
+    if words.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut targets = redirection_targets(&words);
+    targets.extend(tee_targets(&words));
+    targets.extend(command_operand_targets(&words));
+    if !targets.is_empty() {
+        return Some(targets);
+    }
+
     let cmd = command.to_lowercase();
-    if cmd.contains(" > ")
-        || cmd.contains(">>")
-        || cmd.contains(" tee ")
-        || cmd.contains("|tee ")
-        || cmd.contains(" cat >")
-        || cmd.contains("printf ")
-        || cmd.contains("echo ")
-        || cmd.contains("sed -i")
-        || cmd.contains("perl -i")
-        || cmd.contains("python ")
+    if cmd.contains("python ")
         || cmd.contains("python3 ")
         || cmd.contains("node ")
         || cmd.contains("cargo fmt")
         || cmd.contains("git apply")
         || cmd.contains("apply_patch")
+        || cmd.contains("sed -i")
+        || cmd.contains("perl -i")
     {
-        return true;
+        return None;
     }
 
-    cmd.split_whitespace().any(|part| {
-        matches!(
-            part,
-            "mv" | "cp" | "touch" | "mkdir" | "rm" | "truncate" | "install"
-        )
-    })
+    Some(Vec::new())
 }
 
-fn shell_writes_source(command: &str) -> bool {
-    if !shell_command_writes(command) {
-        return false;
+fn redirection_targets(words: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    for (idx, word) in words.iter().enumerate() {
+        let op = word.as_str();
+        if matches!(op, ">" | ">>" | "1>" | "1>>" | "2>" | "2>>") {
+            if let Some(target) = words.get(idx + 1) {
+                targets.push(clean_shell_word(target));
+            }
+        } else if let Some(target) = op.strip_prefix(">>").or_else(|| op.strip_prefix('>')) {
+            if !target.is_empty() {
+                targets.push(clean_shell_word(target));
+            }
+        } else if let Some(target) = op.strip_prefix("1>").or_else(|| op.strip_prefix("2>")) {
+            if !target.is_empty() {
+                targets.push(clean_shell_word(target));
+            }
+        }
     }
-    let cmd = command.to_lowercase();
-    let artifact_only = [
-        "plan.md",
-        "status.json",
-        "blocker.md",
-        "blockers.md",
-        "handoff.md",
-        "final-review.md",
-        "-eval.md",
-    ]
-    .iter()
-    .any(|needle| cmd.contains(needle));
-    !artifact_only
+    targets
+}
+
+fn tee_targets(words: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    for (idx, word) in words.iter().enumerate() {
+        if word != "tee" {
+            continue;
+        }
+        for arg in &words[idx + 1..] {
+            if arg.starts_with('-') {
+                continue;
+            }
+            if is_shell_separator(arg) {
+                break;
+            }
+            targets.push(clean_shell_word(arg));
+        }
+    }
+    targets
+}
+
+fn command_operand_targets(words: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut idx = 0;
+    while idx < words.len() {
+        let cmd = words[idx].as_str();
+        if matches!(cmd, "cp" | "mv" | "install") {
+            if let Some(target) = words[idx + 1..]
+                .iter()
+                .rev()
+                .find(|arg| !arg.starts_with('-') && !is_shell_separator(arg))
+            {
+                targets.push(clean_shell_word(target));
+            }
+        } else if matches!(cmd, "touch" | "mkdir" | "rm" | "truncate") {
+            targets.extend(
+                words[idx + 1..]
+                    .iter()
+                    .take_while(|arg| !is_shell_separator(arg))
+                    .filter(|arg| !arg.starts_with('-'))
+                    .map(|arg| clean_shell_word(arg)),
+            );
+        }
+        idx += 1;
+    }
+    targets
+}
+
+fn shell_words(command: &str) -> Vec<String> {
+    command
+        .replace(">>", " __OPENFLOWS_REDIR__ ")
+        .replace('>', " __OPENFLOWS_REDIR__ ")
+        .replace('|', " | ")
+        .replace(';', " ; ")
+        .split_whitespace()
+        .map(|word| {
+            if word == "__OPENFLOWS_REDIR__" {
+                ">".to_string()
+            } else {
+                clean_shell_word(word)
+            }
+        })
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+fn clean_shell_word(word: &str) -> String {
+    word.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')'))
+        .to_string()
+}
+
+fn is_shell_separator(word: &str) -> bool {
+    matches!(word, "|" | ";" | "&&" | "||")
+}
+
+fn is_allowed_lifecycle_artifact(path: &str) -> bool {
+    let p = path.to_lowercase();
+    let file = p.rsplit(['/', '\\']).next().unwrap_or(p.as_str());
+    matches!(
+        file,
+        "plan.md"
+            | "plan"
+            | "status.json"
+            | "blocker"
+            | "blocker.md"
+            | "blockers.md"
+            | "handoff.md"
+            | "final-review.md"
+            | "review.md"
+            | "review-report.md"
+    ) || file.ends_with("-eval.md")
 }
 
 fn is_write_attempt(tool_name: &str, input: &Value) -> bool {
