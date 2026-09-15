@@ -6,7 +6,7 @@
 //! Safe to call on every restart.
 
 use crate::{CoderClient, CreateWorkspaceRequest};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use config::{CoderConfig, GithubConfig};
 use envconfig::Envconfig;
 use serde_json::json;
@@ -493,6 +493,12 @@ impl CoderBootstrapper {
         };
         let coder_url_for_workspace = client.base_url().replace("localhost", "coder");
         let github_pat = github_cfg.token.clone().unwrap_or_default();
+        let hook_secret = env_cfg
+            .hooks
+            .chat_hook_secret
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the Nexus workspace")?;
 
         let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
@@ -507,6 +513,7 @@ impl CoderBootstrapper {
                     "github_repository": repository,
                     "registry_json": registry_json,
                     "github_pat": github_pat,
+                    "coder_chat_hook_secret": hook_secret,
                     "start_controller": false,
                 }),
             })
@@ -760,6 +767,17 @@ impl CoderBootstrapper {
             .and_then(|e| e.github.token.clone())
             .or_else(|| GithubConfig::init_from_env().ok().and_then(|c| c.token))
             .unwrap_or_default();
+        let hook_secret = self
+            .env
+            .as_ref()
+            .and_then(|e| e.hooks.chat_hook_secret.clone())
+            .or_else(|| {
+                config::EnvConfig::from_env()
+                    .ok()
+                    .and_then(|c| c.hooks.chat_hook_secret)
+            })
+            .filter(|s| !s.trim().is_empty())
+            .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the tenant Nexus workspace")?;
         let workspace = client
             .create_workspace_for_user(
                 &tenant_user.id,
@@ -774,6 +792,7 @@ impl CoderBootstrapper {
                         "tenant": tenant_name,
                         "github_repository": github_repo,
                         "github_pat": github_pat,
+                        "coder_chat_hook_secret": hook_secret,
                         "start_controller": false,
                     }),
                 },

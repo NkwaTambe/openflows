@@ -27,7 +27,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Run the Controller orchestration loop (default inside nexus workspace)
-    Run,
+    Run {
+        /// Clear this tenant's runtime SharedStore state before starting
+        #[arg(long)]
+        reset_store: bool,
+    },
     /// Bootstrap Coder: admin, templates, LLM check, external auth check
     Bootstrap,
     /// Tenant management
@@ -51,8 +55,18 @@ enum Commands {
         #[command(subcommand)]
         action: GateCommands,
     },
+    /// Coder agent lifecycle hooks (experimental) — simulate/test the consumer
+    Hooks {
+        #[command(subcommand)]
+        action: HooksCommands,
+    },
     /// Reset orchestration files to bundled defaults
     ResetOrchestration,
+    /// Manually manage/clean the shared Redis store
+    Store {
+        #[command(subcommand)]
+        action: StoreCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -82,6 +96,35 @@ enum TenantCommands {
         /// Also purge ns:{tenant}:* from Redis
         #[arg(long)]
         purge: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommands {
+    /// List tenants in the shared store and how many keys each holds (read-only)
+    List,
+    /// Purge a tenant's entire keyspace (ns:{tenant}:*) from the shared store
+    Purge {
+        /// Tenant name
+        name: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Clear a tenant's runtime orchestration state, including ticket-scoped
+    /// worker keys such as status/chat/review/gate/handoff
+    Reset {
+        /// Tenant name
+        name: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Purge the ENTIRE shared store — every key across all tenants (global reset)
+    Wipe {
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -119,6 +162,31 @@ enum GateCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum HooksCommands {
+    /// Simulate Coder dispatching a lifecycle hook event to the consumer.
+    ///
+    /// Signs a JWT exactly like Coder's `chatd` (HS256, iss=coder,
+    /// aud=CODER_CHAT_HOOK_URL, jti=dispatch_id, body_sha256) and POSTs it to
+    /// the configured URL. Lets you exercise the consumer end-to-end without a
+    /// Coder server.
+    Simulate {
+        /// Event to dispatch (session_start, user_prompt_submit, pre_tool_use,
+        /// post_tool_use, pre_compact, post_compact, stop)
+        #[arg(long, default_value = "session_start")]
+        event: String,
+        /// Chat ID to tag the event with (defaults to a generated id)
+        #[arg(long)]
+        chat_id: Option<String>,
+        /// Optional dispatch ID (defaults to a generated one)
+        #[arg(long)]
+        dispatch_id: Option<String>,
+    },
+    /// Run the hook consumer standalone (dev/test). Uses an in-memory store so
+    /// it needs no Redis or Coder. Requires CODER_CHAT_HOOK_SECRET at startup.
+    Serve,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env if present (dev / host CLI use). In the nexus workspace, vars
@@ -133,18 +201,20 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Run) {
-        Commands::Run => run_controller().await,
+    match cli.command.unwrap_or(Commands::Run { reset_store: false }) {
+        Commands::Run { reset_store } => run_controller(reset_store).await,
         Commands::Bootstrap => run_bootstrap().await,
         Commands::Tenant { action } => run_tenant(action).await,
         Commands::Status { tenant, json } => run_status(tenant, json).await,
         Commands::Doctor => openflows::doctor::run_checks().await,
         Commands::Gate { action } => run_gate(action).await,
+        Commands::Hooks { action } => run_hooks(action).await,
         Commands::ResetOrchestration => run_reset().await,
+        Commands::Store { action } => run_store(action).await,
     }
 }
 
-async fn run_controller() -> Result<()> {
+async fn run_controller(reset_store: bool) -> Result<()> {
     let cfg = config::EnvConfig::from_env().context("failed to load environment configuration")?;
     cfg.validate_controller()?;
     let coder_url = cfg.coder.url.clone();
@@ -170,6 +240,14 @@ async fn run_controller() -> Result<()> {
     let store =
         pocketflow_core::SharedStore::new_redis_with_tenant(&redis_url, Some(tenant.clone()))
             .await?;
+    if reset_store {
+        let cleared = reset_tenant_runtime_state(&store).await;
+        tracing::info!(
+            tenant,
+            cleared,
+            "Reset tenant runtime SharedStore state before controller start"
+        );
+    }
 
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
@@ -188,6 +266,8 @@ async fn run_controller() -> Result<()> {
     };
 
     // ── Resolve orchestration directory ─────────────────────────────────
+    // Do this before the hook server so Slice A can hand the consumer the
+    // persona/skills/command paths resolved here.
     let resolver = openflows::orchestration::OrchestrationResolver::new()?;
     let orch_dir = resolver.ensure_orchestration_dir()?;
     resolver.validate()?;
@@ -202,6 +282,64 @@ async fn run_controller() -> Result<()> {
     store
         .set("registry_json", serde_json::json!(registry_json))
         .await;
+
+    // Build the experimental hook-driver context: the reactive kick channel
+    // (Slice B/D, Redis pub/sub) and the bootstrap context (Slice A).
+    let hook_kick_bus = pocketflow_core::build_kick_bus(Some(&redis_url), &tenant)
+        .await
+        .ok();
+    let (hook_publisher, mut hook_kick_rx) = match hook_kick_bus {
+        Some((p, r)) => (Some(p), Some(r)),
+        None => {
+            tracing::warn!("Failed to build hook kick bus; reactive wake disabled");
+            (None, None)
+        }
+    };
+
+    let hook_bootstrap = {
+        let mut persona_by_role = std::collections::HashMap::new();
+        for role in ["forge", "sentinel", "vessel", "lore", "nexus"] {
+            let path = resolver.persona_path(&format!("{role}.agent.md"));
+            persona_by_role.insert(role.to_string(), path);
+        }
+        Some(agent_nexus::hooks::HookBootstrapContext {
+            persona_by_role,
+            skills_dir: Some(orch_dir.join("plugin/skills")),
+            commands_dir: Some(orch_dir.join("plugin/commands")),
+        })
+    };
+
+    // ── Coder Agent Lifecycle Hooks (experimental) ──────────────────────
+    // OpenFlows consumes Coder's deployment-wide lifecycle webhook so we can
+    // observe and centrally policy agent events. Coder's experiment flag and URL
+    // are wired by compose; this process starts the consumer when it has the
+    // shared hook secret.
+    match agent_nexus::hooks::start_lifecycle_hook_server(
+        std::sync::Arc::new(store.clone()),
+        cfg.hooks.clone(),
+        hook_publisher,
+        hook_bootstrap,
+    )
+    .await
+    {
+        Ok(Some(())) => {
+            if cfg.hooks.hook_logs {
+                tracing::info!("Coder lifecycle hook consumer started");
+            }
+        }
+        Ok(None) => {
+            if cfg.hooks.hook_logs {
+                tracing::debug!("Coder lifecycle hook consumer disabled");
+            }
+        }
+        Err(e) => {
+            // Experimental: warn but do not fail the controller boot.
+            tracing::warn!(
+                error = %e,
+                "Failed to start Coder lifecycle hook consumer; continuing without hooks"
+            );
+        }
+    }
 
     // ── Build flow nodes ────────────────────────────────────────────────
     let nexus_persona = resolver.persona_path("nexus.agent.md");
@@ -322,6 +460,7 @@ async fn run_controller() -> Result<()> {
         poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
         "Starting Controller poll loop"
     );
+    let mut last_pass;
     loop {
         match flow.run(&store).await {
             Ok(final_action) => {
@@ -343,7 +482,36 @@ async fn run_controller() -> Result<()> {
                 );
             }
         }
-        tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
+        last_pass = std::time::Instant::now();
+
+        // Wait either for the full poll interval or for a hook kick to wake us
+        // early (Slice B/D). The reconciliation pass is idempotent, so an early
+        // wake only shortens latency. Guard against a kick-in-every-pass
+        // livelock by enforcing a small minimum delay after each pass.
+        if let Some(rx) = &mut hook_kick_rx {
+            let kick = tokio::select! {
+                _ = tokio::time::sleep(CONTROLLER_POLL_INTERVAL) => None,
+                k = rx.recv() => k,
+            };
+            if let Some(k) = kick {
+                let elapsed = last_pass.elapsed();
+                const MIN_HOOK_WAKE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+                if elapsed < MIN_HOOK_WAKE_DELAY {
+                    tokio::time::sleep(MIN_HOOK_WAKE_DELAY - elapsed).await;
+                }
+                if cfg.hooks.hook_logs {
+                    tracing::info!(
+                        event = %k.event,
+                        hint = %k.hint,
+                        "Hook kick woke the Controller early"
+                    );
+                }
+                continue; // re-run the reconciliation pass immediately
+            }
+            // poll interval elapsed; fall through to next pass
+        } else {
+            tokio::time::sleep(CONTROLLER_POLL_INTERVAL).await;
+        }
     }
 }
 
@@ -369,10 +537,21 @@ async fn run_bootstrap() -> Result<()> {
     Ok(())
 }
 
+fn validate_tenant_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "tenant name must not be empty");
+    anyhow::ensure!(
+        name.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+        "tenant name '{name}' contains characters that are not allowed in Redis namespace operations; use only ASCII letters, numbers, '.', '_' and '-'"
+    );
+    Ok(())
+}
+
 async fn run_tenant_clean(action: &TenantCommands) -> Result<()> {
     let TenantCommands::Clean { name, reset_all } = action else {
         unreachable!("run_tenant_clean called with non-clean action");
     };
+    validate_tenant_name(name)?;
 
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
     // Scope the store to the tenant we are cleaning: SharedStore namespaces
@@ -472,6 +651,7 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
         TenantCommands::Add { repo, name } => {
             let tenant_name =
                 name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
+            validate_tenant_name(&tenant_name)?;
 
             println!(
                 "Adding tenant '{}' for repository '{}'...",
@@ -517,6 +697,7 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
             }
         }
         TenantCommands::Remove { name, purge } => {
+            validate_tenant_name(&name)?;
             println!("Removing tenant '{}'...", name);
 
             if purge {
@@ -549,6 +730,177 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn runtime_state_keys(
+    store: &pocketflow_core::SharedStore,
+) -> std::collections::BTreeSet<String> {
+    let exact_keys = [
+        "tickets",
+        "worker_slots",
+        "pending_prs",
+        "open_prs",
+        "command_gate",
+        "_no_work_count",
+        "_hook_events_tail",
+        "registry_json",
+        "ci_readiness",
+        "repository",
+        "documentation_queue",
+    ];
+    let patterns = ["ticket:*", "pair:*", "heartbeat:*", "audit:*"];
+
+    let mut keys = std::collections::BTreeSet::new();
+    for key in exact_keys {
+        keys.extend(store.keys(key).await);
+    }
+    for pattern in patterns {
+        keys.extend(store.keys(pattern).await);
+    }
+    keys
+}
+
+async fn reset_tenant_runtime_state(store: &pocketflow_core::SharedStore) -> usize {
+    let keys = runtime_state_keys(store).await;
+    let count = keys.len();
+    for key in keys {
+        store.raw_del(&key).await;
+    }
+    count
+}
+
+async fn run_store(action: StoreCommands) -> Result<()> {
+    let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
+    let store = pocketflow_core::SharedStore::new_redis(&redis_url)
+        .await
+        .context("Redis not reachable")?;
+
+    match action {
+        StoreCommands::List => {
+            // raw_keys scans full Redis keys (`ns:*`) without re-applying the
+            // tenant namespace, so we can enumerate every tenant and count keys.
+            let keys: Vec<String> = store.raw_keys("ns:*").await;
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for key in keys {
+                if let Some(ns) = key.strip_prefix("ns:") {
+                    if let Some(tenant) = ns.split(':').next() {
+                        *counts.entry(tenant.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+            if counts.is_empty() {
+                println!("  (shared store is empty — no tenants found)");
+            } else {
+                for (tenant, count) in &counts {
+                    println!("  - {}: {} key(s)", tenant, count);
+                }
+            }
+        }
+        StoreCommands::Purge { name, yes } => {
+            validate_tenant_name(&name)?;
+            let pattern = format!("ns:{}:*", name);
+            let keys: Vec<String> = store.raw_keys(&pattern).await;
+            if keys.is_empty() {
+                println!("  ✗ No keys found for tenant '{}'", name);
+                return Ok(());
+            }
+            println!(
+                "  Purging {} key(s) for tenant '{}' from the shared store...",
+                keys.len(),
+                name
+            );
+            if !yes && !confirm()? {
+                println!("  Aborted — no keys were removed.");
+                return Ok(());
+            }
+            for key in &keys {
+                store.raw_del(key).await;
+            }
+            println!("  ✓ Purged {} key(s) for tenant '{}'", keys.len(), name);
+            println!("  (Restart the controller to pick up changes)");
+        }
+        StoreCommands::Reset { name, yes } => {
+            validate_tenant_name(&name)?;
+            let tenant_store = match pocketflow_core::SharedStore::new_redis_with_tenant(
+                &redis_url,
+                Some(name.clone()),
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  ✗ Redis error: {}", e);
+                    return Ok(());
+                }
+            };
+
+            let matching = runtime_state_keys(&tenant_store).await;
+            if matching.is_empty() {
+                println!(
+                    "  (no runtime orchestration state found for tenant '{}')",
+                    name
+                );
+                println!("  (Restart the controller to pick up changes)");
+                return Ok(());
+            }
+
+            println!(
+                "  Resetting {} runtime orchestration key(s) for tenant '{}'",
+                matching.len(),
+                name
+            );
+            if !yes && !confirm()? {
+                println!("  Aborted — no keys were removed.");
+                return Ok(());
+            }
+
+            let cleared = reset_tenant_runtime_state(&tenant_store).await;
+            if cleared > 0 {
+                println!(
+                    "  ✓ Cleared {} orchestration key(s) for tenant '{}'",
+                    cleared, name
+                );
+            } else {
+                println!("  (no orchestration state found for tenant '{}')", name);
+            }
+            println!("  (Restart the controller to pick up changes)");
+        }
+        StoreCommands::Wipe { yes } => {
+            // raw_keys("ns:*") matches every tenant namespace plus any other
+            // shared keys, so this is a true whole-store global reset.
+            let keys: Vec<String> = store.raw_keys("ns:*").await;
+            if keys.is_empty() {
+                println!("  (shared store is already empty — nothing to wipe)");
+                return Ok(());
+            }
+            println!(
+                "  Wiping the ENTIRE shared store: {} key(s) across all tenants / namespaces.",
+                keys.len()
+            );
+            println!("  This is destructive and cannot be undone. All tenants' state is removed.");
+            if !yes && !confirm()? {
+                println!("  Aborted — no keys were removed.");
+                return Ok(());
+            }
+            for key in &keys {
+                store.raw_del(key).await;
+            }
+            println!("  ✓ Wiped {} key(s) from the shared store", keys.len());
+            println!("  (Restart any controller to pick up the clean state)");
+        }
+    }
+
+    Ok(())
+}
+
+fn confirm() -> Result<bool> {
+    use std::io::Write;
+    print!("  Confirm: type 'yes' to continue: ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim().eq_ignore_ascii_case("yes"))
 }
 
 async fn run_status(tenant: Option<String>, json: bool) -> Result<()> {
@@ -673,6 +1025,119 @@ async fn run_gate(action: GateCommands) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn run_hooks(action: HooksCommands) -> Result<()> {
+    match action {
+        HooksCommands::Simulate {
+            event,
+            chat_id,
+            dispatch_id,
+        } => {
+            let cfg = config::EnvConfig::from_env()
+                .context("failed to load environment configuration")?;
+            let hook_url = hook_simulate_url(&cfg.hooks)?;
+            let secret = cfg.hooks.chat_hook_secret.clone().context(
+                "CODER_CHAT_HOOK_SECRET is not set. It must match the consumer's.\n\
+                 Generate one with: openssl rand -hex 32",
+            )?;
+            // Generate stable-ish test ids from the process id + timestamp (no
+            // extra dependency needed in the binary crate).
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let pid = std::process::id();
+            let dispatch_id =
+                dispatch_id.unwrap_or_else(|| format!("sim-{}-{}", event.replace('_', "-"), pid));
+            let chat_id = chat_id.unwrap_or_else(|| format!("chat-sim-{}-{}", pid, ts));
+
+            println!(
+                "Simulating Coder dispatch → `{}` (event={event}, dispatch_id={dispatch_id})",
+                hook_url
+            );
+            let (status, body) = agent_nexus::hooks::dispatch_simulated_event(
+                &hook_url,
+                &secret,
+                &event,
+                &chat_id,
+                &dispatch_id,
+            )
+            .await?;
+            println!("Consumer responded with HTTP {status}");
+            if !body.trim().is_empty() {
+                println!("Response body: {body}");
+            }
+            if status == 200 || status == 204 {
+                println!("✓ Event observed by the OpenFlows hook consumer.");
+            } else {
+                println!("✗ Hook consumer rejected the event. Check the consumer logs.");
+            }
+        }
+        HooksCommands::Serve => {
+            // Standalone consumer for local testing: in-memory store (no Redis),
+            // so `openflows hooks simulate` can fire events at it end-to-end.
+            let mut cfg = config::EnvConfig::from_env().context(
+                "failed to load environment configuration (CODER_CHAT_HOOK_SECRET must be exported)",
+            )?;
+            if std::env::var("OPENFLOWS_HOOK_HOST")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .is_none()
+            {
+                cfg.hooks.hook_host = "127.0.0.1".to_string();
+            }
+            let store = std::sync::Arc::new(pocketflow_core::SharedStore::new_in_memory());
+            // In-memory kick bus so slice B/D wake behaviour can be exercised
+            // locally even without Redis.
+            let kick_publisher = pocketflow_core::build_kick_bus(None, "default")
+                .await
+                .map(|(p, _r)| p)
+                .ok();
+            tracing::info!(
+                hook_url = %cfg.hooks.hook_public_url().unwrap_or_default(),
+                "Starting standalone lifecycle hook consumer (in-memory store)"
+            );
+            match agent_nexus::hooks::start_lifecycle_hook_server(
+                store,
+                cfg.hooks.clone(),
+                kick_publisher,
+                None,
+            )
+            .await
+            {
+                Ok(Some(())) => {
+                    println!("Listening on {}", cfg.hooks.hook_addr);
+                    println!(
+                        "Run `openflows hooks simulate` with the same CODER_CHAT_HOOK_SECRET."
+                    );
+                    // Keep the process alive serving requests.
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                    }
+                }
+                Ok(None) => {
+                    anyhow::bail!("consumer not started: set CODER_CHAT_HOOK_SECRET");
+                }
+                Err(e) => anyhow::bail!("failed to start consumer: {e:#}"),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn hook_simulate_url(hooks: &config::env::CoderHooksConfig) -> Result<String> {
+    if let Ok(url) = std::env::var("CODER_CHAT_HOOK_URL") {
+        if !url.trim().is_empty() {
+            return Ok(url);
+        }
+    }
+
+    let port = hooks
+        .port()
+        .context("OPENFLOWS_HOOK_ADDR has no usable port for hook simulation")?;
+    Ok(format!("http://127.0.0.1:{port}/experimental/hooks/chat"))
 }
 
 async fn run_reset() -> Result<()> {

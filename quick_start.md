@@ -234,6 +234,8 @@ These are optional — the defaults work out of the box. Only touch them if you 
 | `REDIS_URL` | `redis://localhost:6379` | Set only if you host Redis elsewhere. |
 | `CODER_URL` | `http://localhost:7080` | Set only if you host Coder elsewhere. |
 | `OPENFLOWS_TENANT` | `default` | Namespace for Redis keys. |
+| `CODER_CHAT_HOOK_SECRET` | required | Generate 32+ random bytes, for example `openssl rand -hex 32`; hook URL/experiment/bind values are wired automatically. |
+| `OPENFLOWS_HOOK_LOGS` | `false` | Set `true` only when debugging lifecycle hook traffic. |
 | `SLACK_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` | unset | Escalation notifications. |
 
 ### Granting a non-admin (OAuth) user the needed permissions
