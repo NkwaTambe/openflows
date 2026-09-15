@@ -184,7 +184,7 @@ pub async fn build_kick_bus(
             subscriber.init().await?;
             subscriber.subscribe(channel.as_str()).await?;
 
-            let _ = subscriber.manage_subscriptions();
+            std::mem::drop(subscriber.manage_subscriptions());
 
             Ok((
                 HookKickPublisher {

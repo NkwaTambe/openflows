@@ -3,11 +3,11 @@
 //!
 //! Sentinel has no `status set` phases of its own: its "job" is *derived* from
 //! the shared ticket's durable state (what FORGE is doing). Two review jobs:
-//!   - `plan_gate`  — FORGE is `planning` and the gate is not approved yet →
-//!                    review `PLAN.md`, then `gate approve`.
-//!   - `pr_review`  — FORGE is `review_ready` with a PR → review the diff, write
-//!                    the evaluation report, then `review submit`.
-//!   - `idle`       — nothing pending; no review action should be taken.
+//!   - `plan_gate` — FORGE is `planning` and the gate is not approved yet →
+//!     review `PLAN.md`, then `gate approve`.
+//!   - `pr_review` — FORGE is `review_ready` with a PR → review the diff, write
+//!     the evaluation report, then `review submit`.
+//!   - `idle` — nothing pending; no review action should be taken.
 //!
 //! Rules mirror FORGE's phase guard but for the reviewing direction:
 //!   - Sentinel is read-only for source; only review artifacts (*-eval.md,
@@ -126,14 +126,15 @@ pub async fn sentinel_phase_guard(
     }
 
     // A review verdict requires the evaluation report to be written first.
-    if command.contains("review submit") && sentinel_job(st) == SentinelJob::PrReview {
-        if !review_report_exists(store, ticket_id).await {
-            return HookDecision::deny(
-                "openflows policy: cannot submit a review yet — write your evaluation \
-                 report (*-eval.md / final-review.md) first, then `review submit`.",
-            )
-            .with_model_context(guidance);
-        }
+    if command.contains("review submit")
+        && sentinel_job(st) == SentinelJob::PrReview
+        && !review_report_exists(store, ticket_id).await
+    {
+        return HookDecision::deny(
+            "openflows policy: cannot submit a review yet — write your evaluation \
+             report (*-eval.md / final-review.md) first, then `review submit`.",
+        )
+        .with_model_context(guidance);
     }
 
     // A verdict submitted outside the PR-review job is out of order.

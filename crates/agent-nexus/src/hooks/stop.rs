@@ -13,6 +13,7 @@
 //!   - forge reached review_ready (PR submitted),
 //!   - blocked with a reason,
 //!   - fuel exhausted.
+//!
 //! Otherwise it is classified *premature* (no kick; the Controller's FlowRecovery
 //! treats an unexpected stop as a stalled worker on its next poll).
 

@@ -31,5 +31,4 @@ futures = { workspace = true }
 # Coder agent lifecycle hooks (experimental) consumer
 jsonwebtoken = "9"
 sha2 = "0.10"
-base64 = "0.22"
 reqwest = { workspace = true }

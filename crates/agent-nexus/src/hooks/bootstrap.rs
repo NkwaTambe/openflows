@@ -195,10 +195,10 @@ pub async fn build_bootstrap_context(
         }
         _ => {}
     }
-    top.push_str(&format!(
+    top.push_str(
         "You are working this ticket. Re-check `openflows-harness status get` and \
-         `openflows-harness dispatch read`.\n"
-    ));
+         `openflows-harness dispatch read`.\n",
+    );
     parts.push(top);
 
     if !persona.is_empty() {

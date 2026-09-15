@@ -287,7 +287,6 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     // (Slice B/D, Redis pub/sub) and the bootstrap context (Slice A).
     let hook_kick_bus = pocketflow_core::build_kick_bus(Some(&redis_url), &tenant)
         .await
-        .map(|(publisher, receiver)| (publisher, receiver))
         .ok();
     let (hook_publisher, mut hook_kick_rx) = match hook_kick_bus {
         Some((p, r)) => (Some(p), Some(r)),
