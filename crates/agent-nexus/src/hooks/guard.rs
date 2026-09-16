@@ -98,7 +98,65 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
         return None;
     }
 
+    // Unknown-but-write-capable commands (dd of=, curl -o, wget -O, git
+    // checkout/restore/..., sh -c ...) have filesystem effects the operand
+    // parser does not capture. Fail closed: treat them as potential writes in
+    // write-restricted phases rather than assuming they are read-only.
+    if is_write_capable_command(command) {
+        return None;
+    }
+
     Some(Vec::new())
+}
+
+/// Detect commands whose own syntax can write files in a way the redirection /
+/// operand parsers do not capture (`dd of=`, `curl -o`, `wget -O`,
+/// `git checkout`/`git restore`, a nested `sh -c`, ...). Such commands must be
+/// treated as write-capable, otherwise they could silently alter source in a
+/// write-restricted phase.
+fn is_write_capable_command(command: &str) -> bool {
+    let words = shell_words(command);
+    if words.is_empty() {
+        return false;
+    }
+    // Strip wrappers that merely forward to the real command.
+    let cmd = words
+        .iter()
+        .map(|w| w.as_str())
+        .find(|w| {
+            !matches!(
+                *w,
+                "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
+            )
+        })
+        .unwrap_or_default();
+    match cmd {
+        "dd" => true,
+        "curl" | "wget" => words
+            .iter()
+            .any(|w| w == "-o" || w == "-O" || w.starts_with("--output")),
+        "git" => {
+            let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
+            matches!(
+                sub,
+                "checkout"
+                    | "restore"
+                    | "reset"
+                    | "stash"
+                    | "rm"
+                    | "mv"
+                    | "apply"
+                    | "am"
+                    | "merge"
+                    | "rebase"
+                    | "cherry-pick"
+                    | "clean"
+                    | "pull"
+            )
+        }
+        "sh" | "bash" | "zsh" | "ksh" | "dash" => words.iter().any(|w| w == "-c"),
+        _ => false,
+    }
 }
 
 fn redirection_targets(words: &[String]) -> Vec<String> {
@@ -218,10 +276,13 @@ fn is_write_attempt(tool_name: &str, input: &Value) -> bool {
 }
 
 /// Is the tool a read-only probe (bash read of status/dispatch/plan)?
+///
+/// `status set` is deliberately *not* a probe: it mutates durable state and,
+/// in a blocked worker, would otherwise allow an unapproved phase transition
+/// (e.g. `status set building`) to escape the blockage.
 fn is_probe_command(command: &str) -> bool {
     let cmd = command.to_lowercase();
     cmd.contains("status get")
-        || cmd.contains("status set") // set is coordinated by the harness, not a source write
         || cmd.contains("gate status")
         || cmd.contains("dispatch read")
         || cmd.contains("plan read")
@@ -279,11 +340,14 @@ fn target_path(input: &Value) -> String {
 }
 
 /// True when the write is to / creates the plan artifact.
+///
+/// Plan writes are determined from the *validated target path* or the exact
+/// harness `plan write` command — never from an unvalidated `is_plan` flag on
+/// the tool input. Trusting a caller-supplied `is_plan: true` marker would let
+/// a write to any source path masquerade as a plan write and slip past the
+/// phase gate.
 fn is_plan_write(tool_name: &str, input: &Value) -> bool {
     if tool_name.to_lowercase().contains("plan") {
-        return true;
-    }
-    if input.get("is_plan").and_then(|v| v.as_bool()) == Some(true) {
         return true;
     }
     let path = target_path(input).to_lowercase();
@@ -484,18 +548,24 @@ pub async fn phase_guard(
 
     // ── BLOCKED ───────────────────────────────────────────────────────────
     if phase == "blocked" {
-        let is_coordination = is_harness(&lower)
-            || (is_shell(&lower)
-                && input
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(is_probe_command)
-                    .unwrap_or(false));
+        // Only read-only probes, blocker writes, and *returning to planning*
+        // (re-planning) are permitted. Arbitrary forward transitions (e.g.
+        // `status set building`) require explicit NEXUS/human authorization
+        // and must not be reachable from a blocked worker.
+        let command = input
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let is_readonly_probe = is_shell(&lower) && is_probe_command(&command);
+        let is_replan = (is_harness(&lower) || is_shell(&lower))
+            && (command.contains("status set planning") || command.contains("status set blocked"));
         let is_blocker = is_write_tool(&lower) && is_blocker_write(&lower, input);
-        if !is_coordination && !is_blocker {
+        if !is_readonly_probe && !is_replan && !is_blocker {
             decision = HookDecision::deny(
-                "openflows policy: FORGE is blocked. Only record a blocker (STATUS.json) \
-                 and probe state; do not write source or build.",
+                "openflows policy: FORGE is blocked. Only record a blocker (STATUS.json), \
+                 probe state, or return to `status set planning`; do not write source or \
+                 build.",
             );
         }
         return decision.with_model_context(guidance);

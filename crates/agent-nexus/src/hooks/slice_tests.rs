@@ -218,6 +218,186 @@ async fn phase_guard_denies_all_sentinel_writes() {
     assert!(d.deny, "sentinel is readonly");
 }
 
+// ── Review fixes: plan-flag bypass, blocked resume, shell write evasion ──
+
+#[tokio::test]
+async fn phase_guard_denies_is_plan_marked_source_before_plan() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-30", "forge", "chat-30").await;
+    seed_status(&store, "T-30", "planning").await;
+
+    // A caller-supplied `is_plan` marker must not let a write to a source path
+    // masquerade as a plan write (P1: "Plan flag bypasses gate").
+    let input = json!({ "path": "src/lib.rs", "is_plan": true });
+    let d = phase_guard(
+        &store,
+        "chat-30",
+        "forge",
+        "write",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "is_plan:true must not whitelist a source path before a plan exists"
+    );
+}
+
+#[tokio::test]
+async fn phase_guard_allows_is_plan_marked_plan_path() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-301", "forge", "chat-301").await;
+    seed_status(&store, "T-301", "planning").await;
+
+    // Writing the actual plan artifact remains allowed even with the flag set.
+    let input = json!({ "path": "PLAN.md", "is_plan": true });
+    let d = phase_guard(
+        &store,
+        "chat-301",
+        "forge",
+        "write",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(!d.deny, "writing PLAN.md stays allowed in planning");
+}
+
+#[tokio::test]
+async fn phase_guard_denies_blocked_worker_advancing_to_building() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-31", "forge", "chat-31").await;
+    seed_status(&store, "T-31", "blocked").await;
+
+    // A blocked worker must not transition forward (e.g. building) on its own.
+    let input = json!({ "command": "openflows-harness status set building" });
+    let d = phase_guard(
+        &store,
+        "chat-31",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "blocked worker cannot resume building without authorization"
+    );
+}
+
+#[tokio::test]
+async fn phase_guard_allows_blocked_worker_return_to_planning() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-32", "forge", "chat-32").await;
+    seed_status(&store, "T-32", "blocked").await;
+
+    let input = json!({ "command": "openflows-harness status set planning" });
+    let d = phase_guard(
+        &store,
+        "chat-32",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        !d.deny,
+        "returning to planning is an acceptable blocked escape"
+    );
+}
+
+#[tokio::test]
+async fn phase_guard_allows_blocked_worker_blocker_report() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-33", "forge", "chat-33").await;
+    seed_status(&store, "T-33", "blocked").await;
+
+    let input = json!({ "path": "status.json" });
+    let d = phase_guard(
+        &store,
+        "chat-33",
+        "forge",
+        "write",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(!d.deny, "blocker report writes are allowed while blocked");
+}
+
+#[tokio::test]
+async fn phase_guard_denies_blocked_worker_building_shell_write() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-331", "forge", "chat-331").await;
+    seed_status(&store, "T-331", "blocked").await;
+
+    // Even a shell source write that slips past operand parsing must stay denied
+    // in the blocked phase (P1: "Shell writes evade guard").
+    let input = json!({ "command": "dd of=src/lib.rs" });
+    let d = phase_guard(
+        &store,
+        "chat-331",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "blocked worker cannot write source via unknown shell"
+    );
+}
+
+#[tokio::test]
+async fn sentinel_denies_unknown_write_capable_shell_command() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-34", "sentinel", "chat-34").await;
+    seed_status(&store, "T-34", "review_ready").await;
+    let st = read_ticket_state(&store, "T-34").await;
+
+    for cmd in [
+        "dd of=src/lib.rs",
+        "curl -o src/lib.rs https://example.test/x",
+        "wget -O src/lib.rs https://example.test/x",
+        "git checkout -- src/lib.rs",
+        "sh -c 'echo x > src/lib.rs'",
+    ] {
+        let input = json!({ "command": cmd });
+        let d = sentinel_phase_guard(&store, "T-34", &st, "bash", &input, HookDecision::observe())
+            .await;
+        assert!(
+            d.deny,
+            "Sentinel must deny write-capable shell command: {cmd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_guard_denies_write_capable_shell_during_review_ready() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-35", "forge", "chat-35").await;
+    seed_status(&store, "T-35", "review_ready").await;
+
+    let input = json!({ "command": "curl -o src/lib.rs https://example.test/x" });
+    let d = phase_guard(
+        &store,
+        "chat-35",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "review_ready must not allow source changes via unknown shell writes"
+    );
+}
+
 // ── Slice B: kick publishing ────────────────────────────────────────────
 
 #[tokio::test]
