@@ -499,6 +499,7 @@ impl CoderBootstrapper {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the Nexus workspace")?;
+        let hook_url = env_cfg.hooks.chat_hook_url.clone().unwrap_or_default();
 
         let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
@@ -514,6 +515,7 @@ impl CoderBootstrapper {
                     "registry_json": registry_json,
                     "github_pat": github_pat,
                     "coder_chat_hook_secret": hook_secret,
+                    "coder_chat_hook_url": hook_url,
                     "start_controller": false,
                 }),
             })
@@ -778,6 +780,16 @@ impl CoderBootstrapper {
             })
             .filter(|s| !s.trim().is_empty())
             .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the tenant Nexus workspace")?;
+        let hook_url = self
+            .env
+            .as_ref()
+            .and_then(|e| e.hooks.chat_hook_url.clone())
+            .or_else(|| {
+                config::EnvConfig::from_env()
+                    .ok()
+                    .and_then(|c| c.hooks.chat_hook_url)
+            })
+            .unwrap_or_default();
         let workspace = client
             .create_workspace_for_user(
                 &tenant_user.id,
@@ -793,6 +805,7 @@ impl CoderBootstrapper {
                         "github_repository": github_repo,
                         "github_pat": github_pat,
                         "coder_chat_hook_secret": hook_secret,
+                        "coder_chat_hook_url": hook_url,
                         "start_controller": false,
                     }),
                 },
