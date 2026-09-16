@@ -25,6 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 pub mod a2a;
+pub mod hooks;
 
 /// Persona loaded from a `.agent.md` YAML frontmatter block.
 /// (Inlined from the deleted agent-client crate.)
@@ -271,21 +272,45 @@ impl NexusNode {
         registry.resolve_github_token("nexus")
     }
 
+    /// Best-effort GitHub token from the centralized config (`GITHUB_TOKEN`),
+    /// falling back to the `/tmp/github_token` file. Returns `None` when
+    /// neither is available so callers can decide how to degrade.
+    fn resolve_github_token_from_env_or_file(&self) -> Option<String> {
+        config::EnvConfig::from_env()
+            .ok()
+            .and_then(|e| e.github.token)
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/tmp/github_token")
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            })
+    }
+
     fn load_registry(&self) -> Result<Registry> {
         if self.registry_path.exists() {
             return Registry::load(&self.registry_path);
         }
 
-        if let Ok(path) = std::env::var("OPENFLOWS_REGISTRY_PATH") {
+        let tenant = config::EnvConfig::from_env().ok();
+
+        if let Some(path) = tenant
+            .as_ref()
+            .and_then(|t| t.tenant.registry_path.as_deref())
+        {
             let path = PathBuf::from(path);
             if path.exists() {
                 return Registry::load(path);
             }
         }
 
-        if let Ok(content) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
-            let registry: Registry = serde_json::from_str(&content)
-                .context("Failed to parse OPENFLOWS_REGISTRY_JSON")?;
+        if let Some(content) = tenant
+            .as_ref()
+            .and_then(|t| t.tenant.registry_json.as_deref())
+        {
+            let registry: Registry =
+                serde_json::from_str(content).context("Failed to parse OPENFLOWS_REGISTRY_JSON")?;
             return Ok(registry);
         }
 
@@ -311,7 +336,10 @@ impl NexusNode {
     fn load_skills_for_role(&self, role: &str) -> String {
         let mut skills = Vec::new();
 
-        if let Ok(reg_json) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
+        if let Some(reg_json) = config::EnvConfig::from_env()
+            .ok()
+            .and_then(|e| e.tenant.registry_json)
+        {
             if let Ok(registry) = serde_json::from_str::<config::Registry>(&reg_json) {
                 if let Some(entry) = registry.get(role) {
                     for skill_name in &entry.skills {
@@ -346,15 +374,12 @@ Before significant work, read the relevant skill file to understand the workflow
 
         let token = match self.resolve_github_token() {
             Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => match std::env::var("GITHUB_TOKEN") {
-                Ok(t) if !t.is_empty() => t,
-                Ok(_) | Err(_) => match std::fs::read_to_string("/tmp/github_token") {
-                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    Ok(_) | Err(_) => {
-                        warn!("GitHub token not configured, skipping issue sync");
-                        return Ok(());
-                    }
-                },
+            Ok(_) | Err(_) => match self.resolve_github_token_from_env_or_file() {
+                Some(t) => t,
+                None => {
+                    warn!("GitHub token not configured, skipping issue sync");
+                    return Ok(());
+                }
             },
         };
 
@@ -417,21 +442,15 @@ Before significant work, read the relevant skill file to understand the workflow
 
         let token = match self.resolve_github_token() {
             Ok(t) => t,
-            Err(_) => match std::env::var("GITHUB_TOKEN") {
-                Ok(t) if !t.is_empty() => {
-                    info!("Using GITHUB_TOKEN env var for PR sync");
+            Err(_) => match self.resolve_github_token_from_env_or_file() {
+                Some(t) => {
+                    info!("Using GITHUB_TOKEN env var / token file for PR sync");
                     t
                 }
-                Ok(_) | Err(_) => match std::fs::read_to_string("/tmp/github_token") {
-                    Ok(t) if !t.trim().is_empty() => {
-                        info!("Using /tmp/github_token file for PR sync");
-                        t.trim().to_string()
-                    }
-                    Ok(_) | Err(_) => {
-                        warn!("GitHub token not configured, skipping PR sync");
-                        return Ok(());
-                    }
-                },
+                None => {
+                    warn!("GitHub token not configured, skipping PR sync");
+                    return Ok(());
+                }
             },
         };
 
@@ -740,12 +759,13 @@ Before significant work, read the relevant skill file to understand the workflow
     }
 
     async fn coder_client_from_store(store: &SharedStore) -> Option<CoderClient> {
+        let coder_cfg = config::EnvConfig::from_env().ok();
         let coder_url: Option<String> = store
             .get_typed("coder_url")
             .await
-            .or_else(|| std::env::var("CODER_URL").ok());
-        let coder_token: Option<String> = std::env::var("CODER_SESSION_TOKEN")
-            .ok()
+            .or_else(|| coder_cfg.as_ref().map(|e| e.coder.url.clone()));
+        let coder_token: Option<String> = coder_cfg
+            .and_then(|e| e.coder.session_token)
             .or_else(|| std::env::var("CODER_API_TOKEN").ok());
         let coder_token = if coder_token.as_deref().is_some_and(|t| !t.is_empty()) {
             coder_token
@@ -876,8 +896,18 @@ Before significant work, read the relevant skill file to understand the workflow
                 "role": worker_id,
                 "ticket_id": ticket_id,
                 "redis_url": "redis://redis:6379",
-                "tenant": std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string()),
-                "coder_url": coder_url.unwrap_or_else(|| std::env::var("CODER_URL").unwrap_or_default()),
+                "tenant": config::EnvConfig::from_env()
+                    .map(|e| e.tenant.effective_tenant().to_string())
+                    .unwrap_or_else(|_| "default".to_string()),
+                "coder_url": coder_url.unwrap_or_else(|| {
+                    config::EnvConfig::from_env()
+                        .map(|e| e.coder.url)
+                        .unwrap_or_default()
+                }),
+                // Prefer a PAT for git in the workspace so clones/pushes work on
+                // any accessible repo regardless of GitHub App install scope.
+                // Falls back inside the template to the Coder GitHub App token.
+                "github_pat": self.resolve_github_token_from_env_or_file(),
             }),
         };
         // Inject the Terraform variable the template reads.
@@ -934,8 +964,10 @@ Before significant work, read the relevant skill file to understand the workflow
                         // blocked rather than silently falling back).
                         return Err(anyhow::anyhow!(
                             "Coder workspace {} did not become ready after {} attempts ({}s each): {}",
-                            workspace.id, max_ready_attempts,
-                            base_ready_timeout_secs, e
+                            workspace.id,
+                            max_ready_attempts,
+                            base_ready_timeout_secs,
+                            e
                         ));
                     }
                     // Brief pause before retry
@@ -1311,7 +1343,9 @@ Before significant work, read the relevant skill file to understand the workflow
         // when the hook rewrites or overrides initial prompts.
         // The hook's stdout becomes the session context automatically in Claude Code.
         use coder_client::types::{build_chat_labels, CreateChatRequest};
-        let tenant = std::env::var("OPENFLOWS_TENANT").unwrap_or_else(|_| "default".to_string());
+        let tenant = config::EnvConfig::from_env()
+            .map(|e| e.tenant.effective_tenant().to_string())
+            .unwrap_or_else(|_| "default".to_string());
         let labels = build_chat_labels(ticket_id, role, "openflows", &tenant);
 
         // Resolve the default organization ID required by the Coder chats API.
@@ -1396,7 +1430,13 @@ Use `openflows-harness` for all coordination:
             ),
             None => format!(
                 "## {} Agent — Ticket {}\n\nYou are **{}**, a specialized agent.\n\n{}\n\n{}\n\n{}\n\n{}",
-                role.to_uppercase(), ticket_id, role, skills_content, ticket_content, dispatch_info, coordination_info
+                role.to_uppercase(),
+                ticket_id,
+                role,
+                skills_content,
+                ticket_content,
+                dispatch_info,
+                coordination_info
             ),
         };
 
@@ -1714,8 +1754,11 @@ Use `openflows-harness` for all coordination:
                             }
                         };
 
-                        let forge_chat_key =
-                            full_ticket_key(&ticket.id, KEY_TICKET_CHAT, &forge_worker_id);
+                        let forge_chat_key = full_ticket_key(
+                            &ticket.id,
+                            KEY_TICKET_CHAT,
+                            Self::worker_role(&forge_worker_id),
+                        );
                         let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
 
                         if let Some(ref forge_chat_id) = forge_chat_id {
@@ -1991,7 +2034,7 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = format!(
-                         "## Planning Gate Review — Ticket {}\n\n\
+                        "## Planning Gate Review — Ticket {}\n\n\
                          FORGE has written a plan and is waiting for your approval before \
                          proceeding to implementation.\n\n\
                          **Your task:**\n\
@@ -2005,9 +2048,7 @@ Use `openflows-harness` for all coordination:
                          approve the gate\n\n\
                          Use `openflows-harness dispatch read` for ticket context.\n\n\
                          **Ticket:** {} — {}\n",
-                        ticket.id,
-                        ticket.id,
-                        ticket.title,
+                        ticket.id, ticket.id, ticket.title,
                     );
 
                     // Resolve organization_id first - fail fast if unavailable
@@ -2085,7 +2126,29 @@ Use `openflows-harness` for all coordination:
                                     full_ticket_key(&ticket.id, KEY_TICKET_REVIEW, "sentinel");
                                 let existing_review: Option<Value> =
                                     store.get_typed(&review_key).await;
-                                if existing_review.is_none() {
+                                // Hardening: only treat a Waiting sentinel chat as
+                                // "orphaned" while the ticket is STILL in review_ready
+                                // and no verdict has been recorded. The reject path
+                                // (agent-sentinel) moves the phase off review_ready and
+                                // records a review key before deleting the sentinel
+                                // binding, so re-checking the current phase here prevents
+                                // clearing/re-spawning a reviewer for an already-decided
+                                // (especially already-rejected) ticket.
+                                let status_key =
+                                    full_ticket_key_flat(&ticket.id, KEY_TICKET_STATUS);
+                                let still_review_ready = store
+                                    .get_typed::<Value>(&status_key)
+                                    .await
+                                    .and_then(|v| {
+                                        v.get("phase")
+                                            .and_then(|p| p.as_str())
+                                            .map(|p| p == "review_ready")
+                                    })
+                                    .unwrap_or(false);
+                                if Self::should_clear_orphaned_sentinel(
+                                    existing_review.is_some(),
+                                    still_review_ready,
+                                ) {
                                     warn!(
                                         ticket_id = %ticket.id,
                                         chat_id = %chat_id,
@@ -2219,11 +2282,35 @@ Use `openflows-harness` for all coordination:
                         }
                     };
 
+                    // Build a prompt that instructs SENTINEL to review the completed
+                    // PR and record its verdict through the harness command. This is
+                    // the machine-readable handshake the controller reacts to; without
+                    // it the review never lands and the sentinel chat is re-spawned
+                    // as "orphaned" on every poll (see sibling planning-gate prompt).
+                    let pr_review_prompt = format!(
+                        "## PR Review — Ticket {}\n\n\
+                         FORGE has completed the work and opened a PR. Your job is to \
+                         review it and record a verdict for the controller.\n\n\
+                         **Your task:**\n\
+                         1. Read the ticket context via `openflows-harness dispatch read` \
+                         and review the upstream plan via `openflows-harness plan read`\n\
+                         2. Review the PR: spec compliance, logic, tests, security, and \
+                         code quality (see your provisioning `SKILL.md`)\n\
+                         3. Write your full evaluation to a markdown report file (e.g. \
+                         `segment-N-eval.md` / `final-review.md`)\n\
+                         4. Record your verdict for the controller by running:\n\
+                            `openflows-harness review submit --verdict <approve|reject> --report <path-to-report-md>`\n\n\
+                         A `reject` loops back to FORGE for rework in its same chat session; \
+                         FORGE re-signals `openflows-harness status set review_ready` when done.\n\n\
+                         **Ticket:** {} — {}\n",
+                        ticket.id, ticket.id, ticket.title,
+                    );
+
                     let chat_req = coder_client::types::CreateChatRequest {
                         organization_id: Some(organization_id),
                         workspace_id: workspace_id.clone(),
                         model_config_id: None,
-                        content: vec![],
+                        content: vec![coder_client::types::ChatInputPart::text(&pr_review_prompt)],
                         labels: Some(labels),
                     };
 
@@ -2443,16 +2530,13 @@ Use `openflows-harness` for all coordination:
 
         let token = match self.resolve_github_token() {
             Ok(t) if !t.is_empty() => t,
-            Ok(_) | Err(_) => match std::env::var("GITHUB_TOKEN") {
-                Ok(t) if !t.is_empty() => t,
-                Ok(_) | Err(_) => match std::fs::read_to_string("/tmp/github_token") {
-                    Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-                    Ok(_) | Err(_) => {
-                        warn!("GitHub token not configured, assuming CI is ready");
-                        store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
-                        return CiReadiness::Ready;
-                    }
-                },
+            Ok(_) | Err(_) => match self.resolve_github_token_from_env_or_file() {
+                Some(t) => t,
+                None => {
+                    warn!("GitHub token not configured, assuming CI is ready");
+                    store.set(KEY_CI_READINESS, json!(CiReadiness::Ready)).await;
+                    return CiReadiness::Ready;
+                }
             },
         };
 
@@ -2479,7 +2563,10 @@ Use `openflows-harness` for all coordination:
     /// Checks common workspace locations like ~/Sandbox/{repo_name}
     fn detect_workspace_path(_owner: &str, repo_name: &str) -> std::path::PathBuf {
         // Check for WORKSPACE_ROOT environment variable first
-        if let Ok(workspace_root) = std::env::var("WORKSPACE_ROOT") {
+        if let Some(workspace_root) = config::EnvConfig::from_env()
+            .ok()
+            .and_then(|e| e.agent.effective_workspace_root())
+        {
             let path = std::path::PathBuf::from(workspace_root).join(repo_name);
             if path.exists() {
                 return path;
@@ -2709,7 +2796,7 @@ Use `openflows-harness` for all coordination:
         let worker_entry = registry.get(&base_id);
 
         // Resolve the worker's GitHub token. resolve_github_token() falls back
-        // to GITHUB_PERSONAL_ACCESS_TOKEN when no dedicated github_token_env is
+        // to GITHUB_TOKEN when no dedicated github_token_env is
         // configured on the registry entry, so agents without a per-agent token
         // still work as long as the fallback env var is set. We do NOT hard-fail
         // on a missing github_token_env field — that would block all v2-style
@@ -2725,7 +2812,7 @@ Use `openflows-harness` for all coordination:
             let env_var_name = worker_entry
                 .as_ref()
                 .and_then(|e| e.github_token_env.as_deref())
-                .unwrap_or("GITHUB_PERSONAL_ACCESS_TOKEN");
+                .unwrap_or("GITHUB_TOKEN");
             let comment = format!(
                 "<!-- openflows-assignment-failure -->\n\
                  ⚠️ **Could not assign this issue to `{}`** — the agent's GitHub token could not \
@@ -2792,12 +2879,12 @@ Use `openflows-harness` for all coordination:
                         github_username
                     );
                     let comment = format!(
-                            "<!-- openflows-assignment-failure -->\n\
+                        "<!-- openflows-assignment-failure -->\n\
                              ⚠️ **Could not assign this issue to `@{}`** — this GitHub user is not a \
                              collaborator on `{}/{}`. To fix this, add `{}` as a collaborator or \
                              adjust repository permissions.",
-                            github_username, owner, repo, github_username
-                        );
+                        github_username, owner, repo, github_username
+                    );
                     Self::post_comment_once(
                         &nexus_client,
                         owner,
@@ -3087,6 +3174,14 @@ Use `openflows-harness` for all coordination:
             .unwrap_or(worker_id)
     }
 
+    /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
+    /// for re-spawn. Only when no review verdict has been recorded AND the ticket is
+    /// still in `review_ready`. A decided (approved/rejected) ticket — in particular
+    /// one already sent back to FORGE for rework — must never be cleared/re-spawned.
+    fn should_clear_orphaned_sentinel(existing_review: bool, still_review_ready: bool) -> bool {
+        !existing_review && still_review_ready
+    }
+
     fn should_resume_existing_chat(status: ChatStatus, last_action: Option<&str>) -> bool {
         match status {
             ChatStatus::Error => true,
@@ -3107,10 +3202,11 @@ Use `openflows-harness` for all coordination:
 
     async fn ticket_phase(store: &SharedStore, ticket_id: &str) -> Option<String> {
         let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
-        store
-            .get(&status_key)
-            .await
-            .and_then(|v| v.get("phase").and_then(|p| p.as_str()).map(String::from))
+        store.get(&status_key).await.and_then(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("phase").and_then(|p| p.as_str()).map(String::from))
+        })
     }
 
     async fn gate_approved(store: &SharedStore, ticket_id: &str, phase: &str) -> bool {
@@ -3300,14 +3396,12 @@ Use `openflows-harness` for all coordination:
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
 
+            let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
+            let chat_status_key = full_ticket_key(ticket_id, "chat_status", role);
             store
-                .set(
-                    &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
-                    json!(chat.status().as_str()),
-                )
+                .set(&chat_status_key, json!(chat.status().as_str()))
                 .await;
 
-            let action_key = full_ticket_key(ticket_id, KEY_TICKET_CHAT_ACTION, role);
             let last_action: Option<String> = store.get_typed(&action_key).await;
             let worker_id = tickets
                 .iter()
@@ -3750,14 +3844,16 @@ impl Node for NexusNode {
             warn!("Failed to sync registry: {}", e);
         }
 
-        let repository = if let Ok(repo) = std::env::var("GITHUB_REPOSITORY") {
-            repo
-        } else {
-            store
+        let repository = match config::EnvConfig::from_env()
+            .ok()
+            .and_then(|e| e.github.repository)
+        {
+            Some(repo) => repo,
+            None => store
                 .get("repository")
                 .await
                 .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default()
+                .unwrap_or_default(),
         };
 
         // Store repository in Redis so workspace provisioning can use it
@@ -4150,7 +4246,9 @@ impl Node for NexusNode {
                 let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
                 let has_assignable = tickets.iter().any(|t| t.is_assignable());
                 if has_assignable {
-                    info!("merge_prs action but no open PRs — assignable tickets exist, falling through to work assignment");
+                    info!(
+                        "merge_prs action but no open PRs — assignable tickets exist, falling through to work assignment"
+                    );
                 } else {
                     info!("merge_prs action but no open PRs and no assignable tickets — no work");
                 }
@@ -4506,5 +4604,78 @@ mod tests {
         assert_eq!(resolved, 1);
         assert!(matches!(tickets[0].status, TicketStatus::Open));
         assert!(matches!(tickets[1].status, TicketStatus::Failed { .. }));
+    }
+
+    // ── Review-orphan hardening (issue: sentinel reject never reaches forge) ──
+
+    #[test]
+    fn worker_role_strips_numeric_suffix() {
+        assert_eq!(NexusNode::worker_role("forge-1"), "forge");
+        assert_eq!(NexusNode::worker_role("forge-42"), "forge");
+        assert_eq!(NexusNode::worker_role("sentinel"), "sentinel");
+    }
+
+    #[test]
+    fn should_not_clear_orphaned_sentinel_when_review_decided() {
+        // A verdict already recorded → never treat as orphaned.
+        assert!(!NexusNode::should_clear_orphaned_sentinel(true, true));
+        // Rejected ticket: phase moved off review_ready (e.g. `building`) with or
+        // without a lingering review key → never clear/re-spawn.
+        assert!(!NexusNode::should_clear_orphaned_sentinel(false, false));
+        assert!(!NexusNode::should_clear_orphaned_sentinel(true, false));
+    }
+
+    #[test]
+    fn should_clear_orphaned_sentinel_only_when_review_ready_and_no_verdict() {
+        // The only legitimate clear: still in review_ready, no verdict, chat Waiting.
+        assert!(NexusNode::should_clear_orphaned_sentinel(false, true));
+    }
+
+    #[tokio::test]
+    async fn review_ready_with_existing_review_is_not_re_spawned() {
+        // Regression: a ticket that already has a sentinel review verdict must
+        // not have an orphaned-clear decision treat it as spawneable.
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-100";
+        let review_key = full_ticket_key(ticket_id, KEY_TICKET_REVIEW, "sentinel");
+        store
+            .set(
+                &review_key,
+                json!({ "verdict": "reject", "report": "fix it" }),
+            )
+            .await;
+        let existing_review = store.get_typed::<Value>(&review_key).await.is_some();
+        assert!(!NexusNode::should_clear_orphaned_sentinel(
+            existing_review,
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejected_ticket_phase_guard_prevents_orphaned_clear() {
+        // Regression: a rejected ticket sits at `building` (phase != review_ready);
+        // even with no lingering review key the sentinel chat must not be re-spawned.
+        let store = SharedStore::new_in_memory();
+        let ticket_id = "T-101";
+        let status_key = full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS);
+        store
+            .set(
+                &status_key,
+                json!({ "phase": "building", "role": "forge", "ts": 1u64 }),
+            )
+            .await;
+        let still_review_ready = store
+            .get_typed::<Value>(&status_key)
+            .await
+            .and_then(|v| {
+                v.get("phase")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p == "review_ready")
+            })
+            .unwrap_or(false);
+        assert!(!NexusNode::should_clear_orphaned_sentinel(
+            false,
+            still_review_ready
+        ));
     }
 }

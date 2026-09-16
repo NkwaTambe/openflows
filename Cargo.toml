@@ -33,7 +33,7 @@ serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # redis
-fred = { version = "10" }
+fred = { version = "10", features = ["subscriber-client"] }
 
 # http
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
@@ -44,6 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # CLI / env
 dotenvy    = "0.15"
+
+# env config
+envconfig = "0.11"
 
 # yaml
 serde_yaml = "0.9"

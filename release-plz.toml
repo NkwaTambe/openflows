@@ -1,13 +1,17 @@
 # release-plz configuration.
 #
 # Drives the release workflow (`.github/workflows/release.yml`), which runs ONLY
-# on pushes to `main` (the default branch):
+# on pushes to `main` (release-only; `develop` is the default branch):
 #   - `release-pr` : scans Conventional Commits since the last tag, computes the
 #                    next version, and opens a `release-plz-*` PR to `main` that
 #                    bumps the manifest + CHANGELOG.
 #   - `release`    : creates the package tag + GitHub Release when the main push
 #                    is the merge of a `release-plz-*` PR
 #                    (`release_always = false`).
+#
+# Release flow: only `develop` merges into `main`, which triggers `release-pr`;
+# the resulting `release-plz-*` version-bump PR merges back into `main` and
+# triggers `release`. The `release-branch.yml` guard enforces this source model.
 #
 # GitHub integration is via git tags only (`git_only = true`) — the shipped
 # package is an application binary that is NOT published to crates.io, so
