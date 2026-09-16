@@ -57,9 +57,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: release-plz/action@b11437f8c0e955c306676ceaf8ce8c54eba6004f # v0.5
+      - uses: release-plz/action@5b353e755cfc29e2efff7365a831d69fef0aaea9 # v0.5.99
         with:
           command: release-pr
+          version: "0.3.167"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -74,8 +75,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: release-plz/action@b11437f8c0e955c306676ceaf8ce8c54eba6004f # v0.5
+      - uses: release-plz/action@5b353e755cfc29e2efff7365a831d69fef0aaea9 # v0.5.99
         with:
           command: release
+          version: "0.3.167"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
