@@ -27,6 +27,10 @@
 git_only = true
 # Explicitly disable crates.io publishing (no CARGO_REGISTRY_TOKEN is provided).
 publish = false
+# `openflows` is an application binary, not a published library, and its only
+# baseline is its own git tag. Skip cargo-semver-checks so a newer rustc rustdoc
+# format (e.g. v60) does not break version determination during release-pr.
+semver_check = false
 # Only release when the main push is the merge of a `release-plz-*` release PR
 # (not on every push), avoiding premature tags before the bump PR merges.
 release_always = false
