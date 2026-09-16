@@ -109,24 +109,85 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
     Some(Vec::new())
 }
 
+/// The known forwarding wrappers that merely pass control to the real command.
+const FORWARDING_WRAPPERS: &[&str] = &["nohup", "nice", "sudo", "env", "setsid", "time", "command"];
+
+/// Wrapper options that consume a *separate* argument token (`sudo -u root`).
+/// These must be skipped together with their value so the value is not mistaken
+/// for the executable.
+const WRAPPER_OPT_WITH_ARG: &[&str] = &[
+    "-u",
+    "--user",
+    "-g",
+    "--group",
+    "-C",
+    "--chroot",
+    "-p",
+    "--prompt",
+    "-D",
+    "--chdir",
+    "-n",
+    "--adjustment",
+    "-S",
+    "--set-home",
+    "-o",
+    "--output",
+];
+
+/// Is `word` a wrapper option (leading dash, not `-` alone)?
+fn is_option_token(word: &str) -> bool {
+    word.len() > 1 && word.starts_with('-')
+}
+
+/// Is `word` an environment assignment (`VAR=value`)?
+fn is_env_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
+    eq > 0 && !word[..eq].contains(['-', '/'])
+}
+
+/// Resolve the index of the real executable after a forwarding-wrapper prefix.
+///
+/// A wrapper is not simply "the first token that is not a wrapper name":
+/// wrapper *arguments* (`sudo -u root`, `env SOME=1 git`, `nice -n 10 git`)
+/// would otherwise be mistaken for the command and let a write-capable
+/// subcommand (e.g. `git checkout`) slip past detection (P1: "Wrapper Arguments
+/// Hide Writes"). We skip wrapper names, their value-consuming options and the
+/// option values, leading `--opt=value` options, and `VAR=value` assignments
+/// before settling on the executable.
+fn resolve_executable_index(segment: &[String]) -> usize {
+    let mut i = 0;
+    while i < segment.len() {
+        let w = segment[i].as_str();
+        if FORWARDING_WRAPPERS.contains(&w) {
+            i += 1;
+            continue;
+        }
+        if WRAPPER_OPT_WITH_ARG.contains(&w) {
+            i += 2; // skip the option and its separate value token
+            continue;
+        }
+        if is_option_token(w) || is_env_assignment(w) {
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+    segment.len().saturating_sub(1)
+}
+
 /// Can one command *segment* (a portion separated by `&&`/`||`/`;`/`|`) write a
 /// file in a way the redirection / operand parsers do not capture?
 ///
 /// Wrappers (`sudo`, `nohup`, `env`, ...) that merely forward to the real
-/// command are stripped first, and the subcommand of a compound command (e.g.
-/// `git checkout`) is resolved *relative to the executable that was actually
-/// found*. Reading the subcommand from a fixed token would break under a
-/// wrapper (`sudo git checkout -- src/lib.rs`) and let the write slip past.
+/// command are stripped first — including their arguments/options — and the
+/// subcommand of a compound command (e.g. `git checkout`) is resolved *relative
+/// to the executable that was actually found*. Reading the subcommand from a
+/// fixed token would break under a wrapper (`sudo -u root git checkout` or
+/// `env SOME=1 git checkout`) and let the write slip past.
 fn segment_is_write_capable(segment: &[String]) -> bool {
-    // The real command is the first token that is not a forwarding wrapper.
-    let Some(cmd_idx) = segment.iter().position(|w| {
-        !matches!(
-            w.as_str(),
-            "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
-        )
-    }) else {
-        return false;
-    };
+    let cmd_idx = resolve_executable_index(segment);
     let cmd = segment[cmd_idx].as_str();
     let rest = &segment[cmd_idx + 1..];
     match cmd {
@@ -310,8 +371,34 @@ fn is_write_attempt(tool_name: &str, input: &Value) -> bool {
 /// `status set` is deliberately *not* a probe: it mutates durable state and,
 /// in a blocked worker, would otherwise allow an unapproved phase transition
 /// (e.g. `status set building`) to escape the blockage.
+///
+/// Probes are matched **per shell segment**, never by substring over the whole
+/// command, so a compound command such as `git status; touch src/lib.rs` is not
+/// a probe: its write segment fails the check and the whole call is denied
+/// instead of allowing a trailing source write past the blocked gate.
+///
+/// An empty or unknown command is **not** a probe: at least one recognized,
+/// non-empty probe segment must match or the whole command is denied, so a
+/// wrapper/argv-driven invocation with no `command` field cannot masquerade as
+/// a read-only probe (P1: "Argv Commands Bypass Blocking").
 fn is_probe_command(command: &str) -> bool {
-    let cmd = command.to_lowercase();
+    let mut saw_probe = false;
+    for seg in command.split([';', '&', '|']) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if !is_probe_segment(seg) {
+            return false;
+        }
+        saw_probe = true;
+    }
+    saw_probe
+}
+
+/// Whether a single shell segment is a recognised read-only probe.
+fn is_probe_segment(seg: &str) -> bool {
+    let cmd = seg.to_lowercase();
     cmd.contains("status get")
         || cmd.contains("gate status")
         || cmd.contains("dispatch read")
@@ -595,12 +682,18 @@ pub async fn phase_guard(
         // (re-planning) are permitted. Arbitrary forward transitions (e.g.
         // `status set building`) require explicit NEXUS/human authorization
         // and must not be reachable from a blocked worker.
-        let command = input
-            .get("command")
-            .and_then(|c| c.as_str())
-            .unwrap_or_default()
-            .to_lowercase();
-        let is_readonly_probe = is_shell(&lower) && is_probe_command(&command);
+        //
+        // Classify the *normalized* command via `command_text` so the same
+        // representation the write detector uses is what we test against: a
+        // tool invoked through `argv` (with no `command` field) must not fall
+        // back to an empty string that vacuously matches a probe (P1: "Argv
+        // Commands Bypass Blocking").
+        let command = command_text(input).to_lowercase();
+        // A probe is only read-only if it is truly write-free: a probe segment
+        // that embeds a source write (e.g. `git status > src/lib.rs` or
+        // `git status | tee src/lib.rs`) must not slip past the blocked gate.
+        let is_readonly_probe =
+            is_shell(&lower) && is_probe_command(&command) && !shell_writes_source(&command);
         let is_replan = (is_harness(&lower) || is_shell(&lower)) && is_exact_replan(&command);
         let is_blocker = is_write_tool(&lower) && is_blocker_write(&lower, input);
         if !is_readonly_probe && !is_replan && !is_blocker {

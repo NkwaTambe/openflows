@@ -113,44 +113,108 @@ fn is_write_capable_command(command: &str) -> bool {
     if words.is_empty() {
         return false;
     }
-    // Strip wrappers that merely forward to the real command.
-    let cmd = words
-        .iter()
+    // A wrapper must not shift the token used to resolve the executable or its
+    // subcommand: wrapper names *and* their arguments/options (`sudo -u root`,
+    // `env SOME=1 git`) are part of the prefix (P1: "Wrapper Arguments Hide
+    // Writes").
+    let cmd_idx = resolve_executable_index(&words);
+    let cmd = words.get(cmd_idx).map(|w| w.as_str()).unwrap_or_default();
+    let next = words
+        .get(cmd_idx + 1)
         .map(|w| w.as_str())
-        .find(|w| {
-            !matches!(
-                *w,
-                "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
-            )
-        })
         .unwrap_or_default();
     match cmd {
         "dd" => true,
         "curl" | "wget" => words
             .iter()
             .any(|w| w == "-o" || w == "-O" || w.starts_with("--output")),
-        "git" => {
-            let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
-            matches!(
-                sub,
-                "checkout"
-                    | "restore"
-                    | "reset"
-                    | "stash"
-                    | "rm"
-                    | "mv"
-                    | "apply"
-                    | "am"
-                    | "merge"
-                    | "rebase"
-                    | "cherry-pick"
-                    | "clean"
-                    | "pull"
-            )
-        }
+        "git" => matches!(
+            next,
+            "checkout"
+                | "restore"
+                | "reset"
+                | "stash"
+                | "rm"
+                | "mv"
+                | "apply"
+                | "am"
+                | "merge"
+                | "rebase"
+                | "cherry-pick"
+                | "clean"
+                | "pull"
+        ),
         "sh" | "bash" | "zsh" | "ksh" | "dash" => words.iter().any(|w| w == "-c"),
         _ => false,
     }
+}
+
+/// The known forwarding wrappers that merely pass control to the real command.
+const FORWARDING_WRAPPERS: &[&str] = &["nohup", "nice", "sudo", "env", "setsid", "time", "command"];
+
+/// Wrapper options that consume a *separate* argument token (`sudo -u root`).
+/// These must be skipped together with their value so the value is not mistaken
+/// for the executable.
+const WRAPPER_OPT_WITH_ARG: &[&str] = &[
+    "-u",
+    "--user",
+    "-g",
+    "--group",
+    "-C",
+    "--chroot",
+    "-p",
+    "--prompt",
+    "-D",
+    "--chdir",
+    "-n",
+    "--adjustment",
+    "-S",
+    "--set-home",
+    "-o",
+    "--output",
+];
+
+/// Is `word` a wrapper option (leading dash, not `-` alone)?
+fn is_option_token(word: &str) -> bool {
+    word.len() > 1 && word.starts_with('-')
+}
+
+/// Is `word` an environment assignment (`VAR=value`)?
+fn is_env_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
+    eq > 0 && !word[..eq].contains(['-', '/'])
+}
+
+/// Resolve the index of the real executable after a forwarding-wrapper prefix.
+///
+/// A wrapper is not simply "the first token that is not a wrapper name":
+/// wrapper *arguments* (`sudo -u root`, `env SOME=1 git`, `nice -n 10 git`)
+/// would otherwise be mistaken for the command and let a write-capable
+/// subcommand (e.g. `git checkout`) slip past detection (P1: "Wrapper Arguments
+/// Hide Writes"). We skip wrapper names, their value-consuming options and the
+/// option values, leading `--opt=value` options, and `VAR=value` assignments
+/// before settling on the executable.
+fn resolve_executable_index(segment: &[String]) -> usize {
+    let mut i = 0;
+    while i < segment.len() {
+        let w = segment[i].as_str();
+        if FORWARDING_WRAPPERS.contains(&w) {
+            i += 1;
+            continue;
+        }
+        if WRAPPER_OPT_WITH_ARG.contains(&w) {
+            i += 2; // skip the option and its separate value token
+            continue;
+        }
+        if is_option_token(w) || is_env_assignment(w) {
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+    segment.len().saturating_sub(1)
 }
 
 fn redirection_targets(words: &[String]) -> Vec<String> {

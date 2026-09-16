@@ -353,6 +353,123 @@ async fn phase_guard_denies_blocked_worker_building_shell_write() {
 }
 
 #[tokio::test]
+async fn phase_guard_denies_blocked_worker_compound_probe_write() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-332", "forge", "chat-332").await;
+    seed_status(&store, "T-332", "blocked").await;
+
+    // A probe substring (git status) followed by a write must NOT classify the
+    // whole command as a read-only probe (P1: "Blocked Probe Allows Writes").
+    let input = json!({ "command": "git status; touch src/lib.rs" });
+    let d = phase_guard(
+        &store,
+        "chat-332",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "compound probe+write command must be denied while blocked"
+    );
+}
+
+#[tokio::test]
+async fn phase_guard_allows_blocked_worker_pure_probe() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-333", "forge", "chat-333").await;
+    seed_status(&store, "T-333", "blocked").await;
+
+    // A standalone read-only probe must still be allowed while blocked.
+    let input = json!({ "command": "git status" });
+    let d = phase_guard(
+        &store,
+        "chat-333",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        !d.deny,
+        "a pure read-only probe stays allowed while blocked"
+    );
+}
+
+#[tokio::test]
+async fn phase_guard_denies_blocked_worker_probe_with_embedded_write() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-334", "forge", "chat-334").await;
+    seed_status(&store, "T-334", "blocked").await;
+
+    // A probe whose command itself embeds a source write (redirection / tee)
+    // must be denied while blocked, even though it matches a probe substring
+    // (P1: "Blocked Probe Allows Writes").
+    for command in ["git status > src/lib.rs", "git status | tee src/lib.rs"] {
+        let input = json!({ "command": command });
+        let d = phase_guard(
+            &store,
+            "chat-334",
+            "forge",
+            "bash",
+            &input,
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            d.deny,
+            "blocked probe with embedded source write must be denied: {command}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_guard_denies_blocked_worker_argv_write_bypass() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-335", "forge", "chat-335").await;
+    seed_status(&store, "T-335", "blocked").await;
+
+    // A shell invocation supplied via `argv` (with no `command` field) must not
+    // fall back to an empty command that vacuously matches a read-only probe
+    // and let an unrecognized write escape the blocked gate (P1: "Argv Commands
+    // Bypass Blocking"). `command_text` must reconstruct the command and the
+    // probe check must require a recognized probe segment.
+    let input = json!({ "argv": ["python", "-c", "open('src/lib.rs','w').write('x')"] });
+    let d = phase_guard(
+        &store,
+        "chat-335",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "blocked worker cannot bypass the gate via an argv-only shell write"
+    );
+
+    // An argv-only invocation that is a genuine read-only probe stays allowed.
+    let input = json!({ "argv": ["git", "status"] });
+    let d = phase_guard(
+        &store,
+        "chat-335",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        !d.deny,
+        "an argv-only pure probe stays allowed while blocked"
+    );
+}
+
+#[tokio::test]
 async fn sentinel_denies_unknown_write_capable_shell_command() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-34", "sentinel", "chat-34").await;
@@ -372,6 +489,44 @@ async fn sentinel_denies_unknown_write_capable_shell_command() {
         assert!(
             d.deny,
             "Sentinel must deny write-capable shell command: {cmd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sentinel_denies_leading_wrapper_git_write() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-340", "sentinel", "chat-340").await;
+    seed_status(&store, "T-340", "review_ready").await;
+    let st = read_ticket_state(&store, "T-340").await;
+
+    // A wrapper before `git` must not shift the token used to resolve the git
+    // subcommand: `sudo git checkout` writes the checkout and must be denied
+    // (P1: "Sentinel wrapper handling resolves the Git subcommand from the
+    // wrong token"). Wrapper *arguments* must not be mistaken for the command
+    // either (P1: "Wrapper Arguments Hide Writes").
+    for cmd in [
+        "sudo git checkout -- src/lib.rs",
+        "sudo git restore src/lib.rs",
+        "env SOME=1 git apply --patch",
+        "sudo -u root git checkout -- src/lib.rs",
+        "sudo -u root git restore src/lib.rs",
+        "env SOME=1 git checkout src/lib.rs",
+        "nice -n 10 git reset --hard HEAD",
+    ] {
+        let input = json!({ "command": cmd });
+        let d = sentinel_phase_guard(
+            &store,
+            "T-340",
+            &st,
+            "bash",
+            &input,
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            d.deny,
+            "Sentinel must deny git write with a leading wrapper: {cmd}"
         );
     }
 }
@@ -406,11 +561,15 @@ async fn phase_guard_denies_wrapped_git_checkout_write_capable() {
 
     // A wrapper (`sudo`) must not let the git subcommand resolve to the wrong
     // token and slip past write detection (P1: "Wrapped Commands Evade
-    // Detection").
+    // Detection"). Wrapper *arguments* must not be mistaken for the command
+    // (P1: "Wrapper Arguments Hide Writes").
     for cmd in [
         "sudo git checkout -- src/lib.rs",
         "env git restore src/lib.rs",
         "nohup git reset --hard HEAD",
+        "sudo -u root git checkout -- src/lib.rs",
+        "env SOME=1 git checkout src/lib.rs",
+        "nice -n 10 git reset --hard HEAD",
     ] {
         let input = json!({ "command": cmd });
         let d = phase_guard(
