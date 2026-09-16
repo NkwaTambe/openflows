@@ -427,6 +427,49 @@ async fn phase_guard_denies_blocked_worker_probe_with_embedded_write() {
 }
 
 #[tokio::test]
+async fn phase_guard_denies_blocked_worker_argv_write_bypass() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-335", "forge", "chat-335").await;
+    seed_status(&store, "T-335", "blocked").await;
+
+    // A shell invocation supplied via `argv` (with no `command` field) must not
+    // fall back to an empty command that vacuously matches a read-only probe
+    // and let an unrecognized write escape the blocked gate (P1: "Argv Commands
+    // Bypass Blocking"). `command_text` must reconstruct the command and the
+    // probe check must require a recognized probe segment.
+    let input = json!({ "argv": ["python", "-c", "open('src/lib.rs','w').write('x')"] });
+    let d = phase_guard(
+        &store,
+        "chat-335",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        d.deny,
+        "blocked worker cannot bypass the gate via an argv-only shell write"
+    );
+
+    // An argv-only invocation that is a genuine read-only probe stays allowed.
+    let input = json!({ "argv": ["git", "status"] });
+    let d = phase_guard(
+        &store,
+        "chat-335",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(
+        !d.deny,
+        "an argv-only pure probe stays allowed while blocked"
+    );
+}
+
+#[tokio::test]
 async fn sentinel_denies_unknown_write_capable_shell_command() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-34", "sentinel", "chat-34").await;
@@ -460,11 +503,16 @@ async fn sentinel_denies_leading_wrapper_git_write() {
     // A wrapper before `git` must not shift the token used to resolve the git
     // subcommand: `sudo git checkout` writes the checkout and must be denied
     // (P1: "Sentinel wrapper handling resolves the Git subcommand from the
-    // wrong token").
+    // wrong token"). Wrapper *arguments* must not be mistaken for the command
+    // either (P1: "Wrapper Arguments Hide Writes").
     for cmd in [
         "sudo git checkout -- src/lib.rs",
         "sudo git restore src/lib.rs",
         "env SOME=1 git apply --patch",
+        "sudo -u root git checkout -- src/lib.rs",
+        "sudo -u root git restore src/lib.rs",
+        "env SOME=1 git checkout src/lib.rs",
+        "nice -n 10 git reset --hard HEAD",
     ] {
         let input = json!({ "command": cmd });
         let d = sentinel_phase_guard(
@@ -513,11 +561,15 @@ async fn phase_guard_denies_wrapped_git_checkout_write_capable() {
 
     // A wrapper (`sudo`) must not let the git subcommand resolve to the wrong
     // token and slip past write detection (P1: "Wrapped Commands Evade
-    // Detection").
+    // Detection"). Wrapper *arguments* must not be mistaken for the command
+    // (P1: "Wrapper Arguments Hide Writes").
     for cmd in [
         "sudo git checkout -- src/lib.rs",
         "env git restore src/lib.rs",
         "nohup git reset --hard HEAD",
+        "sudo -u root git checkout -- src/lib.rs",
+        "env SOME=1 git checkout src/lib.rs",
+        "nice -n 10 git reset --hard HEAD",
     ] {
         let input = json!({ "command": cmd });
         let d = phase_guard(
