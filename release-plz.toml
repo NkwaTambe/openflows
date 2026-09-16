@@ -37,16 +37,10 @@ release_always = false
 # Only the package explicitly opted in below is processed. The rest of the
 # workspace crates are libraries/sub-crates and are intentionally not released.
 release = false
-
-# Group Conventional Commits into clean, GitHub-style sections in the generated
-# CHANGELOG and release notes.
-[changelog]
-commit_parsers = [
-    { message = "^feat", group = "Features" },
-    { message = "^fix", group = "Bug Fixes" },
-    { message = "^perf", group = "Performance" },
-    { message = "^.*", group = "Other" },
-]
+# Changelog generation is configured in `cliff.toml` (git-cliff) and written to
+# a single repository-root CHANGELOG.md.
+changelog_config = "cliff.toml"
+changelog_path = "./CHANGELOG.md"
 
 # `openflows` is the single released package. The tag carries no `v` prefix:
 # `openflows-{{ version }}`.
@@ -54,9 +48,9 @@ commit_parsers = [
 name = "openflows"
 release = true
 git_tag_name = "openflows-{{ version }}"
-# Release notes = the grouped changelog plus a contributor acknowledgement list.
-# `remote.contributors` is populated from PR numbers present in commit messages
-# (e.g. `(#123)`), so merges must reference their PR.
+# Release notes = the grouped changelog (from cliff.toml) plus a contributor
+# acknowledgement list. `remote.contributors` is populated from PR numbers in
+# commit messages (e.g. `(#123)`), so merges must reference their PR.
 git_release_body = """
 {{ changelog }}
 {% if remote.contributors %}
