@@ -18,6 +18,7 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 - [Step 9 — Add a tenant](#step-9--add-a-tenant)
 - [Step 10 — Run the controller](#step-10--run-the-controller)
 - [Verify it's working](#verify-its-working)
+- [Lifecycle hooks](#lifecycle-hooks)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [More](#more)
@@ -38,35 +39,17 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 
 ## Step 1 — Create a GitHub App
 
-OpenFlows agents authenticate to your GitHub repositories (including private repos) through a **GitHub App** using GitHub OIDC / Coder external auth. Creating the app is free.
+OpenFlows agents authenticate to your GitHub repos (including private ones) through a GitHub App. Create a new one at **https://github.com/settings/apps/new**:
 
-1. On GitHub, create a new GitHub App.
-2. Fill in:
-   - **GitHub App name** — this becomes your app's URL slug (e.g. `my-openflows-app`).
-   - **Homepage URL** — GitHub requires a value here, but it's not used for a local setup. Put any URL you own, e.g. your repo page or `http://localhost:7080`.
-   - **Redirect URI** (under "Identifying and authorizing users") — this is the callback Coder expects. Enter exactly:
-     ```
-     http://localhost:7080/external-auth/primary-github/callback
-     ```
-   - **Webhook** — can be left **Active: false** (blank).
-   - **Permissions → Repository permissions**, set the following to **Read and write** (note: **Metadata** stays **Read-only** — GitHub does not allow raising it, so it is not part of the read/write instruction):
-     | Permission | Why |
-     |------------|-----|
-     | **Contents** | Clone/push repo code (required for private repos). |
-     | **Pull requests** | Open/update PRs via the API. |
-     | **Workflows** | Push/create `.github/workflows/` files (e.g. the "set up CI" ticket type). |
-     | **Metadata** | Read-only — auto-required by GitHub for repo access. |
-   - **Where can this GitHub App be installed?** — choose **Any account** (or limit to specific orgs).
-3. Click **Create GitHub App**.
-4. On the app's page, copy the **Client ID** (top of the page).
-5. In the **Client secrets** section, click **Generate a new client secret** and copy it now — it is shown only once.
-6. Your **Install URL** is `https://github.com/apps/<your-app-slug>/installations/new`. Replace `<your-app-slug>` with the app's **URL slug** — the value that appears in the app's page URL (e.g. `my-openflows-app`). The slug can differ from the display name if it contains spaces or capitals; copy it from the app page URL to be safe. This is how you (and your agents) install the app on your org/repos.
+1. Set the **Redirect URI** (under *Identifying and authorizing users*) to exactly:
+   ```
+   http://localhost:7080/external-auth/primary-github/callback
+   ```
+2. Under **Permissions → Repository permissions**, set **Contents**, **Pull requests**, and **Workflows** to **Read and write**.
+3. Create the app, then **Install it** on your org via your install URL (`https://github.com/apps/<your-app-slug>/installations/new`).
+4. Copy three values for [Step 2](#step-2--set-up-env): the **Client ID**, a generated **Client Secret** (shown once), and your **Install URL**.
 
-> **If you add permissions *after* installing the app:** editing the app's developer-settings permissions only *requests* the new permission — you must then **approve/update the installation** at `https://github.com/settings/installations` (open your app's installation and click **Approve/Update**), then get a **fresh token** (restart the workspace). Changing an app's permissions does **not** update already-issued tokens. The most common blockers:
-> - *"refusing to allow a GitHub App to create or update workflow … without workflows permission"* → grant **Workflows** (≠ **Actions**) and approve the installation.
-> - *"Resource not accessible by integration"* when creating a PR → grant **Pull requests** (read/write) and approve the installation.
-
-Keep the Client ID, Client Secret, and Install URL — you'll need all three in the next step.
+> If you change the app's permissions after installing, re-open the installation at **https://github.com/settings/installations** and click **Approve/Update**, then get a fresh token — otherwise the new permissions don't take effect.
 
 ---
 
@@ -84,6 +67,7 @@ Fill in the required values:
 |----------|-------------|
 | `GITHUB_TOKEN` | GitHub PAT with `repo` scope. |
 | `GITHUB_REPOSITORY` | The repo the controller watches, as `owner/repo`. |
+| `CODER_CHAT_HOOK_SECRET` | The shared signing secret for lifecycle hooks. Generate 32+ random bytes: `openssl rand -hex 32`. The bundled stack requires it before enabling hooks (see [Lifecycle hooks](#lifecycle-hooks)). |
 | `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
 
 Then set the three GitHub external auth values in `.env` from [Step 1](#step-1--create-a-github-app):
@@ -97,7 +81,7 @@ CODER_EXTERNAL_AUTH_0_SCOPES=repo
 CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL=https://github.com/apps/<your-app-slug>/installations/new
 ```
 
-> **Why now?** The Coder container reads these vars from `.env` when it starts (see `docker-compose.yml`). Setting them here **before** starting Docker means Coder comes up with GitHub App auth already wired — no UI editing, and no risk of Coder failing to start with empty credentials.
+> **Set these before starting Docker** — Coder reads them from `.env` at startup, and won't start with empty GitHub App credentials.
 
 ---
 
@@ -143,7 +127,7 @@ Signing in is **not** enough. You must also **link** the GitHub App so Coder can
    ```
 3. On GitHub, click **Authorize**. You'll be redirected back to Coder once linked.
 
-> **Why this is required:** the `CODER_EXTERNAL_AUTH_0_*` vars only *configure* the provider. The actual grant happens when you complete this link — until then Coder has no token to give your agents. If you skip it, bootstrap later fails with `403 External authentication is required to create a workspace with this template`; see [Troubleshooting](#troubleshooting).
+> Required for private repos: skipping this link makes bootstrap fail with `403 External authentication is required to create a workspace with this template`; see [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -222,6 +206,45 @@ In a separate terminal:
 
 ---
 
+## Lifecycle hooks
+
+Lifecycle hooks let OpenFlows observe and steer agent behaviour as it happens. The bundled stack wires them automatically — you only provide the shared signing secret in [Step 2](#step-2--set-up-env). Do not set the Coder hook experiment/URL/bind variables manually.
+
+### Verify hooks are working
+
+After [Step 10](#step-10--run-the-controller), confirm the consumer started and the stack is not logging `InvalidAudience`. For explicit confirmation, set `OPENFLOWS_HOOK_LOGS=true` in `.env`, restart the controller, and watch for:
+
+```text
+INFO ... Coder lifecycle hook consumer started
+```
+
+You can also exercise the consumer directly with the `openflows` binary's simulate command (run it from a shell that can reach the consumer, using the same secret):
+
+```bash
+export CODER_CHAT_HOOK_SECRET=<the same secret you put in .env>
+export CODER_CHAT_HOOK_URL=http://openflows-nexus:3001/experimental/hooks/chat
+./.dev-binaries/openflows hooks simulate --event user_prompt_submit --chat-id chat-verify
+```
+
+A healthy consumer responds `200`. If you see `InvalidAudience`, see [Troubleshooting](#audience-mismatch-invalidaudience).
+
+### Rotating the secret
+
+`CODER_CHAT_HOOK_SECRET` is an **immutable** Nexus workspace parameter: Coder captures it when the workspace is built, and re-running bootstrap alone **does not** update an existing workspace (bootstrap only rebuilds the Nexus workspace when the template itself changes). To rotate, you must recreate the workspace so it is rebuilt with the new secret:
+
+1. Stop the Controller.
+2. Set a new 32+ byte `CODER_CHAT_HOOK_SECRET` in `.env`.
+3. Delete the existing Nexus workspace so bootstrap rebuilds it. You can do this from the host with the `coder` CLI (logged in as the OpenFlows user):
+   ```bash
+   coder delete openflows-nexus
+   ```
+   (If you changed `OPENFLOWS_HOOK_URL` at the same time, do the same — the hook URL is also immutable.)
+4. Re-run bootstrap. It recreates the workspace with the new secret and the controller starts validating against it.
+
+Coder and the consumer must always share the same secret, and both Coder and the Controller must be restarted after rotation.
+
+---
+
 ## Configuration
 
 These are optional — the defaults work out of the box. Only touch them if you need to.
@@ -235,6 +258,7 @@ These are optional — the defaults work out of the box. Only touch them if you 
 | `CODER_URL` | `http://localhost:7080` | Set only if you host Coder elsewhere. |
 | `OPENFLOWS_TENANT` | `default` | Namespace for Redis keys. |
 | `CODER_CHAT_HOOK_SECRET` | required | Generate 32+ random bytes, for example `openssl rand -hex 32`; hook URL/experiment/bind values are wired automatically. |
+| `OPENFLOWS_HOOK_URL` | `http://openflows-nexus:3001/experimental/hooks/chat` | Single source of truth for the hook endpoint, shared between Coder and the consumer. The consumer picks it up via bootstrap; after changing it on an existing deployment, recreate the Nexus workspace (see [Rotating the secret](#rotating-the-secret)). |
 | `OPENFLOWS_HOOK_LOGS` | `false` | Set `true` only when debugging lifecycle hook traffic. |
 | `SLACK_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` | unset | Escalation notifications. |
 
@@ -319,6 +343,17 @@ Grant the GitHub App **Pull requests → Read and write**, then **approve/update
 2. Watch the controller's foreground terminal for errors.
 3. Verify Coder is reachable: `curl http://localhost:7080/api/v2/buildinfo`.
 
+### Chat creation fails with 502 / `Lifecycle hook dispatch ... failed (http_error)`
+
+This usually means the hook consumer rejected or couldn't be reached during Coder Chat creation. The most common specific cause is the one below (`InvalidAudience`). Other possibilities: the consumer isn't running (no `CODER_CHAT_HOOK_SECRET` set), or the Coder container can't reach the consumer endpoint. Confirm the secret is set in `.env` (Step 2), the controller is running, and — for a custom topology — that the hook URL is reachable from the Coder container.
+
+### Audience mismatch (`InvalidAudience`)
+
+If the controller logs `Hook consumer: JWT verification failed ... InvalidAudience`, the JWT's `aud` claim (Coder's `CODER_CHAT_HOOK_URL`) does not match the audience the consumer expects. In the bundled stack this should not happen — `OPENFLOWS_HOOK_URL` drives both Coder's URL and the consumer's expected `aud` via bootstrap. It appears when those two get out of sync:
+
+- The hook URL is set on a **custom** deployment via `OPENFLOWS_HOOK_URL`, but the **Nexus workspace was not recreated** after the URL changed. The hook URL is an immutable workspace parameter, so an existing workspace keeps validating against the audience it was originally built with even after you change `OPENFLOWS_HOOK_URL`. Recreate the workspace (see [Rotating the secret](#rotating-the-secret)) so bootstrap rebuilds it against the current URL, or keep the bundled defaults.
+- Coder and the consumer were started with different `CODER_CHAT_HOOK_SECRET` values or one was restarted out of order. Restart both with the same secret.
+
 ### `403 External authentication is required to create a workspace with this template`
 
 Coder refuses to build a workspace until the owning account links the GitHub App (workspaces that request GitHub access require the owner to authenticate with it). Fix it by completing the link in [Step 4](#step-4--sign-in-with-github) — sign in as the workspace owner and visit `http://localhost:7080/external-auth/primary-github`, then **Authorize** on GitHub. Afterwards, re-run bootstrap.
@@ -340,3 +375,4 @@ Verify inside a workspace **without printing the token**: `test -s ~/.git-creden
 - **Full docs:** [README.md](README.md)
 - **Testing & debugging:** [testing_quick_start.md](testing_quick_start.md)
 - **Token acquisition:** [token_guide.md](token_guide.md)
+- **Lifecycle hooks (design):** [docs/experiments/hook-driven-state-derivation.md](docs/experiments/hook-driven-state-derivation.md) and [docs/experiments/coder-lifecycle-hooks-feedback.md](docs/experiments/coder-lifecycle-hooks-feedback.md)

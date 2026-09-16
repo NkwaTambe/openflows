@@ -251,6 +251,8 @@ async fn consumer_accepts_signed_dispatch_end_to_end() {
         chat_hook_allow_insecure: true,
         hook_addr: addr.to_string(),
         hook_host: "127.0.0.1".to_string(),
+        chat_hook_url: None,
+        hook_url: None,
         hook_logs: false,
     };
     assert_eq!(config.hook_public_url().as_deref(), Some(hook_url.as_str()));
@@ -270,5 +272,64 @@ async fn consumer_accepts_signed_dispatch_end_to_end() {
     assert_eq!(
         status, 200,
         "consumer should accept a valid signed dispatch: {body}"
+    );
+}
+
+#[tokio::test]
+async fn consumer_accepts_dispatch_when_chat_hook_url_is_audience() {
+    // Regression for the InvalidAudience drift: when CODER_CHAT_HOOK_URL is the
+    // configured audience, the consumer must validate against it even if it
+    // differs from the address derived from the bind host/port. This mirrors a
+    // topology where Coder POSTs to a hook URL that is not the loopback-derived
+    // value (e.g. ${OPENFLOWS_HOOK_PORT} vs {hook_addr} port).
+    use super::server::create_router;
+    use super::simulate::dispatch_simulated_event;
+    use config::env::CoderHooksConfig;
+    use pocketflow_core::SharedStore;
+    use std::sync::Arc;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let coder_hook_url = format!("http://127.0.0.1:{}/experimental/hooks/chat", addr.port());
+
+    // The bind-derived address uses a *different* port than the listener. If the
+    // consumer wrongly used the derived value as its `aud` it would reject the
+    // token; because CODER_CHAT_HOOK_URL is authoritative, it accepts it.
+    let config = CoderHooksConfig {
+        chat_hook_secret: Some(SECRET.to_string()),
+        chat_hook_timeout_ms: 1500,
+        chat_hook_enabled: true,
+        chat_hook_allow_insecure: true,
+        hook_addr: format!("127.0.0.1:{}", addr.port() + 1),
+        hook_host: "127.0.0.1".to_string(),
+        // The authoritative audience is Coder's CODER_CHAT_HOOK_URL.
+        chat_hook_url: Some(coder_hook_url.clone()),
+        hook_url: None,
+        hook_logs: false,
+    };
+    assert_eq!(
+        config.hook_public_url().as_deref(),
+        Some(coder_hook_url.as_str())
+    );
+
+    let store = Arc::new(SharedStore::new_in_memory());
+    let router = create_router(store, config, None, None);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Sign with Coder's configured URL as the aud and POST to the reachable
+    // listener; the consumer must accept it even though its bind-derived URL
+    // would have been a different port.
+    let (status, body) =
+        dispatch_simulated_event(&coder_hook_url, SECRET, "session_start", CHAT, "dis-aud-1")
+            .await
+            .expect("dispatch should succeed");
+    assert_eq!(
+        status, 200,
+        "consumer should accept a dispatch signed with the authoritative \
+         CODER_CHAT_HOOK_URL audience: {body}"
     );
 }

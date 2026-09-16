@@ -57,8 +57,12 @@ services:
       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
       # Agent lifecycle hooks are wired by OpenFlows. Operators do not need to
       # configure Coder's raw hook URL/experiment flags for the bundled stack.
+      # OPENFLOWS_HOOK_URL is the single source of truth for the hook endpoint:
+      # it is forwarded to Coder (here) and to the Nexus consumer via bootstrap,
+      # so Coder's CODER_CHAT_HOOK_URL and the consumer's expected JWT `aud`
+      # stay in lockstep (prevents hook JWT InvalidAudience failures).
       CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-agent-lifecycle-hooks}
-      CODER_CHAT_HOOK_URL: "http://openflows-nexus:${OPENFLOWS_HOOK_PORT:-3001}/experimental/hooks/chat"
+      CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:-http://openflows-nexus:3001/experimental/hooks/chat}
       CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:?Set CODER_CHAT_HOOK_SECRET to 32+ random bytes before enabling lifecycle hooks}
       # Dev-only: allow the plain-http hook URL above.
       CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-true}

@@ -107,6 +107,24 @@ pub struct CoderHooksConfig {
     #[envconfig(from = "OPENFLOWS_HOOK_HOST", default = "openflows-nexus")]
     pub hook_host: String,
 
+    /// The exact hook URL Coder is configured to POST to (Coder's
+    /// `CODER_CHAT_HOOK_URL`). When set, this is the authoritative JWT audience
+    /// the consumer validates against — it matches what Coder signs by
+    /// construction. When unset, the audience is derived from
+    /// [`CoderHooksConfig::hook_host`] + the [`CoderHooksConfig::hook_addr`]
+    /// port. Keeping a single source of truth avoids `aud` drift between Coder's
+    /// hook URL and the consumer's expectation.
+    #[envconfig(from = "CODER_CHAT_HOOK_URL")]
+    pub chat_hook_url: Option<String>,
+
+    /// Alias knob used by docker-compose as the single source of truth for the
+    /// hook endpoint. The controller process never sees Coder's
+    /// `CODER_CHAT_HOOK_URL`, so honoring `OPENFLOWS_HOOK_URL` here lets a custom
+    /// hook URL that an operator sets in `.env` propagate to the consumer via
+    /// bootstrap — preventing `aud` drift (see [`CoderHooksConfig::chat_hook_url_effective`]).
+    #[envconfig(from = "OPENFLOWS_HOOK_URL")]
+    pub hook_url: Option<String>,
+
     /// Emit routine hook lifecycle logs. Warnings/errors remain visible.
     #[envconfig(from = "OPENFLOWS_HOOK_LOGS", default = "false")]
     pub hook_logs: bool,
@@ -130,12 +148,34 @@ impl CoderHooksConfig {
         self.hook_addr.rsplit(':').next().map(|p| p.to_string())
     }
 
-    /// The internal hook URL Coder must POST to. Derived from the internal host
-    /// label and the bind port, path `/experimental/hooks/chat` (the route the
-    /// consumer registers). This is both what the consumer listens as its
+    /// The authoritative audience hint for the hook consumer. Prefers the exact
+    /// Coder URL (`CODER_CHAT_HOOK_URL`), then the compose knob
+    /// (`OPENFLOWS_HOOK_URL`), then `None` (callers derive from bind host/port).
+    ///
+    /// Preferring `OPENFLOWS_HOOK_URL` as a fallback keeps the bundled stack's
+    /// single source of truth shared between Coder and the consumer even though
+    /// the controller process never sees `CODER_CHAT_HOOK_URL`.
+    pub fn chat_hook_url_effective(&self) -> Option<String> {
+        let pick = |u: &Option<String>| {
+            u.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        pick(&self.chat_hook_url).or_else(|| pick(&self.hook_url))
+    }
+
+    /// The internal hook URL Coder must POST to. When an authoritative hook URL
+    /// is configured it is returned verbatim and used as the expected JWT `aud` —
+    /// matching what Coder signs. Otherwise the URL is derived from the internal
+    /// host label and the bind port, path `/experimental/hooks/chat` (the route
+    /// the consumer registers). This is both what the consumer listens as its
     /// expected `aud` and what compose forwards to Coder — an internal detail
     /// the operator does not type.
     pub fn hook_public_url(&self) -> Option<String> {
+        if let Some(url) = self.chat_hook_url_effective() {
+            return Some(url);
+        }
         let port = self.port()?;
         Some(format!(
             "http://{}:{}/experimental/hooks/chat",
@@ -484,6 +524,8 @@ mod tests {
             "OPENFLOWS_HOOK_ADDR",
             "OPENFLOWS_HOOK_HOST",
             "OPENFLOWS_HOOK_LOGS",
+            "CODER_CHAT_HOOK_URL",
+            "OPENFLOWS_HOOK_URL",
             "OPENFLOWS_TENANT",
             "OPENFLOWS_TAR",
             "USE_AI_GATEWAY",
@@ -499,6 +541,7 @@ mod tests {
         assert_eq!(cfg.infra.a2a_relay_addr, "127.0.0.1:3000");
         assert_eq!(cfg.hooks.hook_addr, "0.0.0.0:3001");
         assert_eq!(cfg.hooks.hook_host, "openflows-nexus");
+        assert!(cfg.hooks.chat_hook_url.is_none());
         assert!(!cfg.hooks.hook_logs);
         assert!(!cfg.hooks.enabled());
         assert_eq!(cfg.tenant.effective_tenant(), "default");
@@ -584,6 +627,54 @@ mod tests {
 
         std::env::set_var("OPENFLOWS_HOOK_LOGS", "true");
         assert!(EnvConfig::from_env().unwrap().hooks.hook_logs);
+    }
+
+    #[test]
+    fn hook_public_url_prefers_coder_chat_hook_url() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_CHAT_HOOK_URL",
+            "OPENFLOWS_HOOK_URL",
+            "OPENFLOWS_HOOK_ADDR",
+            "OPENFLOWS_HOOK_HOST",
+        ]);
+        guard.unset_all();
+
+        // Without CODER_CHAT_HOOK_URL the audience is derived from host + addr.
+        std::env::set_var("OPENFLOWS_HOOK_ADDR", "0.0.0.0:3001");
+        std::env::set_var("OPENFLOWS_HOOK_HOST", "openflows-nexus");
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.hooks.hook_public_url().as_deref(),
+            Some("http://openflows-nexus:3001/experimental/hooks/chat")
+        );
+
+        // When Coder's CODER_CHAT_HOOK_URL is set it is the authoritative
+        // audience, regardless of the derived bind/host, preventing aud drift.
+        std::env::set_var(
+            "CODER_CHAT_HOOK_URL",
+            "http://openflows-nexus:3900/experimental/hooks/chat",
+        );
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.hooks.hook_public_url().as_deref(),
+            Some("http://openflows-nexus:3900/experimental/hooks/chat")
+        );
+
+        // A custom OPENFLOWS_HOOK_URL (compose's single knob) is honored when
+        // CODER_CHAT_HOOK_URL is not exported to the controller process — the
+        // drift case where the controller would otherwise fall back to the
+        // derived default while Coder signs with the custom URL.
+        std::env::remove_var("CODER_CHAT_HOOK_URL");
+        std::env::set_var(
+            "OPENFLOWS_HOOK_URL",
+            "http://openflows-nexus:4900/experimental/hooks/chat",
+        );
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.hooks.hook_public_url().as_deref(),
+            Some("http://openflows-nexus:4900/experimental/hooks/chat")
+        );
     }
 
     #[test]

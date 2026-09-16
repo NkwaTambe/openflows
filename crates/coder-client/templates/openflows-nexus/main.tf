@@ -79,6 +79,14 @@ data "coder_parameter" "coder_chat_hook_secret" {
   mutable     = false
 }
 
+data "coder_parameter" "coder_chat_hook_url" {
+  name        = "coder_chat_hook_url"
+  description = "The exact hook URL Coder is configured to POST to (CODER_CHAT_HOOK_URL). When set it is the authoritative JWT audience the consumer validates against, keeping it in lockstep with Coder and preventing aud drift."
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "start_controller" {
   name        = "start_controller"
   description  = "Whether to auto-start the OpenFlows controller on workspace startup"
@@ -187,6 +195,9 @@ resource "coder_agent" "main" {
     export GITHUB_REPOSITORY="${data.coder_parameter.github_repository.value}"
     export OPENFLOWS_REGISTRY_JSON='${data.coder_parameter.registry_json.value}'
     export CODER_CHAT_HOOK_SECRET="${data.coder_parameter.coder_chat_hook_secret.value}"
+    if [ -n "${data.coder_parameter.coder_chat_hook_url.value}" ]; then
+      export CODER_CHAT_HOOK_URL="${data.coder_parameter.coder_chat_hook_url.value}"
+    fi
     # GitHub PAT for issue sync - export as env var so controller picks it up automatically
     export GITHUB_TOKEN="${data.coder_parameter.github_pat.value}"
     echo "${data.coder_parameter.github_pat.value}" > /tmp/github_token 2>/dev/null || true
@@ -253,6 +264,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
     "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
+    "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
