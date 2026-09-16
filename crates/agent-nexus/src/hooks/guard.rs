@@ -310,8 +310,27 @@ fn is_write_attempt(tool_name: &str, input: &Value) -> bool {
 /// `status set` is deliberately *not* a probe: it mutates durable state and,
 /// in a blocked worker, would otherwise allow an unapproved phase transition
 /// (e.g. `status set building`) to escape the blockage.
+///
+/// Probes are matched **per shell segment**, never by substring over the whole
+/// command, so a compound command such as `git status; touch src/lib.rs` is not
+/// a probe: its write segment fails the check and the whole call is denied
+/// instead of allowing a trailing source write past the blocked gate.
 fn is_probe_command(command: &str) -> bool {
-    let cmd = command.to_lowercase();
+    for seg in command.split([';', '&', '|']) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if !is_probe_segment(seg) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a single shell segment is a recognised read-only probe.
+fn is_probe_segment(seg: &str) -> bool {
+    let cmd = seg.to_lowercase();
     cmd.contains("status get")
         || cmd.contains("gate status")
         || cmd.contains("dispatch read")
@@ -600,7 +619,12 @@ pub async fn phase_guard(
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_lowercase();
-        let is_readonly_probe = is_shell(&lower) && is_probe_command(&command);
+        // A probe is only read-only if it is truly write-free: a probe segment
+        // that embeds a source write (e.g. `git status > src/lib.rs` or
+        // `git status | tee src/lib.rs`) must not slip past the blocked gate.
+        let is_readonly_probe = is_shell(&lower)
+            && is_probe_command(&command)
+            && !shell_writes_source(&command_text(input));
         let is_replan = (is_harness(&lower) || is_shell(&lower)) && is_exact_replan(&command);
         let is_blocker = is_write_tool(&lower) && is_blocker_write(&lower, input);
         if !is_readonly_probe && !is_replan && !is_blocker {

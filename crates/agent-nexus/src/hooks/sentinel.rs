@@ -113,41 +113,45 @@ fn is_write_capable_command(command: &str) -> bool {
     if words.is_empty() {
         return false;
     }
-    // Strip wrappers that merely forward to the real command.
-    let cmd = words
+    // Strip wrappers that merely forward to the real command, tracking the
+    // *index* of the resolved command token so subcommands are read from the
+    // token that follows it — a wrapper such as `sudo git checkout` must not
+    // shift the fixed slot and let a write-capable subcommand be misread.
+    let cmd_idx = words
         .iter()
-        .map(|w| w.as_str())
-        .find(|w| {
+        .position(|w| {
             !matches!(
-                *w,
+                w.as_str(),
                 "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
             )
         })
+        .unwrap_or(0);
+    let cmd = words.get(cmd_idx).map(|w| w.as_str()).unwrap_or_default();
+    let next = words
+        .get(cmd_idx + 1)
+        .map(|w| w.as_str())
         .unwrap_or_default();
     match cmd {
         "dd" => true,
         "curl" | "wget" => words
             .iter()
             .any(|w| w == "-o" || w == "-O" || w.starts_with("--output")),
-        "git" => {
-            let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
-            matches!(
-                sub,
-                "checkout"
-                    | "restore"
-                    | "reset"
-                    | "stash"
-                    | "rm"
-                    | "mv"
-                    | "apply"
-                    | "am"
-                    | "merge"
-                    | "rebase"
-                    | "cherry-pick"
-                    | "clean"
-                    | "pull"
-            )
-        }
+        "git" => matches!(
+            next,
+            "checkout"
+                | "restore"
+                | "reset"
+                | "stash"
+                | "rm"
+                | "mv"
+                | "apply"
+                | "am"
+                | "merge"
+                | "rebase"
+                | "cherry-pick"
+                | "clean"
+                | "pull"
+        ),
         "sh" | "bash" | "zsh" | "ksh" | "dash" => words.iter().any(|w| w == "-c"),
         _ => false,
     }
