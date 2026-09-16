@@ -37,6 +37,10 @@ release_always = false
 # Only the package explicitly opted in below is processed. The rest of the
 # workspace crates are libraries/sub-crates and are intentionally not released.
 release = false
+# Changelog generation is configured in `cliff.toml` (git-cliff) and written to
+# a single repository-root CHANGELOG.md.
+changelog_config = "cliff.toml"
+changelog_path = "./CHANGELOG.md"
 
 # `openflows` is the single released package. The tag carries no `v` prefix:
 # `openflows-{{ version }}`.
@@ -44,3 +48,22 @@ release = false
 name = "openflows"
 release = true
 git_tag_name = "openflows-{{ version }}"
+# Release notes = the grouped changelog (from cliff.toml) plus a contributor
+# acknowledgement list. `remote.contributors` is populated by release-plz from
+# the `/pull/N` links present in the rendered CHANGELOG.md last entry (see
+# `prs_from_text`), which are generated only from `(#N)` trailers in commit
+# messages (see `commit_preprocessors` in cliff.toml). Therefore every squash-
+# merge commit that should appear under Contributors must retain its `(#N)`
+# PR trailer in the subject. GitHub's "automatically add a (#<number>) suffix
+# to squash commits" repo setting (or a CI/commitlint rule) is what guarantees
+# this; commits without a `(#N)` trailer are invisible to the contributor
+# lookup and to `remote.contributors`.
+git_release_body = """
+{{ changelog }}
+{% if remote.contributors %}
+### Contributors
+{% for contributor in remote.contributors %}
+* @{{ contributor.username }}
+{% endfor %}
+{% endif %}
+"""
