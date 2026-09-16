@@ -55,6 +55,20 @@ services:
       CODER_EXTERNAL_AUTH_0_CLIENT_SECRET: ${CODER_EXTERNAL_AUTH_0_CLIENT_SECRET:-}
       CODER_EXTERNAL_AUTH_0_SCOPES: ${CODER_EXTERNAL_AUTH_0_SCOPES:-repo}
       CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL: ${CODER_EXTERNAL_AUTH_0_APP_INSTALL_URL:-}
+      # Agent lifecycle hooks are wired by OpenFlows. Operators do not need to
+      # configure Coder's raw hook URL/experiment flags for the bundled stack.
+      # OPENFLOWS_HOOK_URL is the single source of truth for the hook endpoint:
+      # it is forwarded to Coder (here) and to the Nexus consumer via bootstrap,
+      # so Coder's CODER_CHAT_HOOK_URL and the consumer's expected JWT `aud`
+      # stay in lockstep (prevents hook JWT InvalidAudience failures).
+      CODER_EXPERIMENTS: ${CODER_EXPERIMENTS:-agent-lifecycle-hooks}
+      CODER_CHAT_HOOK_URL: ${OPENFLOWS_HOOK_URL:-http://openflows-nexus:3001/experimental/hooks/chat}
+      CODER_CHAT_HOOK_SECRET: ${CODER_CHAT_HOOK_SECRET:?Set CODER_CHAT_HOOK_SECRET to 32+ random bytes before enabling lifecycle hooks}
+      # Dev-only: allow the plain-http hook URL above.
+      CODER_CHAT_HOOK_ALLOW_INSECURE: ${CODER_CHAT_HOOK_ALLOW_INSECURE:-true}
+    extra_hosts:
+      # Keep host-gateway available for local integrations that need the host.
+      - "host.docker.internal:host-gateway"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # TEMPORARY: Mount local openflows binary for testing (remove when using GitHub releases)

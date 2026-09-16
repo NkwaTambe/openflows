@@ -41,6 +41,9 @@ pub struct CoderConfig {
     #[envconfig(from = "CODER_GITHUB_TOKEN")]
     pub github_token: Option<String>,
 
+    #[envconfig(from = "CODER_EXTERNAL_AUTH_0_ID")]
+    pub external_auth_id: Option<String>,
+
     #[envconfig(from = "CODER_EXTERNAL_AUTH_0_CLIENT_ID")]
     pub external_auth_client_id: Option<String>,
 
@@ -55,6 +58,132 @@ impl CoderConfig {
     }
 }
 
+/// Coder Agent Lifecycle Hooks configuration (experimental).
+///
+/// These mirror the `coder server` flags that power the `agent-lifecycle-hooks`
+/// experiment (see coder/coder `docs/admin/setup/chat-lifecycle-hooks.md`).
+/// The OpenFlows Controller is the **consumer** of the deployment-wide webhook:
+/// Coder `chatd` POSTs a JWT-signed lifecycle event to the hook URL for each
+/// `session_start` / `user_prompt_submit` / `pre_tool_use` / `post_tool_use` /
+/// `pre_compact` / `post_compact` / `stop` event, and this side verifies the
+/// signature and observes (or denies/rewrites) the event.
+///
+/// The hook endpoint is a purely internal detail: the consumer derives it from
+/// its bind address + the internal host label Coder must use to reach it. In
+/// the bundled Docker topology the Nexus workspace has the stable network alias
+/// `openflows-nexus`. The bundled stack sets the Coder-side URL/experiment
+/// values; operators only override the shared secret for production or the bind
+/// address/host for unusual topology.
+///
+/// On Coder's side, enabling the experiment looks like:
+///   CODER_EXPERIMENTS=agent-lifecycle-hooks
+///   CODER_CHAT_HOOK_URL=<derived internal URL>
+///   CODER_CHAT_HOOK_SECRET=<at least 32 random bytes, HS256>
+#[derive(Debug, Clone, Envconfig)]
+pub struct CoderHooksConfig {
+    /// Shared HS256 secret used to sign/verify hook JWTs (>= 32 bytes).
+    #[envconfig(from = "CODER_CHAT_HOOK_SECRET")]
+    pub chat_hook_secret: Option<String>,
+
+    /// Per-request dispatch timeout Coder applies. We mirror it for awareness.
+    #[envconfig(from = "CODER_CHAT_HOOK_TIMEOUT", default = "1500")]
+    pub chat_hook_timeout_ms: u64,
+
+    /// Break-glass switch (mirrored from Coder for observability).
+    #[envconfig(from = "CODER_CHAT_HOOK_ENABLED", default = "true")]
+    pub chat_hook_enabled: bool,
+
+    /// Allow plain http (dev only).
+    #[envconfig(from = "CODER_CHAT_HOOK_ALLOW_INSECURE", default = "false")]
+    pub chat_hook_allow_insecure: bool,
+
+    /// Bind address for the OpenFlows hook consumer endpoint. The default is
+    /// Docker-reachable because the bundled Coder service posts from a container.
+    #[envconfig(from = "OPENFLOWS_HOOK_ADDR", default = "0.0.0.0:3001")]
+    pub hook_addr: String,
+
+    /// Internal host label Coder must use to reach the consumer. Defaults to the
+    /// Nexus workspace network alias in the bundled Docker topology.
+    #[envconfig(from = "OPENFLOWS_HOOK_HOST", default = "openflows-nexus")]
+    pub hook_host: String,
+
+    /// The exact hook URL Coder is configured to POST to (Coder's
+    /// `CODER_CHAT_HOOK_URL`). When set, this is the authoritative JWT audience
+    /// the consumer validates against — it matches what Coder signs by
+    /// construction. When unset, the audience is derived from
+    /// [`CoderHooksConfig::hook_host`] + the [`CoderHooksConfig::hook_addr`]
+    /// port. Keeping a single source of truth avoids `aud` drift between Coder's
+    /// hook URL and the consumer's expectation.
+    #[envconfig(from = "CODER_CHAT_HOOK_URL")]
+    pub chat_hook_url: Option<String>,
+
+    /// Alias knob used by docker-compose as the single source of truth for the
+    /// hook endpoint. The controller process never sees Coder's
+    /// `CODER_CHAT_HOOK_URL`, so honoring `OPENFLOWS_HOOK_URL` here lets a custom
+    /// hook URL that an operator sets in `.env` propagate to the consumer via
+    /// bootstrap — preventing `aud` drift (see [`CoderHooksConfig::chat_hook_url_effective`]).
+    #[envconfig(from = "OPENFLOWS_HOOK_URL")]
+    pub hook_url: Option<String>,
+
+    /// Emit routine hook lifecycle logs. Warnings/errors remain visible.
+    #[envconfig(from = "OPENFLOWS_HOOK_LOGS", default = "false")]
+    pub hook_logs: bool,
+}
+
+impl CoderHooksConfig {
+    /// Whether the OpenFlows consumer should be started at all. Coder's
+    /// experiment flag is configured on the Coder service; this process only
+    /// needs a shared secret to verify signed dispatches.
+    pub fn enabled(&self) -> bool {
+        self.chat_hook_enabled
+            && self
+                .chat_hook_secret
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+    }
+
+    /// The port component of the bind address (e.g. `3001` from `0.0.0.0:3001`).
+    pub fn port(&self) -> Option<String> {
+        self.hook_addr.rsplit(':').next().map(|p| p.to_string())
+    }
+
+    /// The authoritative audience hint for the hook consumer. Prefers the exact
+    /// Coder URL (`CODER_CHAT_HOOK_URL`), then the compose knob
+    /// (`OPENFLOWS_HOOK_URL`), then `None` (callers derive from bind host/port).
+    ///
+    /// Preferring `OPENFLOWS_HOOK_URL` as a fallback keeps the bundled stack's
+    /// single source of truth shared between Coder and the consumer even though
+    /// the controller process never sees `CODER_CHAT_HOOK_URL`.
+    pub fn chat_hook_url_effective(&self) -> Option<String> {
+        let pick = |u: &Option<String>| {
+            u.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        pick(&self.chat_hook_url).or_else(|| pick(&self.hook_url))
+    }
+
+    /// The internal hook URL Coder must POST to. When an authoritative hook URL
+    /// is configured it is returned verbatim and used as the expected JWT `aud` —
+    /// matching what Coder signs. Otherwise the URL is derived from the internal
+    /// host label and the bind port, path `/experimental/hooks/chat` (the route
+    /// the consumer registers). This is both what the consumer listens as its
+    /// expected `aud` and what compose forwards to Coder — an internal detail
+    /// the operator does not type.
+    pub fn hook_public_url(&self) -> Option<String> {
+        if let Some(url) = self.chat_hook_url_effective() {
+            return Some(url);
+        }
+        let port = self.port()?;
+        Some(format!(
+            "http://{}:{}/experimental/hooks/chat",
+            self.hook_host, port
+        ))
+    }
+}
+
 impl fmt::Debug for CoderConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoderConfig")
@@ -65,6 +194,7 @@ impl fmt::Debug for CoderConfig {
             .field("admin_username", &self.admin_username)
             .field("image_tag", &self.image_tag)
             .field("github_token", &redact(&self.github_token))
+            .field("external_auth_id", &self.external_auth_id)
             .field("external_auth_client_id", &self.external_auth_client_id)
             .field(
                 "external_auth_client_secret",
@@ -262,6 +392,7 @@ impl AgentConfig {
 #[derive(Debug, Clone)]
 pub struct EnvConfig {
     pub coder: CoderConfig,
+    pub hooks: CoderHooksConfig,
     pub infra: InfraConfig,
     pub tenant: TenantConfig,
     pub github: GithubConfig,
@@ -327,9 +458,12 @@ impl EnvConfig {
             GithubConfig::init_from_env().map_err(|e| anyhow::anyhow!("GitHub config: {e}"))?;
         let agent =
             AgentConfig::init_from_env().map_err(|e| anyhow::anyhow!("Agent config: {e}"))?;
+        let hooks =
+            CoderHooksConfig::init_from_env().map_err(|e| anyhow::anyhow!("Hooks config: {e}"))?;
 
         Ok(Self {
             coder,
+            hooks,
             infra,
             tenant,
             github,
@@ -385,6 +519,13 @@ mod tests {
             "CODER_IMAGE_TAG",
             "REDIS_URL",
             "A2A_RELAY_ADDR",
+            "CODER_CHAT_HOOK_SECRET",
+            "CODER_CHAT_HOOK_ENABLED",
+            "OPENFLOWS_HOOK_ADDR",
+            "OPENFLOWS_HOOK_HOST",
+            "OPENFLOWS_HOOK_LOGS",
+            "CODER_CHAT_HOOK_URL",
+            "OPENFLOWS_HOOK_URL",
             "OPENFLOWS_TENANT",
             "OPENFLOWS_TAR",
             "USE_AI_GATEWAY",
@@ -398,6 +539,11 @@ mod tests {
         assert_eq!(cfg.coder.image_tag, "v2.37.1");
         assert_eq!(cfg.infra.effective_redis_url(), "redis://localhost:6379");
         assert_eq!(cfg.infra.a2a_relay_addr, "127.0.0.1:3000");
+        assert_eq!(cfg.hooks.hook_addr, "0.0.0.0:3001");
+        assert_eq!(cfg.hooks.hook_host, "openflows-nexus");
+        assert!(cfg.hooks.chat_hook_url.is_none());
+        assert!(!cfg.hooks.hook_logs);
+        assert!(!cfg.hooks.enabled());
         assert_eq!(cfg.tenant.effective_tenant(), "default");
         assert_eq!(cfg.tenant.tar, "tar");
         assert_eq!(cfg.agent.use_ai_gateway, None);
@@ -449,6 +595,86 @@ mod tests {
                 "USE_AI_GATEWAY={v}"
             );
         }
+    }
+
+    #[test]
+    fn hook_consumer_enablement_uses_secret_not_coder_experiment_flag() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_EXPERIMENTS",
+            "CODER_CHAT_HOOK_SECRET",
+            "CODER_CHAT_HOOK_ENABLED",
+        ]);
+        guard.unset_all();
+
+        std::env::set_var("CODER_EXPERIMENTS", "agent-lifecycle-hooks");
+        assert!(!EnvConfig::from_env().unwrap().hooks.enabled());
+
+        std::env::set_var("CODER_CHAT_HOOK_SECRET", "0123456789abcdef0123456789abcdef");
+        assert!(EnvConfig::from_env().unwrap().hooks.enabled());
+
+        std::env::set_var("CODER_CHAT_HOOK_ENABLED", "false");
+        assert!(!EnvConfig::from_env().unwrap().hooks.enabled());
+    }
+
+    #[test]
+    fn hook_logs_are_opt_in() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&["OPENFLOWS_HOOK_LOGS"]);
+        guard.unset_all();
+
+        assert!(!EnvConfig::from_env().unwrap().hooks.hook_logs);
+
+        std::env::set_var("OPENFLOWS_HOOK_LOGS", "true");
+        assert!(EnvConfig::from_env().unwrap().hooks.hook_logs);
+    }
+
+    #[test]
+    fn hook_public_url_prefers_coder_chat_hook_url() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let guard = EnvGuard::capture(&[
+            "CODER_CHAT_HOOK_URL",
+            "OPENFLOWS_HOOK_URL",
+            "OPENFLOWS_HOOK_ADDR",
+            "OPENFLOWS_HOOK_HOST",
+        ]);
+        guard.unset_all();
+
+        // Without CODER_CHAT_HOOK_URL the audience is derived from host + addr.
+        std::env::set_var("OPENFLOWS_HOOK_ADDR", "0.0.0.0:3001");
+        std::env::set_var("OPENFLOWS_HOOK_HOST", "openflows-nexus");
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.hooks.hook_public_url().as_deref(),
+            Some("http://openflows-nexus:3001/experimental/hooks/chat")
+        );
+
+        // When Coder's CODER_CHAT_HOOK_URL is set it is the authoritative
+        // audience, regardless of the derived bind/host, preventing aud drift.
+        std::env::set_var(
+            "CODER_CHAT_HOOK_URL",
+            "http://openflows-nexus:3900/experimental/hooks/chat",
+        );
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.hooks.hook_public_url().as_deref(),
+            Some("http://openflows-nexus:3900/experimental/hooks/chat")
+        );
+
+        // A custom OPENFLOWS_HOOK_URL (compose's single knob) is honored when
+        // CODER_CHAT_HOOK_URL is not exported to the controller process — the
+        // drift case where the controller would otherwise fall back to the
+        // derived default while Coder signs with the custom URL.
+        std::env::remove_var("CODER_CHAT_HOOK_URL");
+        std::env::set_var(
+            "OPENFLOWS_HOOK_URL",
+            "http://openflows-nexus:4900/experimental/hooks/chat",
+        );
+        let cfg = EnvConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.hooks.hook_public_url().as_deref(),
+            Some("http://openflows-nexus:4900/experimental/hooks/chat")
+        );
     }
 
     #[test]
