@@ -109,34 +109,40 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
     Some(Vec::new())
 }
 
-/// Detect commands whose own syntax can write files in a way the redirection /
-/// operand parsers do not capture (`dd of=`, `curl -o`, `wget -O`,
-/// `git checkout`/`git restore`, a nested `sh -c`, ...). Such commands must be
-/// treated as write-capable, otherwise they could silently alter source in a
-/// write-restricted phase.
-fn is_write_capable_command(command: &str) -> bool {
-    let words = shell_words(command);
-    if words.is_empty() {
+/// Can one command *segment* (a portion separated by `&&`/`||`/`;`/`|`) write a
+/// file in a way the redirection / operand parsers do not capture?
+///
+/// Wrappers (`sudo`, `nohup`, `env`, ...) that merely forward to the real
+/// command are stripped first, and the subcommand of a compound command (e.g.
+/// `git checkout`) is resolved *relative to the executable that was actually
+/// found*. Reading the subcommand from a fixed token would break under a
+/// wrapper (`sudo git checkout -- src/lib.rs`) and let the write slip past.
+fn segment_is_write_capable(segment: &[String]) -> bool {
+    // The real command is the first token that is not a forwarding wrapper.
+    let Some(cmd_idx) = segment.iter().position(|w| {
+        !matches!(
+            w.as_str(),
+            "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
+        )
+    }) else {
         return false;
-    }
-    // Strip wrappers that merely forward to the real command.
-    let cmd = words
-        .iter()
-        .map(|w| w.as_str())
-        .find(|w| {
-            !matches!(
-                *w,
-                "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
-            )
-        })
-        .unwrap_or_default();
+    };
+    let cmd = segment[cmd_idx].as_str();
+    let rest = &segment[cmd_idx + 1..];
     match cmd {
         "dd" => true,
-        "curl" | "wget" => words
+        "curl" | "wget" => rest
             .iter()
             .any(|w| w == "-o" || w == "-O" || w.starts_with("--output")),
         "git" => {
-            let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
+            // First positional argument after the resolved `git` is the
+            // subcommand. Resolving it relative to `git` (not to token 1)
+            // keeps wrapper-invoked checkouts detected.
+            let sub = rest
+                .iter()
+                .find(|w| !w.starts_with('-') && !is_shell_separator(w))
+                .map(|s| s.as_str())
+                .unwrap_or("");
             matches!(
                 sub,
                 "checkout"
@@ -154,9 +160,29 @@ fn is_write_capable_command(command: &str) -> bool {
                     | "pull"
             )
         }
-        "sh" | "bash" | "zsh" | "ksh" | "dash" => words.iter().any(|w| w == "-c"),
+        "sh" | "bash" | "zsh" | "ksh" | "dash" => rest.iter().any(|w| w == "-c"),
         _ => false,
     }
+}
+
+/// Detect commands whose own syntax can write files in a way the redirection /
+/// operand parsers do not capture (`dd of=`, `curl -o`, `wget -O`,
+/// `git checkout`/`git restore`, a nested `sh -c`, ...). Such commands must be
+/// treated as write-capable, otherwise they could silently alter source in a
+/// write-restricted phase.
+///
+/// Every command *segment* is inspected: a write hidden behind a shell
+/// operator (`true && dd of=src/lib.rs`, `git pull ; git reset`) must not
+/// escape detection by hiding in a later segment.
+fn is_write_capable_command(command: &str) -> bool {
+    let words = shell_words(command);
+    if words.is_empty() {
+        return false;
+    }
+    words
+        .split(|w| is_shell_separator(w))
+        .filter(|segment| !segment.is_empty())
+        .any(segment_is_write_capable)
 }
 
 fn redirection_targets(words: &[String]) -> Vec<String> {
@@ -245,7 +271,11 @@ fn shell_words(command: &str) -> Vec<String> {
 }
 
 fn clean_shell_word(word: &str) -> String {
-    word.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')'))
+    // `;` is intentionally not trimmed: `shell_words` emits it as a standalone
+    // shell-separator token so compound commands (`a ; b`) stay parseable as
+    // separate segments. Trimming it here collapses the segments into one and
+    // hides any write in a later segment.
+    word.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'))
         .to_string()
 }
 
@@ -305,6 +335,19 @@ fn command_text(input: &Value) -> String {
             .join(" ");
     }
     input.as_str().unwrap_or_default().to_string()
+}
+
+/// An *exact* return-to-planning (or blocked-hold) transition command.
+///
+/// The whole command must match, not merely contain the transition substring.
+/// A compound invocation like
+/// `openflows-harness status set planning && dd of=src/lib.rs` contains
+/// `status set planning` but is not a replan — allowing it would let the
+/// blocked worker smuggle an unauthorized trailing write past the gate
+/// (P1: "Compound Replans Bypass Blocking").
+fn is_exact_replan(command: &str) -> bool {
+    let cmd = command.trim().to_lowercase();
+    cmd == "openflows-harness status set planning" || cmd == "openflows-harness status set blocked"
 }
 
 /// Coordination commands that must remain available when durable state is
@@ -558,8 +601,7 @@ pub async fn phase_guard(
             .unwrap_or_default()
             .to_lowercase();
         let is_readonly_probe = is_shell(&lower) && is_probe_command(&command);
-        let is_replan = (is_harness(&lower) || is_shell(&lower))
-            && (command.contains("status set planning") || command.contains("status set blocked"));
+        let is_replan = (is_harness(&lower) || is_shell(&lower)) && is_exact_replan(&command);
         let is_blocker = is_write_tool(&lower) && is_blocker_write(&lower, input);
         if !is_readonly_probe && !is_replan && !is_blocker {
             decision = HookDecision::deny(

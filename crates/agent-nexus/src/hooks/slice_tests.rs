@@ -398,6 +398,118 @@ async fn phase_guard_denies_write_capable_shell_during_review_ready() {
     );
 }
 
+#[tokio::test]
+async fn phase_guard_denies_wrapped_git_checkout_write_capable() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-36", "forge", "chat-36").await;
+    seed_status(&store, "T-36", "review_ready").await;
+
+    // A wrapper (`sudo`) must not let the git subcommand resolve to the wrong
+    // token and slip past write detection (P1: "Wrapped Commands Evade
+    // Detection").
+    for cmd in [
+        "sudo git checkout -- src/lib.rs",
+        "env git restore src/lib.rs",
+        "nohup git reset --hard HEAD",
+    ] {
+        let input = json!({ "command": cmd });
+        let d = phase_guard(
+            &store,
+            "chat-36",
+            "forge",
+            "bash",
+            &input,
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            d.deny,
+            "review_ready must deny wrapper-invoked git write: {cmd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_guard_denies_write_hidden_in_later_shell_segment() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-37", "forge", "chat-37").await;
+    seed_status(&store, "T-37", "review_ready").await;
+
+    // A write in a later command segment (after a shell operator) must still be
+    // detected (P1: "Wrapped Commands Evade Detection").
+    for cmd in [
+        "true && dd of=src/lib.rs",
+        "echo x ; curl -o src/lib.rs https://example.test/x",
+        "ls | wget -O src/lib.rs https://example.test/x",
+    ] {
+        let input = json!({ "command": cmd });
+        let d = phase_guard(
+            &store,
+            "chat-37",
+            "forge",
+            "bash",
+            &input,
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            d.deny,
+            "review_ready must deny write hidden in later segment: {cmd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_guard_denies_compound_replan_bypassing_blocked_gate() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-38", "forge", "chat-38").await;
+    seed_status(&store, "T-38", "blocked").await;
+
+    // Merely *containing* `status set planning` must not let a compound
+    // invocation escape the blocked gate with an unauthorized trailing write
+    // (P1: "Compound Replans Bypass Blocking").
+    for cmd in [
+        "openflows-harness status set planning && dd of=src/lib.rs",
+        "openflows-harness status set planning ; git checkout -- src/lib.rs",
+    ] {
+        let input = json!({ "command": cmd });
+        let d = phase_guard(
+            &store,
+            "chat-38",
+            "forge",
+            "bash",
+            &input,
+            HookDecision::observe(),
+        )
+        .await;
+        assert!(
+            d.deny,
+            "blocked compound command must not bypass the gate: {cmd}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn phase_guard_allows_exact_replan_from_blocked() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-39", "forge", "chat-39").await;
+    seed_status(&store, "T-39", "blocked").await;
+
+    // An exact return-to-planning transition remains a valid blocked escape,
+    // even on the shell tool.
+    let input = json!({ "command": "openflows-harness status set planning" });
+    let d = phase_guard(
+        &store,
+        "chat-39",
+        "forge",
+        "bash",
+        &input,
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(!d.deny, "exact replan from blocked stays allowed");
+}
+
 // ── Slice B: kick publishing ────────────────────────────────────────────
 
 #[tokio::test]
