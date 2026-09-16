@@ -252,6 +252,7 @@ async fn consumer_accepts_signed_dispatch_end_to_end() {
         hook_addr: addr.to_string(),
         hook_host: "127.0.0.1".to_string(),
         chat_hook_url: None,
+        hook_url: None,
         hook_logs: false,
     };
     assert_eq!(config.hook_public_url().as_deref(), Some(hook_url.as_str()));
@@ -303,6 +304,7 @@ async fn consumer_accepts_dispatch_when_chat_hook_url_is_audience() {
         hook_host: "127.0.0.1".to_string(),
         // The authoritative audience is Coder's CODER_CHAT_HOOK_URL.
         chat_hook_url: Some(coder_hook_url.clone()),
+        hook_url: None,
         hook_logs: false,
     };
     assert_eq!(

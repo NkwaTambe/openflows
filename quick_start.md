@@ -230,12 +230,18 @@ A healthy consumer responds `200`. If you see `InvalidAudience`, see [Troublesho
 
 ### Rotating the secret
 
+`CODER_CHAT_HOOK_SECRET` is an **immutable** Nexus workspace parameter: Coder captures it when the workspace is built, and re-running bootstrap alone **does not** update an existing workspace (bootstrap only rebuilds the Nexus workspace when the template itself changes). To rotate, you must recreate the workspace so it is rebuilt with the new secret:
+
 1. Stop the Controller.
 2. Set a new 32+ byte `CODER_CHAT_HOOK_SECRET` in `.env`.
-3. Restart Coder and the Controller.
-4. Re-run bootstrap so templates/workspaces pick up the new value.
+3. Delete the existing Nexus workspace so bootstrap rebuilds it. You can do this from the host with the `coder` CLI (logged in as the OpenFlows user):
+   ```bash
+   coder delete openflows-nexus
+   ```
+   (If you changed `OPENFLOWS_HOOK_URL` at the same time, do the same — the hook URL is also immutable.)
+4. Re-run bootstrap. It recreates the workspace with the new secret and the controller starts validating against it.
 
-Coder and the consumer must always share the same secret.
+Coder and the consumer must always share the same secret, and both Coder and the Controller must be restarted after rotation.
 
 ---
 
@@ -252,7 +258,7 @@ These are optional — the defaults work out of the box. Only touch them if you 
 | `CODER_URL` | `http://localhost:7080` | Set only if you host Coder elsewhere. |
 | `OPENFLOWS_TENANT` | `default` | Namespace for Redis keys. |
 | `CODER_CHAT_HOOK_SECRET` | required | Generate 32+ random bytes, for example `openssl rand -hex 32`; hook URL/experiment/bind values are wired automatically. |
-| `OPENFLOWS_HOOK_URL` | `http://openflows-nexus:3001/experimental/hooks/chat` | Single source of truth for the hook endpoint, shared between Coder and the consumer. Only change for a custom deployment (see [Lifecycle hooks](#lifecycle-hooks)). |
+| `OPENFLOWS_HOOK_URL` | `http://openflows-nexus:3001/experimental/hooks/chat` | Single source of truth for the hook endpoint, shared between Coder and the consumer. The consumer picks it up via bootstrap; after changing it on an existing deployment, recreate the Nexus workspace (see [Rotating the secret](#rotating-the-secret)). |
 | `OPENFLOWS_HOOK_LOGS` | `false` | Set `true` only when debugging lifecycle hook traffic. |
 | `SLACK_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` | unset | Escalation notifications. |
 
@@ -345,7 +351,7 @@ This usually means the hook consumer rejected or couldn't be reached during Code
 
 If the controller logs `Hook consumer: JWT verification failed ... InvalidAudience`, the JWT's `aud` claim (Coder's `CODER_CHAT_HOOK_URL`) does not match the audience the consumer expects. In the bundled stack this should not happen — `OPENFLOWS_HOOK_URL` drives both Coder's URL and the consumer's expected `aud` via bootstrap. It appears when those two get out of sync:
 
-- You set the Coder hook URL and the consumer's bind/host to different ports on a **custom** deployment. Make them agree: either keep the bundled defaults, or export `CODER_CHAT_HOOK_URL` to the bootstrap/controller process so the consumer validates against the **exact** URL Coder uses (see [Step 2](#step-2--set-up-env)).
+- The hook URL is set on a **custom** deployment via `OPENFLOWS_HOOK_URL`, but the **Nexus workspace was not recreated** after the URL changed. The hook URL is an immutable workspace parameter, so an existing workspace keeps validating against the audience it was originally built with even after you change `OPENFLOWS_HOOK_URL`. Recreate the workspace (see [Rotating the secret](#rotating-the-secret)) so bootstrap rebuilds it against the current URL, or keep the bundled defaults.
 - Coder and the consumer were started with different `CODER_CHAT_HOOK_SECRET` values or one was restarted out of order. Restart both with the same secret.
 
 ### `403 External authentication is required to create a workspace with this template`

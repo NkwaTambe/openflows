@@ -499,7 +499,7 @@ impl CoderBootstrapper {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .context("CODER_CHAT_HOOK_SECRET must be set to 32+ random bytes before creating the Nexus workspace")?;
-        let hook_url = env_cfg.hooks.chat_hook_url.clone().unwrap_or_default();
+        let hook_url = env_cfg.hooks.chat_hook_url_effective().unwrap_or_default();
 
         let workspace = client
             .create_workspace(&CreateWorkspaceRequest {
@@ -783,11 +783,11 @@ impl CoderBootstrapper {
         let hook_url = self
             .env
             .as_ref()
-            .and_then(|e| e.hooks.chat_hook_url.clone())
+            .and_then(|e| e.hooks.chat_hook_url_effective())
             .or_else(|| {
                 config::EnvConfig::from_env()
                     .ok()
-                    .and_then(|c| c.hooks.chat_hook_url)
+                    .and_then(|c| c.hooks.chat_hook_url_effective())
             })
             .unwrap_or_default();
         let workspace = client
