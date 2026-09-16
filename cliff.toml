@@ -88,8 +88,14 @@ filter_unconventional = true
 # process each line of a commit as an individual commit
 split_commits = false
 # regex for preprocessing the commit messages
+# render `(#N)` PR trailers as `/pull/N` links so release-plz's contributor
+# lookups (`prs_from_text` → `remote.contributors`) can discover the PR number.
+# This mirrors release-plz's own default preprocessor (its default is skipped
+# whenever this array is non-empty, so we must reproduce the linkification here).
+# The `(#N)` trailer is the ONLY recognized PR marker: `(Refs #N)` and `fixes #N`
+# refer to issues/work items in this repo, never PRs, so they are left untouched.
 commit_preprocessors = [
-  { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "" },
+  { pattern = '\(#([0-9]+)\)', replace = '([#$1](https://github.com/The-AgenticFlow/openflows/pull/$1))' },
 ]
 # regex for parsing and grouping commits
 commit_parsers = [
