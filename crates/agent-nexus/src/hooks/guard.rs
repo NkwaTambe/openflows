@@ -98,7 +98,91 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
         return None;
     }
 
+    // Unknown-but-write-capable commands (dd of=, curl -o, wget -O, git
+    // checkout/restore/..., sh -c ...) have filesystem effects the operand
+    // parser does not capture. Fail closed: treat them as potential writes in
+    // write-restricted phases rather than assuming they are read-only.
+    if is_write_capable_command(command) {
+        return None;
+    }
+
     Some(Vec::new())
+}
+
+/// Can one command *segment* (a portion separated by `&&`/`||`/`;`/`|`) write a
+/// file in a way the redirection / operand parsers do not capture?
+///
+/// Wrappers (`sudo`, `nohup`, `env`, ...) that merely forward to the real
+/// command are stripped first, and the subcommand of a compound command (e.g.
+/// `git checkout`) is resolved *relative to the executable that was actually
+/// found*. Reading the subcommand from a fixed token would break under a
+/// wrapper (`sudo git checkout -- src/lib.rs`) and let the write slip past.
+fn segment_is_write_capable(segment: &[String]) -> bool {
+    // The real command is the first token that is not a forwarding wrapper.
+    let Some(cmd_idx) = segment.iter().position(|w| {
+        !matches!(
+            w.as_str(),
+            "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
+        )
+    }) else {
+        return false;
+    };
+    let cmd = segment[cmd_idx].as_str();
+    let rest = &segment[cmd_idx + 1..];
+    match cmd {
+        "dd" => true,
+        "curl" | "wget" => rest
+            .iter()
+            .any(|w| w == "-o" || w == "-O" || w.starts_with("--output")),
+        "git" => {
+            // First positional argument after the resolved `git` is the
+            // subcommand. Resolving it relative to `git` (not to token 1)
+            // keeps wrapper-invoked checkouts detected.
+            let sub = rest
+                .iter()
+                .find(|w| !w.starts_with('-') && !is_shell_separator(w))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            matches!(
+                sub,
+                "checkout"
+                    | "restore"
+                    | "reset"
+                    | "stash"
+                    | "rm"
+                    | "mv"
+                    | "apply"
+                    | "am"
+                    | "merge"
+                    | "rebase"
+                    | "cherry-pick"
+                    | "clean"
+                    | "pull"
+            )
+        }
+        "sh" | "bash" | "zsh" | "ksh" | "dash" => rest.iter().any(|w| w == "-c"),
+        _ => false,
+    }
+}
+
+/// Detect commands whose own syntax can write files in a way the redirection /
+/// operand parsers do not capture (`dd of=`, `curl -o`, `wget -O`,
+/// `git checkout`/`git restore`, a nested `sh -c`, ...). Such commands must be
+/// treated as write-capable, otherwise they could silently alter source in a
+/// write-restricted phase.
+///
+/// Every command *segment* is inspected: a write hidden behind a shell
+/// operator (`true && dd of=src/lib.rs`, `git pull ; git reset`) must not
+/// escape detection by hiding in a later segment.
+fn is_write_capable_command(command: &str) -> bool {
+    let words = shell_words(command);
+    if words.is_empty() {
+        return false;
+    }
+    words
+        .split(|w| is_shell_separator(w))
+        .filter(|segment| !segment.is_empty())
+        .any(segment_is_write_capable)
 }
 
 fn redirection_targets(words: &[String]) -> Vec<String> {
@@ -187,7 +271,11 @@ fn shell_words(command: &str) -> Vec<String> {
 }
 
 fn clean_shell_word(word: &str) -> String {
-    word.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '(' | ')'))
+    // `;` is intentionally not trimmed: `shell_words` emits it as a standalone
+    // shell-separator token so compound commands (`a ; b`) stay parseable as
+    // separate segments. Trimming it here collapses the segments into one and
+    // hides any write in a later segment.
+    word.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')'))
         .to_string()
 }
 
@@ -218,10 +306,13 @@ fn is_write_attempt(tool_name: &str, input: &Value) -> bool {
 }
 
 /// Is the tool a read-only probe (bash read of status/dispatch/plan)?
+///
+/// `status set` is deliberately *not* a probe: it mutates durable state and,
+/// in a blocked worker, would otherwise allow an unapproved phase transition
+/// (e.g. `status set building`) to escape the blockage.
 fn is_probe_command(command: &str) -> bool {
     let cmd = command.to_lowercase();
     cmd.contains("status get")
-        || cmd.contains("status set") // set is coordinated by the harness, not a source write
         || cmd.contains("gate status")
         || cmd.contains("dispatch read")
         || cmd.contains("plan read")
@@ -244,6 +335,19 @@ fn command_text(input: &Value) -> String {
             .join(" ");
     }
     input.as_str().unwrap_or_default().to_string()
+}
+
+/// An *exact* return-to-planning (or blocked-hold) transition command.
+///
+/// The whole command must match, not merely contain the transition substring.
+/// A compound invocation like
+/// `openflows-harness status set planning && dd of=src/lib.rs` contains
+/// `status set planning` but is not a replan — allowing it would let the
+/// blocked worker smuggle an unauthorized trailing write past the gate
+/// (P1: "Compound Replans Bypass Blocking").
+fn is_exact_replan(command: &str) -> bool {
+    let cmd = command.trim().to_lowercase();
+    cmd == "openflows-harness status set planning" || cmd == "openflows-harness status set blocked"
 }
 
 /// Coordination commands that must remain available when durable state is
@@ -279,11 +383,14 @@ fn target_path(input: &Value) -> String {
 }
 
 /// True when the write is to / creates the plan artifact.
+///
+/// Plan writes are determined from the *validated target path* or the exact
+/// harness `plan write` command — never from an unvalidated `is_plan` flag on
+/// the tool input. Trusting a caller-supplied `is_plan: true` marker would let
+/// a write to any source path masquerade as a plan write and slip past the
+/// phase gate.
 fn is_plan_write(tool_name: &str, input: &Value) -> bool {
     if tool_name.to_lowercase().contains("plan") {
-        return true;
-    }
-    if input.get("is_plan").and_then(|v| v.as_bool()) == Some(true) {
         return true;
     }
     let path = target_path(input).to_lowercase();
@@ -484,18 +591,23 @@ pub async fn phase_guard(
 
     // ── BLOCKED ───────────────────────────────────────────────────────────
     if phase == "blocked" {
-        let is_coordination = is_harness(&lower)
-            || (is_shell(&lower)
-                && input
-                    .get("command")
-                    .and_then(|c| c.as_str())
-                    .map(is_probe_command)
-                    .unwrap_or(false));
+        // Only read-only probes, blocker writes, and *returning to planning*
+        // (re-planning) are permitted. Arbitrary forward transitions (e.g.
+        // `status set building`) require explicit NEXUS/human authorization
+        // and must not be reachable from a blocked worker.
+        let command = input
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let is_readonly_probe = is_shell(&lower) && is_probe_command(&command);
+        let is_replan = (is_harness(&lower) || is_shell(&lower)) && is_exact_replan(&command);
         let is_blocker = is_write_tool(&lower) && is_blocker_write(&lower, input);
-        if !is_coordination && !is_blocker {
+        if !is_readonly_probe && !is_replan && !is_blocker {
             decision = HookDecision::deny(
-                "openflows policy: FORGE is blocked. Only record a blocker (STATUS.json) \
-                 and probe state; do not write source or build.",
+                "openflows policy: FORGE is blocked. Only record a blocker (STATUS.json), \
+                 probe state, or return to `status set planning`; do not write source or \
+                 build.",
             );
         }
         return decision.with_model_context(guidance);

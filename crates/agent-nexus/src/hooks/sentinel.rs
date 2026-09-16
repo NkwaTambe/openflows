@@ -93,7 +93,64 @@ fn shell_write_targets(command: &str) -> Option<Vec<String>> {
         return None;
     }
 
+    // Unknown-but-write-capable commands (dd of=, curl -o, wget -O, git
+    // checkout/restore/..., sh -c ...) have filesystem effects the operand
+    // parser does not capture. Fail closed so Sentinel cannot silently modify
+    // the checkout despite its read-only role.
+    if is_write_capable_command(command) {
+        return None;
+    }
+
     Some(Vec::new())
+}
+
+/// Detect commands whose own syntax can write files in a way the redirection /
+/// operand parsers do not capture (`dd of=`, `curl -o`, `wget -O`,
+/// `git checkout`/`git restore`, a nested `sh -c`, ...). Such commands must be
+/// treated as write-capable, otherwise they could silently alter the checkout.
+fn is_write_capable_command(command: &str) -> bool {
+    let words = shell_words(command);
+    if words.is_empty() {
+        return false;
+    }
+    // Strip wrappers that merely forward to the real command.
+    let cmd = words
+        .iter()
+        .map(|w| w.as_str())
+        .find(|w| {
+            !matches!(
+                *w,
+                "nohup" | "nice" | "sudo" | "env" | "setsid" | "time" | "command"
+            )
+        })
+        .unwrap_or_default();
+    match cmd {
+        "dd" => true,
+        "curl" | "wget" => words
+            .iter()
+            .any(|w| w == "-o" || w == "-O" || w.starts_with("--output")),
+        "git" => {
+            let sub = words.get(1).map(|s| s.as_str()).unwrap_or("");
+            matches!(
+                sub,
+                "checkout"
+                    | "restore"
+                    | "reset"
+                    | "stash"
+                    | "rm"
+                    | "mv"
+                    | "apply"
+                    | "am"
+                    | "merge"
+                    | "rebase"
+                    | "cherry-pick"
+                    | "clean"
+                    | "pull"
+            )
+        }
+        "sh" | "bash" | "zsh" | "ksh" | "dash" => words.iter().any(|w| w == "-c"),
+        _ => false,
+    }
 }
 
 fn redirection_targets(words: &[String]) -> Vec<String> {
