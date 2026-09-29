@@ -61,6 +61,9 @@ openflows-cli control pause my-team
 
 # Resume (back to auto)
 openflows-cli control resume my-team
+
+# Set the mode explicitly (only auto | paused are implemented)
+openflows-cli control set my-team paused
 ```
 
 `drained` and `targeted` are documented control-plane modes but are **not yet
