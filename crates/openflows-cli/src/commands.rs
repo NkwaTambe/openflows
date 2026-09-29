@@ -83,7 +83,7 @@ pub enum TasksAction {
 pub enum ControlAction {
     /// Read a tenant's current control mode.
     Get { tenant: String },
-    /// Set a tenant's control mode (auto|paused|drained|targeted).
+    /// Set a tenant's control mode (auto|paused).
     Set { tenant: String, mode: String },
     /// Halt a tenant's fleet (control mode `paused`).
     Pause { tenant: String },
