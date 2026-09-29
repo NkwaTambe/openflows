@@ -492,3 +492,56 @@ async fn wildcard_tenant_name_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn assignment_ids_do_not_repeat_existing_tickets() {
+    // Simulate an upgrade / a tenant that already had tickets before the id
+    // counter existed: a new assignment must not repeat an existing ticket id.
+    let state = openflows_manager::server::AppState::for_tests();
+    let app = create_router(state.clone());
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+
+    // Pre-existing tickets (no counter key present yet).
+    let existing: Vec<Value> = (1..=5)
+        .map(|i| json!({"id": format!("T-CLI-{i:03}"), "status": {"type": "open"}}))
+        .collect();
+    state
+        .store()
+        .raw_set(
+            &format!("ns:acme:{}", "tickets"),
+            serde_json::to_value(&existing).unwrap(),
+        )
+        .await;
+
+    // Assign one task -> should get the next id, not a repeat.
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants/acme/tasks",
+        Some(json!({"title": "new work"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let tickets = state
+        .store()
+        .raw_get(&format!("ns:acme:{}", "tickets"))
+        .await
+        .unwrap();
+    let arr = tickets.as_array().unwrap();
+    assert_eq!(arr.len(), 6);
+    assert_eq!(arr[5]["id"], "T-CLI-006");
+
+    let mut ids: Vec<&str> = arr.iter().map(|t| t["id"].as_str().unwrap()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), arr.len(), "no duplicate ticket ids");
+}

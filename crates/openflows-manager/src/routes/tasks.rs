@@ -79,7 +79,24 @@ pub async fn append_task(
     tenant: &str,
     req: AssignTaskRequest,
 ) -> Result<Task, ManagerError> {
-    let n = store.raw_incr(&ticket_counter_key(tenant)).await?;
+    // Seed the id counter from the existing ticket count when it is first used,
+    // so a tenant that already has tickets (e.g. after an upgrade, or from
+    // earlier assignments before this counter existed) never gets a repeating
+    // `T-CLI-*` id. SETNX makes this race-safe: concurrent first-use only sets
+    // it once, and INCR then produces unique, strictly-increasing ids.
+    let counter_key = ticket_counter_key(tenant);
+    let existing = store
+        .raw_get_result(&tickets_key(tenant))
+        .await
+        .map_err(ManagerError::Service)?
+        .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v).ok())
+        .map(|t| t.len())
+        .unwrap_or(0);
+    store
+        .raw_set_if_absent(&counter_key, serde_json::json!(existing))
+        .await
+        .map_err(ManagerError::Service)?;
+    let n = store.raw_incr(&counter_key).await?;
 
     // Dispatch first: atomically append the open ticket.
     let ticket = config::Ticket {

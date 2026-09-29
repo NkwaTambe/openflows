@@ -425,7 +425,22 @@ Before significant work, read the relevant skill file to understand the workflow
             });
         }
 
-        store.set(KEY_TICKETS, json!(tickets)).await;
+        // Merge with the CURRENTLY stored ticket array before writing. The
+        // issue sync is a read-modify-write, and a concurrent append (e.g. a
+        // task assigned through the manager CLI) can land between our read above
+        // and this write — overwriting it would silently drop that work. Union
+        // by ticket id so tickets that appeared since our read are preserved.
+        let current: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        let mut merged = tickets;
+        let existing_ids: std::collections::HashSet<String> =
+            merged.iter().map(|t| t.id.clone()).collect();
+        for t in current {
+            if !existing_ids.contains(&t.id) {
+                merged.push(t);
+            }
+        }
+
+        store.set(KEY_TICKETS, json!(merged)).await;
         Ok(())
     }
 
