@@ -525,24 +525,43 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     );
     let mut last_pass;
     loop {
-        match flow.run(&store).await {
-            Ok(final_action) => {
-                tracing::info!(
-                    action = final_action.as_str(),
-                    poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
-                    "Controller flow pass completed; waiting for next poll"
-                );
-            }
-            Err(e) => {
-                // Self-healing: never let a flow error kill the controller.
-                // Log the error, back off, and retry on the next poll cycle.
-                // Transient errors (Redis drops, Coder API timeouts, GitHub
-                // rate limits) should not stop the orchestration loop.
-                tracing::error!(
-                    error = %e,
-                    poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
-                    "Controller flow pass failed — will retry on next poll (self-healing)"
-                );
+        // Read the operator-set control mode (issue #333). When the fleet is
+        // paused the controller halts rather than running a flow pass, so a
+        // `control pause` issued over the manager/CLI takes effect on the next
+        // poll. `auto` (absent key) and other modes run normally.
+        let control_mode = store
+            .get(config::KEY_CONTROL_MODE)
+            .await
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| s == config::CONTROL_MODE_PAUSED);
+
+        if let Some(mode) = control_mode {
+            tracing::info!(
+                tenant,
+                control_mode = mode,
+                poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+                "Controller paused by operator — skipping flow pass"
+            );
+        } else {
+            match flow.run(&store).await {
+                Ok(final_action) => {
+                    tracing::info!(
+                        action = final_action.as_str(),
+                        poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+                        "Controller flow pass completed; waiting for next poll"
+                    );
+                }
+                Err(e) => {
+                    // Self-healing: never let a flow error kill the controller.
+                    // Log the error, back off, and retry on the next poll cycle.
+                    // Transient errors (Redis drops, Coder API timeouts, GitHub
+                    // rate limits) should not stop the orchestration loop.
+                    tracing::error!(
+                        error = %e,
+                        poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
+                        "Controller flow pass failed — will retry on next poll (self-healing)"
+                    );
+                }
             }
         }
         last_pass = std::time::Instant::now();

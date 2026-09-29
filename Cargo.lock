@@ -1599,6 +1599,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "openflows-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "openflows-manager",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "openflows-harness"
 version = "1.2.1"
 dependencies = [

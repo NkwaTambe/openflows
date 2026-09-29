@@ -246,6 +246,18 @@ impl SharedStore {
         self.backend.keys(pattern).await
     }
 
+    /// Raw get of a full key WITHOUT tenant namespacing.
+    /// Use this with fully-qualified keys (e.g. `ns:{tenant}:...`) when the
+    /// caller manages namespacing itself (as the multi-tenant manager does).
+    pub async fn raw_get(&self, key: &str) -> Option<Value> {
+        self.backend.get(key).await
+    }
+
+    /// Raw set of a full key WITHOUT tenant namespacing.
+    pub async fn raw_set(&self, key: &str, value: Value) {
+        self.backend.set(key, value).await;
+    }
+
     /// Raw delete of a full Redis key WITHOUT tenant namespacing.
     /// Use this with keys returned by `keys()` / `raw_keys()`, which are
     /// already fully-qualified and must not be re-prefixed.

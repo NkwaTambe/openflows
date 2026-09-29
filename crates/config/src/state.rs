@@ -92,6 +92,35 @@ pub enum WorkerStatus {
 pub const KEY_TICKETS: &str = "tickets";
 pub const KEY_WORKER_SLOTS: &str = "worker_slots";
 pub const KEY_PENDING_PRS: &str = "pending_prs";
+
+// ── Control-plane state (issue #333) ──────────────────────────────────────
+// The operator halts/resumes/steers a tenant's fleet by writing a control mode
+// to the tenant-scoped key `ns:{tenant}:control:mode`. The controller reads it
+// at the top of each poll pass and the manager/CLI write it. Keeping the
+// vocabulary in one place avoids drift between the server and client.
+pub const KEY_CONTROL_MODE: &str = "control:mode";
+
+/// The fleet runs normally (default when the key is absent).
+pub const CONTROL_MODE_AUTO: &str = "auto";
+/// The fleet is halted; no new work starts and in-flight passes do not run.
+pub const CONTROL_MODE_PAUSED: &str = "paused";
+/// Stop starting new work but allow already in-flight work to finish.
+pub const CONTROL_MODE_DRAINED: &str = "drained";
+/// Restrict the fleet to a specific target (reserved for future steering).
+pub const CONTROL_MODE_TARGETED: &str = "targeted";
+
+/// All valid control-mode values.
+pub const CONTROL_MODES: &[&str] = &[
+    CONTROL_MODE_AUTO,
+    CONTROL_MODE_PAUSED,
+    CONTROL_MODE_DRAINED,
+    CONTROL_MODE_TARGETED,
+];
+
+/// Whether `mode` is one of the documented control-plane values.
+pub fn is_valid_control_mode(mode: &str) -> bool {
+    CONTROL_MODES.contains(&mode)
+}
 #[deprecated(note = "Use KEY_PENDING_PRS for clarity")]
 pub const KEY_OPEN_PRS: &str = "open_prs";
 pub const KEY_COMMAND_GATE: &str = "command_gate";
@@ -247,4 +276,24 @@ pub fn address_review_dispatched_key(pr_number: u64) -> String {
 /// Full key: `_address_review_rearmed_{pr_number}`
 pub fn address_review_rearmed_key(pr_number: u64) -> String {
     format!("_address_review_rearmed_{}", pr_number)
+}
+
+#[cfg(test)]
+mod control_mode_tests {
+    use super::*;
+
+    #[test]
+    fn control_modes_are_valid_and_roundtrip() {
+        assert!(is_valid_control_mode(CONTROL_MODE_AUTO));
+        assert!(is_valid_control_mode(CONTROL_MODE_PAUSED));
+        assert!(is_valid_control_mode(CONTROL_MODE_DRAINED));
+        assert!(is_valid_control_mode(CONTROL_MODE_TARGETED));
+        assert!(!is_valid_control_mode("bogus"));
+        assert!(!is_valid_control_mode(""));
+    }
+
+    #[test]
+    fn auto_is_the_default_mode() {
+        assert_eq!(CONTROL_MODE_AUTO, "auto");
+    }
 }

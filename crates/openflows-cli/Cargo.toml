@@ -1,0 +1,29 @@
+[package]
+name = "openflows-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Remote control surface client for a deployed OpenFlows instance"
+
+[[bin]]
+name = "openflows-cli"
+path = "src/main.rs"
+
+[lib]
+name = "openflows_cli"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+openflows-manager = { path = "../openflows-manager" }
+axum = { version = "0.8", features = ["http1", "json"] }
+tempfile = { workspace = true }

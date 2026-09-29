@@ -13,6 +13,7 @@ members = [
     "crates/coder-client",
     "crates/openflows-harness",
     "crates/openflows-manager",
+    "crates/openflows-cli",
     "crates/a2a-protocol",
     "binary",
     "crates/notifier",
@@ -51,6 +52,9 @@ envconfig = "0.11"
 
 # yaml
 serde_yaml = "0.9"
+
+# CLI / arg parsing
+clap = { version = "4", features = ["derive", "env"] }
 
 # toml
 toml = "0.8"

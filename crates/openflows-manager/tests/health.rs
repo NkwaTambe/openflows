@@ -82,6 +82,7 @@ async fn health_remains_live_when_readiness_dependency_fails() {
         openflows_manager::server::AppState::with_readiness_check(
             pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
             Arc::new(UnreadyProbe),
+            openflows_manager::server::TEST_AUTH_TOKEN.to_string(),
         ),
     );
 
@@ -106,6 +107,7 @@ async fn readiness_returns_unavailable_when_dependency_check_fails() {
         openflows_manager::server::AppState::with_readiness_check(
             pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
             Arc::new(UnreadyProbe),
+            openflows_manager::server::TEST_AUTH_TOKEN.to_string(),
         ),
     );
 
@@ -139,6 +141,7 @@ async fn readiness_returns_unavailable_when_dependency_check_hangs() {
         openflows_manager::server::AppState::with_readiness_check(
             pocketflow_core::SharedStore::new_in_memory_with_tenant("test"),
             Arc::new(HangingProbe),
+            openflows_manager::server::TEST_AUTH_TOKEN.to_string(),
         ),
     );
 
@@ -166,14 +169,16 @@ async fn readiness_returns_unavailable_when_dependency_check_hangs() {
 #[tokio::test]
 async fn api_v1_router_is_mounted_for_future_routes() {
     // This protects the public shape of the versioned API mount while the first
-    // substantive manager endpoints are still being introduced.
+    // substantive manager endpoints are still being introduced. Hitting a real
+    // v1 route (with auth) confirms the mount + auth edge is wired end to end.
     let app =
         openflows_manager::server::create_router(openflows_manager::server::AppState::for_tests());
 
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/api/v1")
+                .uri("/api/v1/tenants")
+                .header("authorization", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -185,7 +190,7 @@ async fn api_v1_router_is_mounted_for_future_routes() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let value: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(value["version"], "v1");
+    assert!(value["tenants"].is_array());
 }
 
 #[tokio::test]

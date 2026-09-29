@@ -1,7 +1,7 @@
 //! Server bootstrap, application state, and graceful serving utilities.
 
 use crate::error::ManagerError;
-use axum::Router;
+use axum::{routing::get, Router};
 use pocketflow_core::SharedStore;
 use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc};
 use tokio::{
@@ -10,6 +10,10 @@ use tokio::{
 };
 
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Token used by the in-memory test state. Tests authenticate with this value
+/// so auth is exercised end-to-end without depending on the environment.
+pub const TEST_AUTH_TOKEN: &str = "test-token";
 
 /// Async dependency probe used by `/ready`.
 ///
@@ -41,9 +45,17 @@ impl ReadinessCheck for StoreReadiness {
 
 #[derive(Clone)]
 pub struct AppState {
-    // Kept in state even before many routes need it so future manager APIs can
-    // share the same tenant-scoped store as readiness.
+    // A BASE (unscoped) SharedStore. The manager is a multi-tenant control
+    // surface, so it must be able to enumerate and address every tenant's
+    // namespaced keys (`ns:{tenant}:*`). We therefore keep one unscoped store
+    // and build fully-qualified keys in the route layer, rather than pinning a
+    // single tenant at construction time like the controller does.
     store: SharedStore,
+    // The bearer token required by every authenticated `/api/v1` route. Stored
+    // on state so handlers and middleware never read `OPENFLOWS_MANAGER_TOKEN`
+    // per request. It is required at startup (see `from_env`) so the manager
+    // can never be left open.
+    auth_token: String,
     // A trait object keeps handler code stable while allowing tests and future
     // deployments to provide richer readiness behavior.
     readiness: Arc<dyn ReadinessCheck>,
@@ -57,36 +69,55 @@ impl AppState {
         let env = config::EnvConfig::from_env()
             .map_err(|error| ManagerError::Config(error.to_string()))?;
         let redis_url = env.infra.effective_redis_url();
-        let tenant = env.tenant.effective_tenant().to_string();
 
-        // Scope the store by tenant at construction time. Handlers receive only
-        // AppState, so tenant selection should not be repeated per request.
-        let store = SharedStore::new_redis_with_tenant(&redis_url, Some(tenant)).await?;
+        // The manager is a control surface for many tenants, so it holds an
+        // unscoped store and addresses `ns:{tenant}:*` keys explicitly. It must
+        // not be constructible without a token: refuse to boot rather than
+        // expose an unauthenticated control plane.
+        let auth_token = crate::auth::token_from_env()?;
+        let store = SharedStore::new_redis(&redis_url).await?;
 
-        Ok(Self::new(store))
+        Ok(Self::new(store, auth_token))
     }
 
     pub fn for_tests() -> Self {
         // Tests should exercise router and handler behavior without requiring a
-        // Redis instance. The tenant name is fixed so assertions stay
-        // deterministic.
-        Self::new(SharedStore::new_in_memory_with_tenant("test"))
+        // Redis instance. The store is unscoped (in-memory) so the multi-tenant
+        // routes can be exercised against `ns:*` keys.
+        Self::new(SharedStore::new_in_memory(), TEST_AUTH_TOKEN.to_string())
     }
 
-    pub fn new(store: SharedStore) -> Self {
+    pub fn new(store: SharedStore, auth_token: String) -> Self {
         // The default readiness implementation mirrors production behavior:
         // report ready only when the shared store can be pinged.
         let readiness = Arc::new(StoreReadiness {
             store: store.clone(),
         });
-        Self { store, readiness }
+        Self {
+            store,
+            auth_token,
+            readiness,
+        }
     }
 
-    pub fn with_readiness_check(store: SharedStore, readiness: Arc<dyn ReadinessCheck>) -> Self {
+    pub fn with_readiness_check(
+        store: SharedStore,
+        readiness: Arc<dyn ReadinessCheck>,
+        auth_token: String,
+    ) -> Self {
         // This constructor is intentionally public for smoke tests and any
         // embedding scenarios that need to compose the manager with a custom
         // health policy.
-        Self { store, readiness }
+        Self {
+            store,
+            auth_token,
+            readiness,
+        }
+    }
+
+    /// The bearer token that authenticated `/api/v1` requests must present.
+    pub fn auth_token(&self) -> &str {
+        &self.auth_token
     }
 
     pub fn store(&self) -> &SharedStore {
@@ -108,9 +139,20 @@ impl AppState {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    // Apply state at the outer edge so nested routers can stay focused on route
-    // definitions and handlers can opt into State<AppState> only when needed.
-    crate::routes::router().with_state(state)
+    // Operational probes stay unauthenticated and version-independent so
+    // orchestrators can reach them without credentials. The authenticated
+    // product API is mounted under /api/v1 with auth applied at that edge, so
+    // the two never share an auth policy.
+    let probes = Router::<AppState>::new()
+        .route("/health", get(crate::routes::health::health))
+        .route("/ready", get(crate::routes::health::ready));
+
+    let api = crate::routes::api_v1_router().layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::require_auth,
+    ));
+
+    probes.nest("/api/v1", api).with_state(state)
 }
 
 pub async fn serve(
