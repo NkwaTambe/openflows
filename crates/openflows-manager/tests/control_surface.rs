@@ -422,3 +422,73 @@ async fn assign_task_to_unknown_tenant_is_404() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn concurrent_assignments_do_not_lose_tasks() {
+    // The task/ticket appends must be atomic so concurrent assignments are all
+    // preserved (addressing the read-modify-write loss race).
+    let state = openflows_manager::server::AppState::for_tests();
+    let app = create_router(state.clone());
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            send(
+                &app,
+                Method::POST,
+                "/api/v1/tenants/acme/tasks",
+                Some(json!({"title": format!("task {i}")})),
+                Some(TEST_AUTH_TOKEN),
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        let (status, _) = h.await.unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let tickets = state
+        .store()
+        .raw_get(&format!("ns:acme:{}", "tickets"))
+        .await
+        .unwrap();
+    assert_eq!(
+        tickets.as_array().unwrap().len(),
+        20,
+        "no assignment may be lost"
+    );
+    let mut ids: Vec<String> = tickets
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 20, "ticket ids must be unique");
+}
+
+#[tokio::test]
+async fn wildcard_tenant_name_is_rejected() {
+    // A name containing `*` must be rejected before it becomes a scan pattern.
+    let app = app();
+    let (status, _) = send(
+        &app,
+        Method::GET,
+        "/api/v1/tenants/acme*/control",
+        None,
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -188,6 +188,125 @@ impl Backend {
             }
         }
     }
+
+    /// Error-propagating key scan. Unlike [`keys`](Self::keys) this surfaces a
+    /// backing-store scan failure instead of returning a possibly-empty list,
+    /// so callers do not mistake an outage for "nothing matches".
+    async fn keys_result(&self, pattern: &str) -> Result<Vec<String>> {
+        match self {
+            Backend::InMemory(b) => Ok(b.keys(pattern).await),
+            Backend::Redis(b) => {
+                use fred::types::scan::Scanner;
+                use futures::StreamExt;
+                let mut keys = Vec::new();
+                let mut stream = b.client.scan(pattern, None, None);
+                while let Some(result) = stream.next().await {
+                    let mut scan_result = result?;
+                    if let Some(page) = scan_result.take_results() {
+                        for key in page {
+                            if let Some(s) = key.into_string() {
+                                keys.push(s);
+                            }
+                        }
+                    }
+                    if scan_result.has_more() {
+                        scan_result.next();
+                    }
+                }
+                Ok(keys)
+            }
+        }
+    }
+
+    /// Atomically set `key` to `value` only if `key` does not already exist.
+    /// Returns `true` if the key was set, `false` if it already existed.
+    async fn set_if_absent(&self, key: &str, value: Value) -> Result<bool> {
+        match self {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                if map.contains_key(key) {
+                    Ok(false)
+                } else {
+                    map.insert(key.to_string(), value);
+                    Ok(true)
+                }
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let s = serde_json::to_string(&value)?;
+                let set: bool = b.client.setnx(key, s).await?;
+                Ok(set)
+            }
+        }
+    }
+
+    /// Atomically append a JSON value to a JSON-array value stored at `key`.
+    ///
+    /// The read-modify-write happens atomically in the backing store (a Lua
+    /// script on Redis, a lock on the in-memory backend), so concurrent appends
+    /// cannot lose each other. Returns the new array length. Fails (rather than
+    /// overwriting) if the stored value is present but is not a JSON array.
+    async fn append(&self, key: &str, value: Value) -> Result<u64> {
+        match self {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                let mut arr: Vec<Value> = match map.get(key).cloned() {
+                    None => Vec::new(),
+                    Some(existing) => serde_json::from_value(existing)
+                        .map_err(|e| anyhow::anyhow!("key {key} is not a JSON array: {e}"))?,
+                };
+                arr.push(value);
+                let len = arr.len() as u64;
+                map.insert(key.to_string(), serde_json::to_value(arr)?);
+                Ok(len)
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                // Lua script: GET the array, decode, append, SET, return length.
+                // Runs atomically in Redis, protecting the array from concurrent
+                // read-modify-write (including the controller's issue sync).
+                let script = r#"
+                    local raw = redis.call('GET', KEYS[1])
+                    local arr = {}
+                    if raw then
+                        arr = cjson.decode(raw)
+                        if type(arr) ~= 'table' then
+                            return redis.error_reply('expected a JSON array')
+                        end
+                    end
+                    table.insert(arr, cjson.decode(ARGV[1]))
+                    redis.call('SET', KEYS[1], cjson.encode(arr))
+                    return #arr
+                "#;
+                let len: i64 = b
+                    .client
+                    .eval::<i64, _, _, _>(script, vec![key.to_string()], vec![value.to_string()])
+                    .await?;
+                Ok(len as u64)
+            }
+        }
+    }
+
+    /// Atomically increment a counter and return the new value (INCR semantics).
+    async fn incr(&self, key: &str) -> Result<u64> {
+        match self {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                let next = map
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                map.insert(key.to_string(), serde_json::json!(next));
+                Ok(next)
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let n: i64 = b.client.incr(key).await?;
+                Ok(n as u64)
+            }
+        }
+    }
 }
 
 // ── SharedStore (public API) ──────────────────────────────────────────────
@@ -303,6 +422,26 @@ impl SharedStore {
         self.backend.set_result(key, value).await
     }
 
+    /// Error-propagating raw key scan (no tenant namespacing).
+    pub async fn raw_keys_result(&self, pattern: &str) -> Result<Vec<String>> {
+        self.backend.keys_result(pattern).await
+    }
+
+    /// Atomically set a full key only if it does not exist (SETNX semantics).
+    pub async fn raw_set_if_absent(&self, key: &str, value: Value) -> Result<bool> {
+        self.backend.set_if_absent(key, value).await
+    }
+
+    /// Atomically append a value to a JSON-array value at a full key.
+    pub async fn raw_append(&self, key: &str, value: Value) -> Result<u64> {
+        self.backend.append(key, value).await
+    }
+
+    /// Atomically increment a counter at a full key and return the new value.
+    pub async fn raw_incr(&self, key: &str) -> Result<u64> {
+        self.backend.incr(key).await
+    }
+
     /// Raw set of a full key WITHOUT tenant namespacing.
     pub async fn raw_set(&self, key: &str, value: Value) {
         self.backend.set(key, value).await;
@@ -368,5 +507,68 @@ impl SharedStore {
     /// Number of events in the ring buffer (for initial TUI render).
     pub async fn event_count(&self) -> usize {
         self.ring_buffer.read().await.len()
+    }
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn raw_append_builds_and_returns_length() {
+        let s = SharedStore::new_in_memory();
+        let key = "ns:t:tickets";
+        assert_eq!(
+            s.raw_append(key, serde_json::json!({"id": 1}))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            s.raw_append(key, serde_json::json!({"id": 2}))
+                .await
+                .unwrap(),
+            2
+        );
+        let arr = s.raw_get(key).await.unwrap();
+        assert_eq!(arr.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn raw_append_rejects_non_array_value() {
+        let s = SharedStore::new_in_memory();
+        let key = "ns:t:not_array";
+        s.raw_set(key, serde_json::json!("oops")).await;
+        let err = s.raw_append(key, serde_json::json!({"id": 1})).await;
+        assert!(
+            err.is_err(),
+            "appending to a non-array must fail, not overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_incr_is_monotonic() {
+        let s = SharedStore::new_in_memory();
+        let key = "ns:t:counter";
+        assert_eq!(s.raw_incr(key).await.unwrap(), 1);
+        assert_eq!(s.raw_incr(key).await.unwrap(), 2);
+        assert_eq!(s.raw_incr(key).await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn raw_set_if_absent_only_sets_once() {
+        let s = SharedStore::new_in_memory();
+        let key = "ns:t:control:mode";
+        assert!(s
+            .raw_set_if_absent(key, serde_json::json!("auto"))
+            .await
+            .unwrap());
+        // A concurrent pause sets it; our second init attempt must not clobber it.
+        s.raw_set(key, serde_json::json!("paused")).await;
+        assert!(!s
+            .raw_set_if_absent(key, serde_json::json!("auto"))
+            .await
+            .unwrap());
+        assert_eq!(s.raw_get(key).await.unwrap(), serde_json::json!("paused"));
     }
 }

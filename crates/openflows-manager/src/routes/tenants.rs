@@ -23,15 +23,33 @@ pub fn router() -> Router<AppState> {
         .route("/{name}/tasks", axum::routing::post(tasks::assign_task))
 }
 
+/// Validate a tenant name for use as a Redis namespace / scan pattern segment.
+///
+/// Only ASCII letters, digits, `.`, `_` and `-` are allowed — notably `*` and
+/// `?` are rejected so a name can never act as a wildcard in a scan pattern.
+pub fn validate_tenant_name(name: &str) -> Result<(), &'static str> {
+    if name.is_empty() {
+        return Err("tenant name must not be empty");
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err("tenant name may only contain ASCII letters, numbers, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
 /// Whether a tenant has been registered on the control surface (has any key in
 /// its `ns:{name}:*` namespace).
+///
+/// Returns an error when the backing store cannot be scanned, so an operator is
+/// never told "no such tenant" during a store outage.
 pub async fn tenant_exists(
     store: &pocketflow_core::SharedStore,
     name: &str,
 ) -> Result<bool, ManagerError> {
-    // raw_keys returns the full matching keys; a registered tenant has at least
-    // its repository binding (or a control-mode key) present.
-    let keys: Vec<String> = store.raw_keys(&format!("ns:{}:*", name)).await;
+    let keys = store.raw_keys_result(&format!("ns:{}:*", name)).await?;
     Ok(!keys.is_empty())
 }
 
@@ -40,10 +58,11 @@ pub async fn tenant_exists(
 /// GET /api/v1/tenants
 ///
 /// Enumerate every tenant from its Redis namespace (`ns:*`) and enrich each
-/// with its control mode and bound repository when present.
+/// with its control mode and bound repository when present. A failed scan
+/// surfaces as an error rather than a misleading empty/incomplete list.
 pub async fn list_tenants(State(state): State<AppState>) -> Result<Json<Value>, ManagerError> {
     let store = state.store();
-    let keys: Vec<String> = store.raw_keys("ns:*").await;
+    let keys = store.raw_keys_result("ns:*").await?;
 
     let mut tenants: Vec<Value> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -84,26 +103,15 @@ pub struct AddTenantRequest {
     pub fleet: Option<u32>,
 }
 
-fn validate_tenant_name(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("tenant name must not be empty");
-    }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        return Err("tenant name may only contain ASCII letters, numbers, '.', '_' and '-'");
-    }
-    Ok(())
-}
-
 /// POST /api/v1/tenants
 ///
 /// Register a tenant on the control surface: persist its bound repository (and
 /// fleet as metadata) into the tenant's namespace, and initialize its control
-/// mode to `auto` **only when the tenant is new**. Re-adding an existing tenant
-/// preserves its current control mode (e.g. it stays paused), so an operator
-/// cannot accidentally resume a fleet they paused for maintenance.
+/// mode to `auto` **only when the tenant is new**.
+///
+/// The new-tenant control-mode init uses SETNX semantics, so even two
+/// concurrent `add` requests (or an add racing an operator pause) cannot
+/// clobber an existing control mode — a paused tenant stays paused.
 ///
 /// Provisioning the actual Coder workspace (and writing the fleet registry)
 /// remains with the local `openflows tenant add`, which has access to Coder and
@@ -132,24 +140,32 @@ pub async fn add_tenant(
 
     let store = state.store();
     let exists = tenant_exists(store, &name).await?;
-    let repo_key = format!("ns:{}:repository", name);
 
-    store.raw_set_result(&repo_key, json!(req.repo)).await?;
+    store
+        .raw_set_result(&format!("ns:{}:repository", name), json!(req.repo))
+        .await
+        .map_err(ManagerError::Service)?;
 
     // Persist fleet as lightweight metadata (the authoritative fleet registry is
     // written during provisioning by the local CLI, not fabricated here).
     if let Some(fleet) = req.fleet {
         store
             .raw_set_result(&format!("ns:{}:fleet", name), json!(fleet))
-            .await?;
+            .await
+            .map_err(ManagerError::Service)?;
     }
 
     let status = if exists {
         // Existing tenant: leave its control mode untouched.
         StatusCode::OK
     } else {
-        // New tenant starts in `auto`.
-        control::write_control_mode(&state, &name, &ControlMode::Auto).await?;
+        // New tenant: set `auto` only if a mode has not already been written
+        // (SETNX), so a concurrent pause is never resumed by this add.
+        let key = control::control_key(&name);
+        store
+            .raw_set_if_absent(&key, json!(ControlMode::Auto.as_str()))
+            .await
+            .map_err(ManagerError::Service)?;
         StatusCode::CREATED
     };
 
@@ -172,6 +188,7 @@ pub async fn get_control(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ManagerError> {
+    validate_tenant_name(&name).map_err(|e| ManagerError::BadRequest(e.to_string()))?;
     if !tenant_exists(state.store(), &name).await? {
         return Err(ManagerError::NotFound(format!("no such tenant: '{name}'")));
     }
@@ -193,6 +210,7 @@ pub async fn set_control(
     Path(name): Path<String>,
     Json(req): Json<SetControlRequest>,
 ) -> Result<Json<Value>, ManagerError> {
+    validate_tenant_name(&name).map_err(|e| ManagerError::BadRequest(e.to_string()))?;
     if !tenant_exists(state.store(), &name).await? {
         return Err(ManagerError::NotFound(format!("no such tenant: '{name}'")));
     }

@@ -1,10 +1,13 @@
 //! Direct task assignment to a tenant.
 //!
 //! An operator can push work into a tenant without waiting for a GitHub issue
-//! by posting a task. The task is recorded under `ns:{tenant}:tasks` AND
-//! injected into the tenant's `tickets` queue (as an open ticket) so the
-//! controller actually assigns and executes it — it is not a dead-letter that
-//! nothing consumes.
+//! by posting a task. The task is injected into the tenant's **ticket queue**
+//! (as an open ticket) so the controller actually assigns and executes it — it
+//! is not a dead-letter that nothing consumes.
+//!
+//! All writes use atomic store primitives (a Lua script on Redis) so concurrent
+//! assignments and the controller's own issue-sync cannot lose a ticket, and so
+//! a malformed stored value fails instead of silently erasing the queue.
 
 use crate::{error::ManagerError, server::AppState};
 use axum::{
@@ -19,6 +22,14 @@ use serde::{Deserialize, Serialize};
 /// Fully-qualified Redis key holding a tenant's assigned tasks.
 pub fn tasks_key(tenant: &str) -> String {
     format!("ns:{}:tasks", tenant)
+}
+
+fn tickets_key(tenant: &str) -> String {
+    format!("ns:{}:{}", tenant, config::KEY_TICKETS)
+}
+
+fn ticket_counter_key(tenant: &str) -> String {
+    format!("ns:{}:ticket_counter", tenant)
 }
 
 /// A unit of work assigned directly to a tenant through the control surface.
@@ -58,69 +69,62 @@ fn default_source() -> String {
 
 /// Inject a task into a tenant's queue.
 ///
-/// Records the task and appends a matching open `Ticket` to the tenant's
-/// `tickets` list so the controller picks it up on its next poll. Errors from
-/// the backing store are propagated rather than swallowed.
+/// Ordering matters for correctness: the **ticket is dispatched first** so an
+/// assignment never leaves an orphaned task record with no executable ticket.
+/// The task record is bookkeeping; if it cannot be written the work is already
+/// queued, so we surface a warning rather than an error for the lost record.
+/// IDs come from an atomic counter so concurrent assignments never collide.
 pub async fn append_task(
     store: &SharedStore,
     tenant: &str,
     req: AssignTaskRequest,
 ) -> Result<Task, ManagerError> {
-    let mut tasks: Vec<Task> = store
-        .raw_get_result(&tasks_key(tenant))
-        .await?
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
+    let n = store.raw_incr(&ticket_counter_key(tenant)).await?;
 
-    let task = Task {
-        id: generate_task_id(&tasks),
+    // Dispatch first: atomically append the open ticket.
+    let ticket = config::Ticket {
+        id: format!("T-CLI-{n:03}"),
         title: req.title.clone(),
         body: req.body.clone(),
-        source: req.source.clone(),
-        payload: req.payload.clone(),
-        created_at: now_millis(),
-    };
-    tasks.push(task.clone());
-    store
-        .raw_set_result(
-            &tasks_key(tenant),
-            serde_json::to_value(&tasks).unwrap_or_default(),
-        )
-        .await?;
-
-    // Inject an open ticket so the task actually runs. It shares the task's
-    // title/body and carries a stable id in the ticket namespace.
-    let tickets_key = format!("ns:{}:{}", tenant, config::KEY_TICKETS);
-    let mut tickets: Vec<config::Ticket> = store
-        .raw_get_result(&tickets_key)
-        .await?
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
-    let ticket_id = format!("T-CLI-{:03}", tickets.len() + 1);
-    let ticket = config::Ticket {
-        id: ticket_id,
-        title: task.title.clone(),
-        body: task.body.clone(),
         priority: 0,
         branch: None,
         status: config::TicketStatus::Open,
         issue_url: None,
         attempts: 0,
     };
-    tickets.push(ticket);
     store
-        .raw_set_result(
-            &tickets_key,
-            serde_json::to_value(&tickets).unwrap_or_default(),
+        .raw_append(
+            &tickets_key(tenant),
+            serde_json::to_value(&ticket).unwrap_or_default(),
         )
-        .await?;
+        .await
+        .map_err(ManagerError::Service)?;
 
+    // Then record the task (bookkeeping). A failure here must not fail the
+    // assignment, because the work is already queued — but it is worth logging.
+    let task = Task {
+        id: format!("task-{n:03}"),
+        title: req.title,
+        body: req.body,
+        source: req.source,
+        payload: req.payload,
+        created_at: now_millis(),
+    };
+    if let Err(e) = store
+        .raw_append(
+            &tasks_key(tenant),
+            serde_json::to_value(&task).unwrap_or_default(),
+        )
+        .await
+    {
+        tracing::warn!(
+            tenant,
+            task_id = %task.id,
+            error = %e,
+            "task dispatched as a ticket but the task record could not be persisted"
+        );
+    }
     Ok(task)
-}
-
-fn generate_task_id(tasks: &[Task]) -> String {
-    let n = tasks.len() + 1;
-    format!("task-{n:03}")
 }
 
 fn now_millis() -> u64 {
@@ -139,8 +143,11 @@ pub async fn assign_task(
     if req.title.trim().is_empty() {
         return Err(ManagerError::BadRequest("title is required".to_string()));
     }
-    // Reject unknown tenants so an operator cannot believe they assigned work
+    // Validate the name before it becomes a Redis key / scan pattern, then
+    // reject unknown tenants so an operator cannot believe they assigned work
     // to a fleet that was never registered.
+    crate::routes::tenants::validate_tenant_name(&name)
+        .map_err(|e| ManagerError::BadRequest(e.to_string()))?;
     if !crate::routes::tenants::tenant_exists(state.store(), &name).await? {
         return Err(ManagerError::NotFound(format!("no such tenant: '{name}'")));
     }
