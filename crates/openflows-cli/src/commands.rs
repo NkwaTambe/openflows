@@ -265,10 +265,12 @@ async fn control(action: ControlAction, client: &Client, json: bool) -> Result<(
 }
 
 fn validate_mode(mode: &str) -> Result<()> {
-    let valid = ["auto", "paused", "drained", "targeted"];
+    // Only fully-implemented modes are accepted; drained/targeted are reserved
+    // for future steering and rejected here for a clear, local error.
+    let valid = ["auto", "paused"];
     if !valid.contains(&mode.to_lowercase().as_str()) {
         bail!(
-            "invalid mode '{}' — expected one of: {}",
+            "invalid mode '{}' — supported modes: {} (drained/targeted are not yet implemented)",
             mode,
             valid.join(", ")
         );

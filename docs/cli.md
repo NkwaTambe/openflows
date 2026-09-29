@@ -53,7 +53,7 @@ openflows-cli tenant add my-org/my-repo --name my-team --fleet 3
 ### Control (halt / resume)
 
 ```sh
-# Read a tenant's control mode (auto | paused | drained | targeted)
+# Read a tenant's control mode (auto | paused)
 openflows-cli control get my-team
 
 # Halt the fleet (controller skips work on its next poll)
@@ -61,10 +61,12 @@ openflows-cli control pause my-team
 
 # Resume (back to auto)
 openflows-cli control resume my-team
-
-# Set any documented mode explicitly
-openflows-cli control set my-team drained
 ```
+
+`drained` and `targeted` are documented control-plane modes but are **not yet
+implemented** by the controller; the CLI and manager reject them rather than
+silently accepting a state that does nothing. Setting an unknown tenant's
+control mode returns a `404`.
 
 ### Assigning work
 
@@ -86,6 +88,10 @@ openflows-cli tasks assign my-team --file task.json
 A task JSON object may contain `title`, `body`, and an arbitrary `payload`.
 Only `title` is required.
 
+An assigned task is injected into the tenant's **ticket queue** as an open
+ticket, so the controller actually picks it up and assigns it — it is not a
+dead-letter. Assigning to an unknown tenant returns a `404`.
+
 ## Examples
 
 ```sh
@@ -102,8 +108,11 @@ openflows-cli tasks assign my-team --title "Ship the release notes"
 
 - **Pause takes effect on the next controller poll.** The manager writes the
   control mode to the tenant's shared store; the tenant's controller reads it
-  at the top of each 15s poll and skips work while `paused`.
+  at the top of each 15s poll and skips work while `paused`. If the control
+  state cannot be read the controller **fails closed** (halts rather than run
+  ungoverned).
 - **Secrets are never printed.** The token is only sent in the `Authorization`
-  header; error output does not echo credentials.
+  header; error output does not echo credentials. The config file is written
+  owner-only (`0600`). Token comparison is constant-time.
 - **Deterministic exit codes**: `0` success, non-zero on failure (auth,
   network, validation).

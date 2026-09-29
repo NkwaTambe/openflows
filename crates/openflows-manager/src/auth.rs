@@ -74,11 +74,15 @@ pub async fn require_auth(State(state): State<AppState>, req: Request, next: Nex
     let provided = bearer_token(&req).unwrap_or_default();
     let expected = state.auth_token();
 
-    // Compare in constant time. Both sides have the same length when provided
-    // is non-empty; when it is empty this still runs in bounded time.
-    let ok = !provided.is_empty()
-        && provided.len() == expected.len()
-        && provided.bytes().zip(expected.bytes()).all(|(a, b)| a == b);
+    // Constant-time comparison: always walks the full (equal-length) inputs,
+    // accumulating a diff, so it does not short-circuit at the first mismatch.
+    // Only the length comparison leaks, which is unavoidable and not sensitive.
+    let ok = provided.len() == expected.len()
+        && provided
+            .bytes()
+            .zip(expected.bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0;
 
     if !ok {
         return unauthorized();
@@ -105,16 +109,26 @@ mod tests {
 
     #[test]
     fn token_from_env_requires_value() {
-        // UNSET
+        // Save/restore the env so this test never leaks a credential to other
+        // tests running in the same process (which would make them order-dependent).
+        let previous = std::env::var(TOKEN_ENV).ok();
         std::env::remove_var(TOKEN_ENV);
-        assert!(token_from_env().is_err());
+        let result_unset = token_from_env();
 
-        // EMPTY
         std::env::set_var(TOKEN_ENV, "   ");
-        assert!(token_from_env().is_err());
+        let result_empty = token_from_env();
 
-        // VALID
         std::env::set_var(TOKEN_ENV, "  secret  ");
-        assert_eq!(token_from_env().unwrap(), "secret");
+        let result_valid = token_from_env();
+
+        // Restore the original value (or remove if it was absent).
+        match previous {
+            Some(v) => std::env::set_var(TOKEN_ENV, v),
+            None => std::env::remove_var(TOKEN_ENV),
+        }
+
+        assert!(result_unset.is_err());
+        assert!(result_empty.is_err());
+        assert_eq!(result_valid.unwrap(), "secret");
     }
 }

@@ -4,7 +4,7 @@
 //! The manager holds an unscoped store and builds fully-qualified keys itself
 //! so it can address any tenant. `auto` is the implicit default.
 
-use crate::server::AppState;
+use crate::{error::ManagerError, server::AppState};
 use pocketflow_core::SharedStore;
 use serde::{Deserialize, Serialize};
 
@@ -46,21 +46,43 @@ pub fn control_key(tenant: &str) -> String {
 }
 
 /// Read the current control mode, defaulting to `auto` when absent.
-pub async fn read_control_mode(store: &SharedStore, tenant: &str) -> ControlMode {
-    store
-        .raw_get(&control_key(tenant))
-        .await
+///
+/// Returns an error when the backing store is unreadable, so the caller does
+/// not mistake an unreadable state for `auto`.
+pub async fn read_control_mode(
+    store: &SharedStore,
+    tenant: &str,
+) -> Result<ControlMode, ManagerError> {
+    let value = store.raw_get_result(&control_key(tenant)).await?;
+    Ok(value
         .and_then(|v| v.as_str().map(String::from))
         .and_then(|s| ControlMode::parse(&s))
-        .unwrap_or(ControlMode::Auto)
+        .unwrap_or(ControlMode::Auto))
 }
 
 /// Write a control mode, returning the previous mode.
-pub async fn write_control_mode(state: &AppState, tenant: &str, mode: &ControlMode) -> ControlMode {
-    let previous = read_control_mode(state.store(), tenant).await;
-    state
-        .store()
-        .raw_set(&control_key(tenant), serde_json::json!(mode.as_str()))
-        .await;
-    previous
+///
+/// Returns an error when the write cannot be persisted (or verified), so a
+/// failed pause/resume is surfaced to the operator instead of reported as
+/// success.
+pub async fn write_control_mode(
+    state: &AppState,
+    tenant: &str,
+    mode: &ControlMode,
+) -> Result<ControlMode, ManagerError> {
+    let previous = read_control_mode(state.store(), tenant).await?;
+    let key = control_key(tenant);
+    let value = serde_json::json!(mode.as_str());
+    state.store().raw_set_result(&key, value).await?;
+    // Read back to confirm the write actually landed; a write that silently
+    // failed must not be reported as success.
+    let confirmed = read_control_mode(state.store(), tenant).await?;
+    if confirmed != *mode {
+        return Err(ManagerError::Service(anyhow::anyhow!(
+            "control mode write did not persist (expected {}, read back {})",
+            mode.as_str(),
+            confirmed.as_str()
+        )));
+    }
+    Ok(previous)
 }

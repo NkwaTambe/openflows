@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Default config file location: `$HOME/.config/openflows/config.toml`.
@@ -42,10 +43,27 @@ pub fn save(path: &Path, config: &Config) -> Result<()> {
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
     }
     let raw = toml::to_string_pretty(config)?;
-    std::fs::write(path, raw)
-        .with_context(|| format!("failed to write config file {}", path.display()))?;
 
-    // Restrict the file to the owning user only (owner read/write).
+    // Create the file with owner-only permissions up front. Because a umask can
+    // only REMOVE permission bits (never add them), opening with mode 0600 can
+    // never produce a world-readable file — closing the window where a token
+    // written before a later chmod could be read by another local user.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts
+        .open(path)
+        .with_context(|| format!("failed to open config file {}", path.display()))?;
+    std::io::Write::write_all(&mut file, raw.as_bytes())
+        .with_context(|| format!("failed to write config file {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush config file {}", path.display()))?;
+
+    // Belt-and-braces: also enforce the mode explicitly after writing.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

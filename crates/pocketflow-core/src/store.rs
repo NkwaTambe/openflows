@@ -154,6 +154,40 @@ impl Backend {
             Backend::Redis(b) => b.ping().await,
         }
     }
+
+    /// Error-propagating get. Unlike [`get`](Self::get) this does not swallow a
+    /// backing-store failure, so callers that must fail closed (or verify a
+    /// write) can distinguish "absent" from "unreadable".
+    async fn get_result(&self, key: &str) -> Result<Option<Value>> {
+        match self {
+            Backend::InMemory(b) => Ok(b.map.read().await.get(key).cloned()),
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> = b.client.get(key).await?;
+                match raw {
+                    Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+
+    /// Error-propagating set. Unlike [`set`](Self::set) this surfaces backing-store
+    /// failures instead of discarding them.
+    async fn set_result(&self, key: &str, value: Value) -> Result<()> {
+        match self {
+            Backend::InMemory(b) => {
+                b.map.write().await.insert(key.to_string(), value);
+                Ok(())
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let s = serde_json::to_string(&value)?;
+                b.client.set::<(), _, _>(key, s, None, None, false).await?;
+                Ok(())
+            }
+        }
+    }
 }
 
 // ── SharedStore (public API) ──────────────────────────────────────────────
@@ -251,6 +285,22 @@ impl SharedStore {
     /// caller manages namespacing itself (as the multi-tenant manager does).
     pub async fn raw_get(&self, key: &str) -> Option<Value> {
         self.backend.get(key).await
+    }
+
+    /// Error-propagating, tenant-scoped get. See [`get_result`](Self::get_result).
+    pub async fn get_result(&self, key: &str) -> Result<Option<Value>> {
+        let ns_key = self.ns_key(key);
+        self.backend.get_result(&ns_key).await
+    }
+
+    /// Error-propagating raw get (no tenant namespacing).
+    pub async fn raw_get_result(&self, key: &str) -> Result<Option<Value>> {
+        self.backend.get_result(key).await
+    }
+
+    /// Error-propagating raw set (no tenant namespacing).
+    pub async fn raw_set_result(&self, key: &str, value: Value) -> Result<()> {
+        self.backend.set_result(key, value).await
     }
 
     /// Raw set of a full key WITHOUT tenant namespacing.

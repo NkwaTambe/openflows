@@ -209,6 +209,15 @@ async fn control_pause_resume_roundtrip() {
 #[tokio::test]
 async fn control_rejects_invalid_mode() {
     let app = app();
+    // Register the tenant first so validation (not existence) is exercised.
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
     let (status, body) = send(
         &app,
         Method::PUT,
@@ -218,7 +227,92 @@ async fn control_rejects_invalid_mode() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body["error"].as_str().unwrap().contains("invalid mode"));
+    assert!(body["message"].as_str().unwrap().contains("invalid mode"));
+}
+
+#[tokio::test]
+async fn control_rejects_unimplemented_modes() {
+    // drained/targeted are documented but not yet implemented, so they must be
+    // rejected rather than silently accepted.
+    let app = app();
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    for mode in ["drained", "targeted"] {
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            "/api/v1/tenants/acme/control",
+            Some(json!({"mode": mode})),
+            Some(TEST_AUTH_TOKEN),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "mode {mode} must be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn control_on_unknown_tenant_is_404() {
+    let app = app();
+    let (status, body) = send(
+        &app,
+        Method::GET,
+        "/api/v1/tenants/ghost/control",
+        None,
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"].as_str().unwrap().contains("no such tenant"));
+}
+
+#[tokio::test]
+async fn re_adding_tenant_preserves_pause() {
+    let app = app();
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    // Pause it.
+    send(
+        &app,
+        Method::PUT,
+        "/api/v1/tenants/acme/control",
+        Some(json!({"mode": "paused"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    // Re-add the same tenant; it must NOT reset the control mode to auto.
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    let (_, body) = send(
+        &app,
+        Method::GET,
+        "/api/v1/tenants/acme/control",
+        None,
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    assert_eq!(body["control_mode"], "paused");
 }
 
 // ── Tasks ──────────────────────────────────────────────────────────────────
@@ -272,4 +366,59 @@ async fn assign_task_requires_title() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn assign_task_injects_ticket_into_queue() {
+    // A directly assigned task must enter the tenant's real ticket queue (as an
+    // open ticket) so the controller actually picks it up — it cannot be a dead
+    // letter that nothing consumes.
+    let state = openflows_manager::server::AppState::for_tests();
+    let app = create_router(state.clone());
+
+    send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants",
+        Some(json!({"repo": "acme/rep", "name": "acme"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants/acme/tasks",
+        Some(json!({"title": "Fix bug", "body": "details"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["task"]["id"], "task-001");
+
+    // The tenant's tickets queue now contains an open ticket mirroring the task.
+    let tickets = state
+        .store()
+        .raw_get(&format!("ns:acme:{}", "tickets"))
+        .await
+        .expect("tickets key present");
+    let tickets: Vec<serde_json::Value> = serde_json::from_value(tickets).unwrap();
+    assert_eq!(tickets.len(), 1);
+    assert_eq!(tickets[0]["id"], "T-CLI-001");
+    assert_eq!(tickets[0]["title"], "Fix bug");
+    assert_eq!(tickets[0]["status"]["type"], "open");
+}
+
+#[tokio::test]
+async fn assign_task_to_unknown_tenant_is_404() {
+    let app = app();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/tenants/ghost/tasks",
+        Some(json!({"title": "nope"})),
+        Some(TEST_AUTH_TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

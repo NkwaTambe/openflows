@@ -528,17 +528,25 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         // Read the operator-set control mode (issue #333). When the fleet is
         // paused the controller halts rather than running a flow pass, so a
         // `control pause` issued over the manager/CLI takes effect on the next
-        // poll. `auto` (absent key) and other modes run normally.
-        let control_mode = store
-            .get(config::KEY_CONTROL_MODE)
-            .await
-            .and_then(|v| v.as_str().map(String::from))
-            .filter(|s| s == config::CONTROL_MODE_PAUSED);
+        // poll. `auto` (absent key) runs normally.
+        //
+        // Fail closed: if the control mode cannot be READ, we must not assume
+        // `auto` — an unreadable state could be masking a stored pause, so we
+        // halt the pass and log the failure rather than run ungoverned.
+        let control_mode = match store.get_result(config::KEY_CONTROL_MODE).await {
+            Ok(v) => v.and_then(|v| v.as_str().map(String::from)),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Could not read control mode — halting flow pass (fail closed)"
+                );
+                Some(config::CONTROL_MODE_PAUSED.to_string())
+            }
+        };
 
-        if let Some(mode) = control_mode {
+        if control_mode.as_deref() == Some(config::CONTROL_MODE_PAUSED) {
             tracing::info!(
                 tenant,
-                control_mode = mode,
                 poll_interval_secs = CONTROLLER_POLL_INTERVAL.as_secs(),
                 "Controller paused by operator — skipping flow pass"
             );

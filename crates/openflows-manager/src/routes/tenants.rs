@@ -3,15 +3,15 @@
 //! These endpoints let an operator manage tenants and steer a tenant's
 //! control-plane state over HTTP, without direct access to Redis or Coder.
 
-use crate::server::AppState;
+use crate::{error::ManagerError, server::AppState};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
     routing::get,
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use super::control::{self, ControlMode};
 use super::tasks;
@@ -23,30 +23,29 @@ pub fn router() -> Router<AppState> {
         .route("/{name}/tasks", axum::routing::post(tasks::assign_task))
 }
 
+/// Whether a tenant has been registered on the control surface (has any key in
+/// its `ns:{name}:*` namespace).
+pub async fn tenant_exists(
+    store: &pocketflow_core::SharedStore,
+    name: &str,
+) -> Result<bool, ManagerError> {
+    // raw_keys returns the full matching keys; a registered tenant has at least
+    // its repository binding (or a control-mode key) present.
+    let keys: Vec<String> = store.raw_keys(&format!("ns:{}:*", name)).await;
+    Ok(!keys.is_empty())
+}
+
 // ── Tenant listing ─────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct TenantSummary {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repository: Option<String>,
-    pub control_mode: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListTenantsResponse {
-    pub tenants: Vec<TenantSummary>,
-}
 
 /// GET /api/v1/tenants
 ///
 /// Enumerate every tenant from its Redis namespace (`ns:*`) and enrich each
 /// with its control mode and bound repository when present.
-pub async fn list_tenants(State(state): State<AppState>) -> Json<ListTenantsResponse> {
+pub async fn list_tenants(State(state): State<AppState>) -> Result<Json<Value>, ManagerError> {
     let store = state.store();
     let keys: Vec<String> = store.raw_keys("ns:*").await;
 
-    let mut tenants: Vec<TenantSummary> = Vec::new();
+    let mut tenants: Vec<Value> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for key in keys {
         if let Some(ns) = key.strip_prefix("ns:") {
@@ -54,21 +53,21 @@ pub async fn list_tenants(State(state): State<AppState>) -> Json<ListTenantsResp
                 if tenant.is_empty() || !seen.insert(tenant.to_string()) {
                     continue;
                 }
-                let mode = control::read_control_mode(store, tenant).await;
+                let mode = control::read_control_mode(store, tenant).await?;
                 let repository = store
                     .raw_get(&format!("ns:{}:repository", tenant))
                     .await
                     .and_then(|v| v.as_str().map(String::from))
                     .filter(|s| !s.is_empty());
-                tenants.push(TenantSummary {
-                    name: tenant.to_string(),
-                    repository,
-                    control_mode: mode.as_str().to_string(),
-                });
+                tenants.push(json!({
+                    "name": tenant,
+                    "repository": repository,
+                    "control_mode": mode.as_str(),
+                }));
             }
         }
     }
-    Json(ListTenantsResponse { tenants })
+    Ok(Json(json!({ "tenants": tenants })))
 }
 
 // ── Tenant add ─────────────────────────────────────────────────────────────
@@ -101,108 +100,86 @@ fn validate_tenant_name(name: &str) -> Result<(), &'static str> {
 /// POST /api/v1/tenants
 ///
 /// Register a tenant on the control surface: persist its bound repository (and
-/// fleet-derived registry when supplied) into the tenant's namespace. This is
-/// the control-plane reflection of `openflows tenant add`. Provisioning the
-/// actual Coder workspace remains with the local CLI until the manager gains a
-/// Coder provisioning seam.
+/// fleet as metadata) into the tenant's namespace, and initialize its control
+/// mode to `auto` **only when the tenant is new**. Re-adding an existing tenant
+/// preserves its current control mode (e.g. it stays paused), so an operator
+/// cannot accidentally resume a fleet they paused for maintenance.
+///
+/// Provisioning the actual Coder workspace (and writing the fleet registry)
+/// remains with the local `openflows tenant add`, which has access to Coder and
+/// the bundled base registry. The manager records the control-surface state.
 pub async fn add_tenant(
     State(state): State<AppState>,
     Json(req): Json<AddTenantRequest>,
-) -> impl IntoResponse {
-    // owner/repo shape check.
+) -> Result<(StatusCode, Json<Value>), ManagerError> {
     if !req.repo.contains('/') {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "repo must be in 'owner/repo' format"
-            })),
-        );
+        return Err(ManagerError::BadRequest(
+            "repo must be in 'owner/repo' format".to_string(),
+        ));
     }
     let name = req
         .name
         .clone()
         .unwrap_or_else(|| req.repo.split('/').next().unwrap_or("").to_string());
-    if let Err(e) = validate_tenant_name(&name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": e })),
-        );
-    }
+    validate_tenant_name(&name).map_err(|e| ManagerError::BadRequest(e.to_string()))?;
     if let Some(fleet) = req.fleet {
         if fleet < 1 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "fleet must be >= 1 (a fleet of N means N FORGE-SENTINEL pairs)"
-                })),
-            );
+            return Err(ManagerError::BadRequest(
+                "fleet must be >= 1 (a fleet of N means N FORGE-SENTINEL pairs)".to_string(),
+            ));
         }
     }
 
     let store = state.store();
-    store
-        .raw_set(
-            &format!("ns:{}:repository", name),
-            serde_json::json!(req.repo),
-        )
-        .await;
-    // If a fleet is supplied, persist a fleet-derived registry so the tenant's
-    // controller can size its FORGE-SENTINEL slots without a local file.
-    if let Some(fleet) = req.fleet {
-        let registry = fleet_registry(fleet);
-        store
-            .raw_set(
-                &format!("ns:{}:registry_json", name),
-                serde_json::json!(registry),
-            )
-            .await;
-    }
-    // A freshly added tenant starts in `auto`.
-    let mode = control::write_control_mode(&state, &name, &ControlMode::Auto).await;
+    let exists = tenant_exists(store, &name).await?;
+    let repo_key = format!("ns:{}:repository", name);
 
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
+    store.raw_set_result(&repo_key, json!(req.repo)).await?;
+
+    // Persist fleet as lightweight metadata (the authoritative fleet registry is
+    // written during provisioning by the local CLI, not fabricated here).
+    if let Some(fleet) = req.fleet {
+        store
+            .raw_set_result(&format!("ns:{}:fleet", name), json!(fleet))
+            .await?;
+    }
+
+    let status = if exists {
+        // Existing tenant: leave its control mode untouched.
+        StatusCode::OK
+    } else {
+        // New tenant starts in `auto`.
+        control::write_control_mode(&state, &name, &ControlMode::Auto).await?;
+        StatusCode::CREATED
+    };
+
+    let mode = control::read_control_mode(store, &name).await?;
+    Ok((
+        status,
+        Json(json!({
             "name": name,
             "repo": req.repo,
             "fleet": req.fleet,
             "control_mode": mode.as_str(),
         })),
-    )
-}
-
-/// Build a minimal fleet-sized registry JSON. Mirrors the local CLI's
-/// `Registry::with_team_fleet` so a manager-added tenant carries its fleet.
-fn fleet_registry(fleet: u32) -> String {
-    serde_json::json!({
-        "fleet": fleet,
-        "forge": { "instances": fleet },
-        "sentinel": { "instances": fleet }
-    })
-    .to_string()
+    ))
 }
 
 // ── Control mode ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct ControlResponse {
-    pub tenant: String,
-    pub control_mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_control_mode: Option<String>,
-}
 
 /// GET /api/v1/tenants/{name}/control
 pub async fn get_control(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Json<ControlResponse> {
-    let mode = control::read_control_mode(state.store(), &name).await;
-    Json(ControlResponse {
-        tenant: name,
-        control_mode: mode.as_str().to_string(),
-        previous_control_mode: None,
-    })
+) -> Result<Json<Value>, ManagerError> {
+    if !tenant_exists(state.store(), &name).await? {
+        return Err(ManagerError::NotFound(format!("no such tenant: '{name}'")));
+    }
+    let mode = control::read_control_mode(state.store(), &name).await?;
+    Ok(Json(json!({
+        "tenant": name,
+        "control_mode": mode.as_str(),
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -215,29 +192,37 @@ pub async fn set_control(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(req): Json<SetControlRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<Value>, ManagerError> {
+    if !tenant_exists(state.store(), &name).await? {
+        return Err(ManagerError::NotFound(format!("no such tenant: '{name}'")));
+    }
+
     let mode = match ControlMode::parse(&req.mode.to_lowercase()) {
         Some(m) => m,
         None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!(
-                        "invalid mode '{}' — expected one of: {}",
-                        req.mode,
-                        config::CONTROL_MODES.join(", ")
-                    )
-                })),
-            )
+            return Err(ManagerError::BadRequest(format!(
+                "invalid mode '{}' — expected one of: {}",
+                req.mode,
+                config::CONTROL_MODES.join(", ")
+            )))
         }
     };
-    let previous = control::write_control_mode(&state, &name, &mode).await;
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "tenant": name,
-            "control_mode": mode.as_str(),
-            "previous_control_mode": previous.as_str(),
-        })),
-    )
+
+    // Only fully-implemented modes are accepted. `drained`/`targeted` are
+    // documented but their fleet-steering semantics are not yet implemented by
+    // the controller, so accepting them would let an operator set a state that
+    // silently does nothing.
+    if !matches!(mode, ControlMode::Auto | ControlMode::Paused) {
+        return Err(ManagerError::BadRequest(format!(
+            "mode '{}' is not yet implemented; supported modes: auto, paused",
+            mode.as_str()
+        )));
+    }
+
+    let previous = control::write_control_mode(&state, &name, &mode).await?;
+    Ok(Json(json!({
+        "tenant": name,
+        "control_mode": mode.as_str(),
+        "previous_control_mode": previous.as_str(),
+    })))
 }
