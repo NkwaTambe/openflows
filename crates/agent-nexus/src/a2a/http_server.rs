@@ -360,6 +360,7 @@ async fn handle_tasks_cancel(state: &A2AServerState, params: &Value) -> anyhow::
     if let Some(entry) = state.relay.get_task(task_id).await {
         if entry.state == TaskState::Running || entry.state == TaskState::Pending {
             let cancelled_result = a2a_protocol::VerifyResult {
+                head_sha: None,
                 task_id: task_id.to_string(),
                 exit_code: None,
                 timed_out: false,

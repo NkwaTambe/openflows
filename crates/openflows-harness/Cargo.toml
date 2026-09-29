@@ -13,6 +13,7 @@ name = "openflows-harness"
 path = "src/main.rs"
 
 [dependencies]
+pocketflow-core = { version = "0.1.0", path = "../pocketflow-core" }
 a2a-protocol = { version = "0.1.0", path = "../a2a-protocol" }
 config = { version = "0.2.0", path = "../config" }
 anyhow = { workspace = true }
@@ -30,4 +31,5 @@ nix = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
+fred = { workspace = true, features = ["i-config"] }
 tempfile = { workspace = true }

@@ -3,6 +3,35 @@ name: forge-coding
 description: Core coding skill for the FORGE builder agent
 ---
 
+## Authoritative lifecycle contract
+
+Read `openflows-harness status get` before acting. The lifecycle is
+`planning -> plan_ready -> building -> testing -> submit -> done`.
+Start/revise in `planning`; upload with `plan write --file PLAN.md`, then set
+`plan_ready`. SENTINEL reviews the exact `revision` and `review_round`. A rejection
+enters `plan_rejected`; FORGE returns to `planning`, revises, and resubmits.
+No source edits are allowed before approval.
+
+After building, commit all changes, then set `testing`. Keep the checkout clean
+and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through
+`verify request --expect-exit 0 --argv <command and args>`, writes a report, and
+uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
+--verdict approve --report review.md` (or reject). Testing needs both SENTINEL
+and human approval. Then FORGE sets `submit`, opens/updates and records the PR.
+SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
+--head <SHA> --verdict approve --report final-review.md` (or reject). Read the
+current round again after recording a PR. Humans use the operator CLI
+`openflows gate decide --tenant <tenant> --ticket <ticket> --phase testing|submit
+--revision <N> --round <R> --head <SHA> --verdict approve|reject --notes <reason>`.
+
+Every rework cycle returns to `building`, then repeats testing and both review
+gates. Never jump directly from building to submit. Testing/submit freeze source.
+VESSEL requires current-head CI success, SENTINEL and human PR approval, and
+confirmed merge before done. Missing or timed-out CI never counts as success.
+Use `blocked` for an operational failure; recovery returns to planning.
+
+
+
 # FORGE Coding Skill
 
 ## Your role
@@ -71,7 +100,7 @@ unaddressed inline comments. It includes `state`, `pr`, `reason`, inline `commen
    sides — never just pick one), stage, and commit.
 3. Address **all** inline comments, not just the first.
 4. Verify, then push. **Never force-push or bypass branch protection.**
-5. Re-arm the PR for review: `openflows-harness status set review_ready`.
+5. Re-arm the PR for review: `openflows-harness status set testing`.
 6. Stay in the same chat session. If you cannot resolve it, `status set blocked` with an
    exact question.
 
@@ -91,7 +120,7 @@ start from scratch.**
 4. Reproduce and fix locally (install tools/deps the workflow expects, run the failing job's
    exact `run:` steps). Fix **ALL** errors, not just the first.
 5. Verify all checks pass locally, then push. **Never force-push or bypass branch protection.**
-6. Re-arm the PR for review: `openflows-harness status set review_ready`.
+6. Re-arm the PR for review: `openflows-harness status set testing`.
 7. Stay in the same chat session. If you cannot resolve it, `status set blocked` with an exact
    question.
 
@@ -121,14 +150,16 @@ value is rejected by the harness and your work is wasted.
 
 | Phase | When to use |
 |---|---|
-| `planning` | Analyzing the ticket and writing `PLAN.md`; wait for SENTINEL gate approval |
+| `planning` | Drafting the plan |
+| `plan_ready` | Submitted plan awaiting SENTINEL |
+| `plan_rejected` | Read feedback and return to planning |
 | `building` | Implementing after SENTINEL approves the plan |
 | `testing` | Running the test suite and verifying behavior |
-| `review_ready` | PR is open and SENTINEL is reviewing the completed work |
+| `submit` | PR is open and SENTINEL is reviewing the completed work |
 | `blocked` | Cannot proceed — include an exact, answerable question |
 
 Do NOT invent other phase values and do NOT write a `STATUS.json` file expecting the
-controller to read it. If you need review use `status set review_ready`. If you need help
+controller to read it. If you need review use `status set testing`. If you need help
 use `status set blocked`.
 
 ## When work is complete
@@ -156,7 +187,7 @@ When SENTINEL approves all segments and you're ready to finish:
 
 3. **Signal review-ready via the harness:**
    ```bash
-   openflows-harness status set review_ready
+   openflows-harness status set testing
    # (with the opened PR recorded):
    openflows-harness pr opened --pr <N> --branch <branch> --title <title>
    ```
@@ -164,7 +195,7 @@ When SENTINEL approves all segments and you're ready to finish:
 4. **Exit** - NEXUS reads the harness status and spawns SENTINEL to review the PR.
    SENTINEL's verdict (`approve`/`reject`) is submitted via
    `openflows-harness review submit`. If rejected, stay in this chat, address the
-   report, and re-run `openflows-harness status set review_ready`.
+   report, and re-run `openflows-harness status set testing`.
 
 ## If you cannot create a PR
 

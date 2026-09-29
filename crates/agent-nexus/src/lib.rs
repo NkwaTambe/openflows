@@ -11,7 +11,7 @@ use config::{
         review_action_key, review_chat_key, review_verdict_key, HeartbeatRecord, KEY_COMMAND_GATE,
         KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
         KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
-        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS, REVIEW_TYPE_PLANNING_GATE, REVIEW_TYPE_PR,
+        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS, REVIEW_TYPE_PR,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -1602,10 +1602,10 @@ Use `openflows-harness` for all coordination:
 | `handoff write --contract F --notes N` | Prepare for next agent |
 
 ### Phase Workflow
-1. Analyze task, write PLAN.md, then set `status set planning` and wait for SENTINEL approval
+1. Analyze task, write PLAN.md, then upload it with `plan write --file PLAN.md` and set `status set plan_ready` and wait for SENTINEL approval
 2. `building` → After SENTINEL approval, implement and set `status set building`
 3. `testing` → Run tests, verify, set `status set testing`
-4. `review_ready` | OPEN PR, request review, set `status set review_ready`
+4. After SENTINEL and human testing approval, set `status set submit`, open/record PR, and wait for SENTINEL and human PR approval.
 5. `blocked` → Stuck? Set status and explain
 "#;
 
@@ -1649,7 +1649,7 @@ Use `openflows-harness` for all coordination:
                 ticket_id, directive
             ),
             None => format!(
-                "{}\n\n**Begin work immediately.** Analyze the task, write `PLAN.md`, then run `openflows-harness status set planning` and wait for SENTINEL gate approval before implementation.\n",
+                "{}\n\n**Begin work immediately.** Analyze the task, write `PLAN.md`, then run `openflows-harness plan write --file PLAN.md` and `openflows-harness status set plan_ready` and wait for SENTINEL gate approval before implementation.\n",
                 base_prompt
             ),
         };
@@ -1824,31 +1824,6 @@ Use `openflows-harness` for all coordination:
             .await
     }
 
-    /// Send a planning-gate-specific resume message when SENTINEL has approved
-    /// the plan. This notifies FORGE that it can proceed to implementation
-    /// without polling — NEXUS is the orchestrator that delivers the verdict.
-    async fn resume_chat_planning_approved(
-        &self,
-        client: &CoderClient,
-        chat: &coder_client::types::Chat,
-        ticket_id: &str,
-    ) -> anyhow::Result<coder_client::types::ChatMessage> {
-        let follow_up_prompt = format!(
-            "SENTINEL has approved your planning gate for ticket {ticket_id}. \
-             The plan is sound and you are authorized to proceed with implementation.\n\n\
-             Run the following to move to the building phase:\n\
-             `openflows-harness status set building`\n\n\
-             Then begin implementation with Segment 1.",
-            ticket_id = ticket_id,
-        );
-        client
-            .send_chat_message(
-                &chat.id,
-                vec![coder_client::types::ChatInputPart::text(follow_up_prompt)],
-            )
-            .await
-    }
-
     async fn create_chat_for_ticket_id(
         &self,
         store: &SharedStore,
@@ -1936,7 +1911,23 @@ Use `openflows-harness` for all coordination:
             }
 
             match phase {
-                Some("planning") => {
+                Some("plan_ready") | Some("testing") => {
+                    let lifecycle = match store.lifecycle(&ticket.id).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error=%e,"Cannot load lifecycle");
+                            continue;
+                        }
+                    };
+                    let testing = lifecycle.phase == config::lifecycle::Phase::Testing;
+                    let review_namespace = format!(
+                        "{}:{}:{}:{}",
+                        if testing { "testing" } else { "planning_gate" },
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or("plan"),
+                        lifecycle.review_round
+                    );
+                    let review_type = review_namespace.as_str();
                     info!(
                         ticket_id = %ticket.id,
                         "Detected planning phase — attempting to spawn Sentinel for plan review"
@@ -1946,108 +1937,41 @@ Use `openflows-harness` for all coordination:
                     // `openflows-harness gate approve --phase planning`. If no SENTINEL
                     // chat exists for this ticket, spawn one so it can review the plan.
 
-                    // Check if gate already approved — if so, notify FORGE to resume.
-                    if Self::gate_approved(store, &ticket.id, "planning").await {
-                        // Deduplication: skip if we already notified FORGE about
-                        // this gate approval on a previous poll cycle.
-                        let notification_key = format!("ticket:{}:planning_notified", ticket.id);
-                        let already_notified: Option<bool> =
-                            store.get_typed(&notification_key).await;
-                        if already_notified.unwrap_or(false) {
-                            debug!(
-                                ticket_id = %ticket.id,
-                                "Already notified FORGE of planning gate approval; skipping"
-                            );
+                    let reviewed = if testing {
+                        lifecycle.test_decision.as_ref().is_some_and(|d| d.approved)
+                    } else {
+                        lifecycle.plan_decision.as_ref().is_some_and(|d| d.approved)
+                    };
+                    if reviewed {
+                        // Keep a durable decision while waiting for the human; never re-spawn a reviewer.
+                        if testing && !lifecycle.test_human.as_ref().is_some_and(|d| d.approved) {
                             continue;
                         }
-
-                        // Get the forge worker_id for this ticket so we can find
-                        // its Coder chat and inject a resume message.
-                        let forge_worker_id = match &ticket.status {
-                            TicketStatus::Assigned { worker_id }
-                            | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                            _ => {
-                                warn!(
-                                    ticket_id = %ticket.id,
-                                    "Planning gate approved but ticket has unexpected status; \
-                                     cannot notify FORGE"
-                                );
-                                continue;
-                            }
-                        };
-
-                        let forge_chat_key = full_ticket_key(
-                            &ticket.id,
-                            KEY_TICKET_CHAT,
-                            Self::worker_role(&forge_worker_id),
-                        );
-                        let forge_chat_id: Option<String> = store.get_typed(&forge_chat_key).await;
-
-                        if let Some(ref forge_chat_id) = forge_chat_id {
-                            match client.get_chat(forge_chat_id).await {
-                                Ok(chat) => {
-                                    let status = chat.status();
-                                    // Only send a resume if the forge chat is in a
-                                    // state where it can accept new messages —
-                                    // Waiting or Error. A Running chat is actively
-                                    // generating; we wait for it to finish.
-                                    if matches!(status, ChatStatus::Waiting | ChatStatus::Error) {
-                                        match self
-                                            .resume_chat_planning_approved(
-                                                &client, &chat, &ticket.id,
-                                            )
-                                            .await
-                                        {
-                                            Ok(message) => {
-                                                info!(
-                                                    ticket_id = %ticket.id,
-                                                    chat_id = %forge_chat_id,
-                                                    message_id = %message.id,
-                                                    "Notified forge that planning gate is approved"
-                                                );
-                                                // Track that we notified so we don't spam
-                                                // on every poll cycle.
-                                                let notification_key = format!(
-                                                    "ticket:{}:planning_notified",
-                                                    ticket.id
-                                                );
-                                                store.set(&notification_key, json!(true)).await;
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    ticket_id = %ticket.id,
-                                                    chat_id = %forge_chat_id,
-                                                    error = %e,
-                                                    "Failed to notify forge of planning gate approval"
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        debug!(
-                                            ticket_id = %ticket.id,
-                                            chat_id = %forge_chat_id,
-                                            chat_status = ?status,
-                                            "Forge chat is not in a resumable state; \
-                                             waiting for chat to go to Waiting"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        ticket_id = %ticket.id,
-                                        chat_id = %forge_chat_id,
-                                        error = %e,
-                                        "Failed to get forge chat for planning gate notification"
-                                    );
+                        let key =
+                            format!("ticket:{}:gate_notified:{}", ticket.id, lifecycle.version);
+                        if store.get(&key).await.is_none() {
+                            if let Some(chat) = store
+                                .get_typed::<String>(&full_ticket_key(
+                                    &ticket.id,
+                                    KEY_TICKET_CHAT,
+                                    "forge",
+                                ))
+                                .await
+                            {
+                                let target = if testing { "submit" } else { "building" };
+                                let prompt=format!("Review gates passed. Run `openflows-harness status set {target}`. Read status get for the approved revision and head. After submit, open/record the PR and wait for PR review and human approval.");
+                                if client
+                                    .send_chat_message(
+                                        &chat,
+                                        vec![coder_client::types::ChatInputPart::text(prompt)],
+                                    )
+                                    .await
+                                    .is_ok()
+                                {
+                                    store.set(&key, json!(true)).await;
                                 }
                             }
-                        } else {
-                            debug!(
-                                ticket_id = %ticket.id,
-                                "No forge chat ID found; forge may not have been provisioned yet"
-                            );
                         }
-
                         continue;
                     }
 
@@ -2060,9 +1984,8 @@ Use `openflows-harness` for all coordination:
                     // Check if SENTINEL chat already exists for plan review.
                     // The planning-gate review has its own namespace so it can
                     // never collide with (or block) the later PR review.
-                    let sentinel_chat_key = review_chat_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE);
-                    let sentinel_action_key =
-                        review_action_key(&ticket.id, REVIEW_TYPE_PLANNING_GATE);
+                    let sentinel_chat_key = review_chat_key(&ticket.id, review_type);
+                    let sentinel_action_key = review_action_key(&ticket.id, review_type);
                     let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
 
@@ -2075,26 +1998,7 @@ Use `openflows-harness` for all coordination:
                         match client.get_chat_opt(chat_id).await {
                             Ok(Some(chat)) => {
                                 let status = chat.status();
-                                if matches!(status, ChatStatus::Waiting) {
-                                    // Chat is waiting but no agent has ever
-                                    // responded.  Check if a gate approval
-                                    // has been written — if not, the chat
-                                    // never did its job and is stale.
-                                    let gate_key = format!("ticket:{}:gate:planning", ticket.id);
-                                    let gate_approved: Option<serde_json::Value> =
-                                        store.get_typed(&gate_key).await;
-                                    if gate_approved.is_none() {
-                                        warn!(
-                                            ticket_id = %ticket.id,
-                                            chat_id = %chat_id,
-                                            "Sentinel chat is orphaned (Waiting with no gate \
-                                             approval) — clearing stale chat to re-spawn"
-                                        );
-                                        store.del(&sentinel_chat_key).await;
-                                        store.del(&sentinel_action_key).await;
-                                        existing_sentinel_chat = None;
-                                    }
-                                }
+                                let _ = status; // Waiting is a valid pending review, not an orphan.
                             }
                             Ok(None) => {
                                 // Chat no longer exists on Coder — stale key.
@@ -2240,7 +2144,8 @@ Use `openflows-harness` for all coordination:
                     // all other pair artifacts and is cleaned up when the workspace is
                     // destroyed.
                     let plan_key = format!("pair:{}:plan", ticket.id);
-                    let plan_content: Option<String> = store.get_typed(&plan_key).await;
+                    let plan_content = Some(lifecycle.plan.clone());
+                    let _ = plan_key;
 
                     // Build dispatch payload for Sentinel plan review.
                     // Include the PLAN.md content hint so SENTINEL knows this is a
@@ -2251,16 +2156,9 @@ Use `openflows-harness` for all coordination:
                         "title": ticket.title,
                         "body": ticket.body,
                         "branch": ticket.branch,
-                        "review_type": "planning_gate",
+                        "review_type": if testing {"testing"} else {"planning_gate"},
                         "plan": plan_content,
-                        "instructions": format!(
-                            "Review the plan for ticket {}. Read PLAN.md and evaluate whether it \
-                             correctly addresses the ticket requirements. If the plan is sound, \
-                             approve the planning gate by running: \
-                             openflows-harness gate approve --phase planning --notes \"Plan approved\". \
-                             If the plan has issues, provide feedback and do NOT approve the gate.",
-                            ticket.id
-                        ),
+                        "instructions": "Read status get. Review the exact revision and review_round. For testing, run A2A verification at the recorded head. Record gate decide with phase, revision, round, head (testing), verdict and report. Rejection returns work to FORGE.",
                     });
                     store.set(&dispatch_key, dispatch_payload).await;
 
@@ -2269,26 +2167,17 @@ Use `openflows-harness` for all coordination:
                     labels.insert(CHAT_LABEL_FLOW.to_string(), json!("openflows"));
                     labels.insert(CHAT_LABEL_ROLE.to_string(), json!("sentinel"));
                     labels.insert(CHAT_LABEL_TICKET.to_string(), json!(ticket.id));
-                    labels.insert("review_type".to_string(), json!("planning_gate"));
+                    labels.insert(
+                        "review_type".to_string(),
+                        json!(if testing { "testing" } else { "planning_gate" }),
+                    );
 
                     // Build a prompt that instructs SENTINEL to review the plan
-                    let plan_review_prompt = format!(
-                        "## Planning Gate Review — Ticket {}\n\n\
-                         FORGE has written a plan and is waiting for your approval before \
-                         proceeding to implementation.\n\n\
-                         **Your task:**\n\
-                         1. Read the Forge plan via `openflows-harness plan read` (or from the \
-                         dispatch payload via `openflows-harness dispatch read`)\n\
-                         2. Evaluate whether the plan correctly addresses the ticket requirements\n\
-                         3. If the plan is sound, approve the planning gate:\n\
-                            `openflows-harness gate approve --phase planning --notes \"Plan approved. \
-                         Proceed with implementation.\"`\n\
-                         4. If the plan has issues, provide specific actionable feedback and do NOT \
-                         approve the gate\n\n\
-                         Use `openflows-harness dispatch read` for ticket context.\n\n\
-                         **Ticket:** {} — {}\n",
-                        ticket.id, ticket.id, ticket.title,
-                    );
+                    let plan_review_prompt = if testing {
+                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 --argv <test command and arguments>` to run tests in FORGE. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Approval waits for human testing approval before submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
+                    } else {
+                        format!("Review plan revision {} for {}. Read `openflows-harness plan read`. Write review.md with actionable feedback. Run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict approve --report review.md` (or reject). Do not change source. A rejection is recorded and returned to FORGE.",lifecycle.revision,ticket.id,lifecycle.revision,lifecycle.review_round)
+                    };
 
                     // Resolve organization_id first - fail fast if unavailable
                     let organization_id = match client.get_default_organization_id().await {
@@ -2347,7 +2236,16 @@ Use `openflows-harness` for all coordination:
                         }
                     }
                 }
-                Some("review_ready") => {
+                Some("submit") => {
+                    if !store
+                        .lifecycle(&ticket.id)
+                        .await
+                        .ok()
+                        .is_some_and(|s| s.pr_number.is_some() && s.pr_decision.is_none())
+                    {
+                        continue;
+                    }
+
                     // ── PR Review: SENTINEL reviews completed work ──
 
                     // Check if Sentinel chat already exists for this ticket.
@@ -2381,7 +2279,7 @@ Use `openflows-harness` for all coordination:
                                     .and_then(|v| {
                                         v.get("phase")
                                             .and_then(|p| p.as_str())
-                                            .map(|p| p == "review_ready")
+                                            .map(|p| p == "submit")
                                     })
                                     .unwrap_or(false);
                                 // The sentinel chat bound to this key may be a leftover
@@ -2561,9 +2459,9 @@ Use `openflows-harness` for all coordination:
                          3. Write your full evaluation to a markdown report file (e.g. \
                          `segment-N-eval.md` / `final-review.md`)\n\
                          4. Record your verdict for the controller by running:\n\
-                            `openflows-harness review submit --verdict <approve|reject> --report <path-to-report-md>`\n\n\
+                            `openflows-harness review submit --verdict <approve|reject> --report <path-to-report-md> --revision <revision-from-status-get> --round <review_round-from-status-get> --head <head-from-status-get>`\n\n\
                          A `reject` loops back to FORGE for rework in its same chat session; \
-                         FORGE re-signals `openflows-harness status set review_ready` when done.\n\n\
+                         FORGE re-signals `openflows-harness status set testing` when done.\n\n\
                          **Ticket:** {} — {}\n",
                         ticket.id, ticket.id, ticket.title,
                     );
@@ -2605,6 +2503,36 @@ Use `openflows-harness` for all coordination:
                                 error = %e,
                                 "Failed to create Sentinel chat"
                             );
+                        }
+                    }
+                }
+                Some("plan_rejected") | Some("building") => {
+                    if let Ok(state) = store.lifecycle(&ticket.id).await {
+                        if let Some(feedback) = &state.feedback {
+                            let key =
+                                format!("ticket:{}:feedback_notified:{}", ticket.id, state.version);
+                            if store.get(&key).await.is_none() {
+                                if let Some(chat) = store
+                                    .get_typed::<String>(&full_ticket_key(
+                                        &ticket.id,
+                                        KEY_TICKET_CHAT,
+                                        "forge",
+                                    ))
+                                    .await
+                                {
+                                    let prompt=format!("Review rejected: {feedback}. Read status get. If plan_rejected, run status set planning, revise/upload the plan and set plan_ready. If building, fix, commit and return through testing before submit.");
+                                    if client
+                                        .send_chat_message(
+                                            &chat,
+                                            vec![coder_client::types::ChatInputPart::text(prompt)],
+                                        )
+                                        .await
+                                        .is_ok()
+                                    {
+                                        store.set(&key, json!(true)).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3302,7 +3230,7 @@ Use `openflows-harness` for all coordination:
                         let review_done: Option<Value> = store.get_typed(&review_key).await;
                         let review_complete = phase
                             .as_deref()
-                            .is_some_and(|p| p != "planning" && p != "review_ready")
+                            .is_some_and(|p| !matches!(p, "plan_ready" | "testing" | "submit"))
                             || gate_approved.is_some()
                             || review_done.is_some();
                         if review_complete {
@@ -3608,15 +3536,16 @@ Use `openflows-harness` for all coordination:
         })
     }
 
-    async fn gate_approved(store: &SharedStore, ticket_id: &str, phase: &str) -> bool {
+    async fn gate_approved(store: &SharedStore, ticket_id: &str, _phase: &str) -> bool {
         store
-            .get(&Self::ticket_gate_key(ticket_id, phase))
+            .lifecycle(ticket_id)
             .await
-            .is_some()
+            .ok()
+            .is_some_and(|s| s.plan_decision.as_ref().is_some_and(|d| d.approved))
     }
 
     async fn is_waiting_for_planning_gate(store: &SharedStore, ticket_id: &str) -> bool {
-        Self::ticket_phase(store, ticket_id).await.as_deref() == Some("planning")
+        Self::ticket_phase(store, ticket_id).await.as_deref() == Some("plan_ready")
             && !Self::gate_approved(store, ticket_id, "planning").await
     }
 
@@ -5191,28 +5120,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_planning_gate_wait_detection_uses_store_namespace_once() {
+        use config::lifecycle::{Event, Phase};
         let store = SharedStore::new_in_memory();
         let ticket_id = "T-048";
-        store
-            .set(
-                &full_ticket_key_flat(ticket_id, KEY_TICKET_STATUS),
-                json!({
-                    "phase": "planning",
-                    "role": "forge",
-                    "ts": 1u64,
-                }),
+        let s = store
+            .transition(
+                ticket_id,
+                0,
+                "forge",
+                Event::Plan {
+                    content: "plan".into(),
+                },
             )
-            .await;
-
+            .await
+            .unwrap();
+        let s = store
+            .transition(
+                ticket_id,
+                s.version,
+                "forge",
+                Event::Move {
+                    phase: Phase::PlanReady,
+                    head: None,
+                },
+            )
+            .await
+            .unwrap();
         assert!(NexusNode::is_waiting_for_planning_gate(&store, ticket_id).await);
-
         store
-            .set(
-                &NexusNode::ticket_gate_key(ticket_id, "planning"),
-                json!({ "approved_by": "sentinel" }),
+            .transition(
+                ticket_id,
+                s.version,
+                "sentinel",
+                Event::Decide {
+                    round: s.review_round,
+                    phase: Phase::PlanReady,
+                    approved: true,
+                    report: "approved".into(),
+                    revision: s.revision,
+                    head: None,
+                },
             )
-            .await;
-
+            .await
+            .unwrap();
         assert!(!NexusNode::is_waiting_for_planning_gate(&store, ticket_id).await);
     }
 

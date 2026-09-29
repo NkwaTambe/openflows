@@ -4,9 +4,9 @@
 //! On top of the generic `apply_policy()` (rm -rf, force-push, redis-cli, ...),
 //! this adds per-role, phase-aware decisions for the **complete** Forge
 //! lifecycle. The harness phases are authoritative:
-//! `planning → building → testing → review_ready`, with `blocked` as the
+//! `planning → plan_ready → building → testing → submit → done`, with `blocked` as the
 //! failure escape hatch. There is no separate `pr_ready` phase: opening a PR is
-//! the artifact produced *inside* `review_ready`.
+//! the artifact produced *inside* `submit`.
 //!
 //! The guard asks one question of every tool call — "is the agent doing exactly
 //! what its current phase says it should?":
@@ -14,8 +14,8 @@
 //!   - `building`     — implementation; **the plan MUST already exist**. If a
 //!     `building` ticket has no plan, the agent is out of sequence and is told to
 //!     run `/plan` first (deny, relayed to the model via `post_tool_use`).
-//!   - `testing`      — verify; plan must exist, source fixes permitted.
-//!   - `review_ready` — terminal; source writes denied, rework re-enters earlier.
+//!   - `testing`      — verify; plan must exist, source frozen; fixes return to building.
+//!   - `submit`       — PR review; source writes denied, rework re-enters earlier.
 //!   - `blocked`      — only blocker report + read-only probes.
 //!   - `sentinel`     — read-only reviewer; all writes denied.
 //!
@@ -28,7 +28,16 @@ use pocketflow_core::SharedStore;
 use serde_json::Value;
 
 /// The phases of a Forge worker's lifecycle, in order.
-const PHASES: &[&str] = &["planning", "building", "testing", "review_ready", "blocked"];
+const PHASES: &[&str] = &[
+    "planning",
+    "plan_ready",
+    "plan_rejected",
+    "building",
+    "testing",
+    "submit",
+    "done",
+    "blocked",
+];
 
 /// True iff `phase` is a recognised Forge lifecycle phase.
 pub fn is_valid_phase(phase: &str) -> bool {
@@ -520,52 +529,21 @@ pub fn phase_guidance(phase: &str, plan_exists: bool, role: &str) -> String {
         return "You are SENTINEL, the read-only reviewer. Your job is to review \
                  plans and PRs and submit verdicts — you must not write or edit source. \
                  Read the plan/PR, run read-only checks, and use `openflows-harness \
-                 review submit` / `gate approve`."
+                 review submit` / `gate decide`."
             .to_string();
     }
 
     match phase {
-        "planning" if !plan_exists => {
-            "FORGE planning phase: a plan does not exist yet. Run `/plan` now to \
-             analyze the ticket and write PLAN.md, then `openflows-harness plan write \
-             --file PLAN.md`, then `openflows-harness status set planning`, and HALT \
-             for SENTINEL gate approval before touching any source file."
-                .to_string()
-        }
-        "planning" => "FORGE planning phase: your plan is written and awaiting SENTINEL gate \
-             approval. Do not write source yet. Run `openflows-harness gate status \
-             --phase planning`; HALT for approval, then `status set building`."
-            .to_string(),
-        "building" if !plan_exists => {
-            "FORGE is in the building phase but NO plan exists in the shared store. \
-             This is out of sequence. Stop and run `/plan` first: write PLAN.md, \
-             upload it with `openflows-harness plan write --file PLAN.md`, and obtain \
-             SENTINEL gate approval before continuing to build."
-                .to_string()
-        }
-        "building" => "FORGE building phase: implement per PLAN.md. Write source and tests, run \
-             the test suite, and signal completion with `openflows-harness status set`."
-            .to_string(),
-        "testing" => "FORGE testing phase: you are verifying behavior. Run the test suite, fix \
-             failing tests, and only then `openflows-harness status set review_ready` \
-             and open the PR."
-            .to_string(),
-        "review_ready" => {
-            "FORGE review_ready phase: a PR is open and SENTINEL is reviewing it. Do \
-             not modify source while under review — rework must re-enter \
-             `status set planning`/`building` first."
-                .to_string()
-        }
-        "blocked" => "FORGE blocked phase: record an exact, answerable blocker (STATUS.json) \
-             and wait for NEXUS/human intervention. Do not write source or build."
-            .to_string(),
-        _ => {
-            format!(
-                "Signal the harness phase with `openflows-harness status set <phase>` and \
-                 work to the phase's contract. Valid phases: {}.",
-                PHASES.join(", ")
-            )
-        }
+        "planning" => if plan_exists { "Planning: revise the plan if needed, upload it, then set plan_ready. Source edits require approval." } else {"Planning: write PLAN.md and upload with plan write before setting plan_ready. Source edits require approval."}.into(),
+        "plan_ready" => "Plan is ready for SENTINEL review. Wait for approval, then set building; do not edit source or the submitted plan.".into(),
+        "plan_rejected" => "Read rejection feedback in status get. Return to planning, revise/upload the plan, and set plan_ready.".into(),
+        "building" if !plan_exists => "Building has no approved plan. Return to planning and run /plan, upload it, then obtain review before implementing.".into(),
+        "building" => "Building: implement the approved plan, commit all changes, then set testing with a clean checkout.".into(),
+        "testing" => "Testing freezes source. Run verify serve for SENTINEL A2A tests. Wait for SENTINEL and human testing approval, then set submit. For fixes return to building.".into(),
+        "submit" => "Submit: open/record the PR. Wait for SENTINEL review, human approval and CI. Source fixes require returning to building and repeating testing.".into(),
+        "done" => "Ticket is done and terminal.".into(),
+        "blocked" => "Blocked: record a blocker and wait for help. Recovery returns to planning.".into(),
+        _ => "Read status get; start with planning and an uploaded plan. Unknown state cannot authorize source edits.".into(),
     }
 }
 
@@ -621,8 +599,10 @@ pub async fn phase_guard(
     }
 
     // ── PLANNING ──────────────────────────────────────────────────────────
-    if phase == "planning" {
-        if is_write_attempt(&lower, input) && !st.plan_exists && !is_plan_write(&lower, input) {
+    if matches!(phase, "planning" | "plan_ready" | "plan_rejected" | "unset") {
+        if is_write_attempt(&lower, input)
+            && !(phase != "plan_ready" && is_plan_write(&lower, input))
+        {
             // First write must be the plan.
             decision = HookDecision::deny(
                 "openflows policy: FORGE is in the planning phase and must write \
@@ -650,7 +630,15 @@ pub async fn phase_guard(
     }
 
     // ── TESTING ───────────────────────────────────────────────────────────
+    if phase == "done" {
+        return HookDecision::deny("Ticket is done; no further worker actions are allowed");
+    }
     if phase == "testing" {
+        if is_write_attempt(&lower, input) {
+            return HookDecision::deny(
+                "Testing freezes source. Return to building before making changes",
+            );
+        }
         if !st.plan_exists {
             if is_plan_write(&lower, input) || is_plan_recovery_command(&lower, input) {
                 return decision.with_model_context(guidance);
@@ -664,11 +652,11 @@ pub async fn phase_guard(
     }
 
     // ── REVIEW_READY ──────────────────────────────────────────────────────
-    if phase == "review_ready" {
+    if phase == "submit" {
         if is_write_attempt(&lower, input) {
             // Under review: source must not change; re-enter an earlier phase.
             decision = HookDecision::deny(
-                "openflows policy: FORGE is in review_ready (PR under review). Do not \
+                "openflows policy: FORGE is in submit (PR under review). Do not \
                  modify source; for rework run `openflows-harness status set planning` \
                  (or `building`) first.",
             );
@@ -706,6 +694,11 @@ pub async fn phase_guard(
         return decision.with_model_context(guidance);
     }
 
-    // Unknown/unset phase → attach general guidance, do not deny.
+    if !is_valid_phase(phase) && is_write_attempt(&lower, input) {
+        return HookDecision::deny(
+            "Unknown lifecycle state; recover to planning before editing source",
+        );
+    }
+    // Non-mutating inspection remains available.
     decision.with_model_context(guidance)
 }

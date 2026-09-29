@@ -183,14 +183,14 @@ pub async fn build_bootstrap_context(
             top.push_str(
                 "Your first action: run `/plan` to analyze the ticket and write PLAN.md, \
                  then `openflows-harness plan write --file PLAN.md` and \
-                 `openflows-harness status set planning` (HALT for SENTINEL gate).\n",
+                 `openflows-harness status set plan_ready` (HALT for SENTINEL gate).\n",
             );
         }
         "sentinel" => {
             top.push_str(
                 "Your first action: review what FORGE has submitted — read the plan/PR \
                  and record your verdict with `openflows-harness review submit` or the \
-                 planning gate with `gate approve` (see the /review and /plan commands).\n",
+                 planning/testing gates with `gate decide --revision <N> --round <R> --report review.md` (see the /review and /plan commands).\n",
             );
         }
         _ => {}

@@ -51,6 +51,7 @@ pub async fn execute_verify_task(
     progress_tx: Option<mpsc::UnboundedSender<VerifyProgressEvent>>,
     cancel_token: Option<Arc<AtomicBool>>,
 ) -> Result<VerifyResult> {
+    let before_head = clean_head();
     let start = Instant::now();
     let task_id = match task_id_opt {
         Some(id) if !id.is_empty() => id.to_string(),
@@ -130,6 +131,7 @@ pub async fn execute_verify_task(
 
                 // Build timeout result
                 let result = VerifyResult {
+                    head_sha: None,
                     task_id: task_id.clone(),
                     exit_code: None,
                     timed_out: true,
@@ -206,6 +208,9 @@ pub async fn execute_verify_task(
 
     // Build result artifact
     let result = VerifyResult {
+        head_sha: before_head
+            .clone()
+            .filter(|h| clean_head().as_ref() == Some(h)),
         task_id: task_id.clone(),
         exit_code,
         timed_out: false,
@@ -333,6 +338,24 @@ fn truncate_to_tail(s: &str, max_bytes: usize) -> String {
     }
 
     String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+fn clean_head() -> Option<String> {
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return None;
+    }
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !head.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(head.stdout).ok()?.trim().to_owned())
 }
 
 #[cfg(test)]

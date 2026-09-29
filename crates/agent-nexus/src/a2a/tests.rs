@@ -29,6 +29,7 @@ mod tests {
 
     fn sample_result(task_id: &str) -> VerifyResult {
         VerifyResult {
+            head_sha: None,
             task_id: task_id.to_string(),
             exit_code: Some(0),
             timed_out: false,
@@ -460,6 +461,7 @@ mod tests {
 
         // Build a synthetic cancelled result (as done in http_server cancel handler)
         let cancelled_result = VerifyResult {
+            head_sha: None,
             task_id: task_id.clone(),
             exit_code: None,
             timed_out: false,

@@ -134,6 +134,25 @@ enum StoreCommands {
 
 #[derive(Subcommand)]
 enum GateCommands {
+    /// Record a human decision for the exact testing or PR submission candidate.
+    Decide {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        ticket: String,
+        #[arg(long, value_parser=["testing","submit"])]
+        phase: String,
+        #[arg(long,value_parser=["approve","reject"])]
+        verdict: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        round: u64,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        notes: String,
+    },
     /// Approve a phase transition gate
     Approve {
         /// Tenant name
@@ -1099,6 +1118,33 @@ async fn run_gate(action: GateCommands) -> Result<()> {
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
 
     match action {
+        GateCommands::Decide {
+            tenant,
+            ticket,
+            phase,
+            verdict,
+            revision,
+            round,
+            head,
+            notes,
+        } => {
+            let store = Harness::new(&redis_url, &tenant).await?;
+            store
+                .gate_decide(
+                    &ticket,
+                    "human",
+                    &phase,
+                    verdict == "approve",
+                    &notes,
+                    openflows_harness::store::ReviewTarget {
+                        revision,
+                        round,
+                        head: Some(head),
+                    },
+                )
+                .await?;
+            println!("Human decision recorded for {ticket}");
+        }
         GateCommands::Approve {
             tenant,
             ticket,

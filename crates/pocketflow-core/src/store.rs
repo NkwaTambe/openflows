@@ -271,6 +271,71 @@ impl SharedStore {
         Ok(())
     }
 
+    /// Strict lifecycle reads distinguish an absent ticket from a store outage.
+    pub async fn lifecycle(&self, ticket: &str) -> Result<config::lifecycle::Lifecycle> {
+        let key = self.ns_key(&format!("ticket:{ticket}:status"));
+        let value = match &self.backend {
+            Backend::InMemory(b) => b.map.read().await.get(&key).cloned(),
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> = b.client.get(&key).await?;
+                raw.map(|s| serde_json::from_str(&s)).transpose()?
+            }
+        };
+        config::lifecycle::Lifecycle::decode(value)
+    }
+
+    /// Compare-and-set the entire lifecycle, including approvals and evidence.
+    /// A conflict is returned to the caller; stale requests are never replayed.
+    pub async fn transition(
+        &self,
+        ticket: &str,
+        version: u64,
+        actor: &str,
+        event: config::lifecycle::Event,
+    ) -> Result<config::lifecycle::Lifecycle> {
+        use config::lifecycle::Lifecycle;
+        let key = self.ns_key(&format!("ticket:{ticket}:status"));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        match &self.backend {
+            Backend::InMemory(b) => {
+                let mut map = b.map.write().await;
+                let current = Lifecycle::decode(map.get(&key).cloned())?;
+                anyhow::ensure!(
+                    current.version == version,
+                    "Lifecycle changed; refresh before retrying"
+                );
+                let next = current.apply(actor, event, ts)?;
+                map.insert(key, serde_json::to_value(&next)?);
+                Ok(next)
+            }
+            Backend::Redis(b) => {
+                use fred::prelude::*;
+                let raw: Option<String> = b.client.get(&key).await?;
+                let current =
+                    Lifecycle::decode(raw.as_deref().map(serde_json::from_str).transpose()?)?;
+                anyhow::ensure!(
+                    current.version == version,
+                    "Lifecycle changed; refresh before retrying"
+                );
+                let next = current.apply(actor, event, ts)?;
+                let script="local old=redis.call('GET',KEYS[1]); if (old or '') ~= ARGV[1] then return 0 end; redis.call('SET',KEYS[1],ARGV[2]); return 1";
+                let changed: i64 = b
+                    .client
+                    .eval(
+                        script,
+                        vec![key],
+                        vec![raw.unwrap_or_default(), serde_json::to_string(&next)?],
+                    )
+                    .await?;
+                anyhow::ensure!(changed == 1, "Lifecycle changed; refresh before retrying");
+                Ok(next)
+            }
+        }
+    }
+
     // ── Event ring buffer ─────────────────────────────────────────────
 
     /// Emit a structured event. Every node lifecycle phase should call this.
@@ -306,5 +371,47 @@ impl SharedStore {
     /// Number of events in the ring buffer (for initial TUI render).
     pub async fn event_count(&self) -> usize {
         self.ring_buffer.read().await.len()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use config::lifecycle::{Event, Phase};
+    #[tokio::test]
+    async fn competing_updates_cannot_both_commit() {
+        let store = SharedStore::new_in_memory();
+        let event = Event::Plan {
+            content: "plan".into(),
+        };
+        let (a, b) = tokio::join!(
+            store.transition("T-1", 0, "forge", event.clone()),
+            store.transition("T-1", 0, "forge", event)
+        );
+        assert_ne!(a.is_ok(), b.is_ok());
+        assert_eq!(store.lifecycle("T-1").await.unwrap().version, 1);
+    }
+    #[tokio::test]
+    async fn legacy_approval_is_not_authority_and_merged_stays_terminal() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set("ticket:T-1:status", serde_json::json!("approved"))
+            .await;
+        assert_eq!(store.lifecycle("T-1").await.unwrap().phase, Phase::Planning);
+        store
+            .set("ticket:T-1:status", serde_json::json!("Merged"))
+            .await;
+        assert!(store
+            .transition(
+                "T-1",
+                0,
+                "forge",
+                Event::Move {
+                    phase: Phase::Planning,
+                    head: None
+                }
+            )
+            .await
+            .is_err());
     }
 }

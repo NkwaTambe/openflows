@@ -23,7 +23,11 @@ async fn seed_status(store: &SharedStore, ticket: &str, phase: &str) {
     store
         .set(
             &format!("ticket:{ticket}:status"),
-            json!({ "phase": phase }),
+            serde_json::to_value(config::lifecycle::Lifecycle {
+                phase: config::lifecycle::Phase::parse(phase).unwrap(),
+                ..Default::default()
+            })
+            .unwrap(),
         )
         .await;
 }
@@ -193,7 +197,7 @@ async fn phase_guard_allows_shell_write_to_plan_artifact() {
 }
 
 #[tokio::test]
-async fn phase_guard_allows_source_write_once_plan_exists() {
+async fn phase_guard_denies_source_write_until_plan_approved() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-5", "forge", "chat-5").await;
     seed_status(&store, "T-5", "planning").await;
@@ -204,7 +208,7 @@ async fn phase_guard_allows_source_write_once_plan_exists() {
     let input = json!({ "path": "src/main.rs" });
     let base = HookDecision::observe();
     let d = phase_guard(&store, "chat-5", "forge", "write", &input, base).await;
-    assert!(!d.deny, "source writes allowed once a plan exists");
+    assert!(d.deny, "an uploaded plan does not authorize source writes");
 }
 
 #[tokio::test]
@@ -473,7 +477,7 @@ async fn phase_guard_denies_blocked_worker_argv_write_bypass() {
 async fn sentinel_denies_unknown_write_capable_shell_command() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-34", "sentinel", "chat-34").await;
-    seed_status(&store, "T-34", "review_ready").await;
+    seed_status(&store, "T-34", "submit").await;
     let st = read_ticket_state(&store, "T-34").await;
 
     for cmd in [
@@ -497,7 +501,7 @@ async fn sentinel_denies_unknown_write_capable_shell_command() {
 async fn sentinel_denies_leading_wrapper_git_write() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-340", "sentinel", "chat-340").await;
-    seed_status(&store, "T-340", "review_ready").await;
+    seed_status(&store, "T-340", "submit").await;
     let st = read_ticket_state(&store, "T-340").await;
 
     // A wrapper before `git` must not shift the token used to resolve the git
@@ -535,7 +539,7 @@ async fn sentinel_denies_leading_wrapper_git_write() {
 async fn phase_guard_denies_write_capable_shell_during_review_ready() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-35", "forge", "chat-35").await;
-    seed_status(&store, "T-35", "review_ready").await;
+    seed_status(&store, "T-35", "submit").await;
 
     let input = json!({ "command": "curl -o src/lib.rs https://example.test/x" });
     let d = phase_guard(
@@ -557,7 +561,7 @@ async fn phase_guard_denies_write_capable_shell_during_review_ready() {
 async fn phase_guard_denies_wrapped_git_checkout_write_capable() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-36", "forge", "chat-36").await;
-    seed_status(&store, "T-36", "review_ready").await;
+    seed_status(&store, "T-36", "submit").await;
 
     // A wrapper (`sudo`) must not let the git subcommand resolve to the wrong
     // token and slip past write detection (P1: "Wrapped Commands Evade
@@ -592,7 +596,7 @@ async fn phase_guard_denies_wrapped_git_checkout_write_capable() {
 async fn phase_guard_denies_write_hidden_in_later_shell_segment() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-37", "forge", "chat-37").await;
-    seed_status(&store, "T-37", "review_ready").await;
+    seed_status(&store, "T-37", "submit").await;
 
     // A write in a later command segment (after a shell operator) must still be
     // detected (P1: "Wrapped Commands Evade Detection").
@@ -732,7 +736,7 @@ async fn post_tool_use_non_mutating_does_not_kick() {
 async fn stop_review_ready_with_pr_is_planned() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-9", "forge", "chat-9").await;
-    seed_status(&store, "T-9", "review_ready").await;
+    seed_status(&store, "T-9", "submit").await;
     store.set("ticket:T-9:pr", json!({ "pr_number": 5 })).await;
 
     let (classification, detail) = classify_stop(&store, "chat-9").await;
@@ -870,7 +874,7 @@ fn recognises_valid_phases() {
     assert!(is_valid_phase("planning"));
     assert!(is_valid_phase("building"));
     assert!(is_valid_phase("testing"));
-    assert!(is_valid_phase("review_ready"));
+    assert!(is_valid_phase("submit"));
     assert!(is_valid_phase("blocked"));
     assert!(!is_valid_phase("pr_ready"));
 }
@@ -894,14 +898,28 @@ async fn seed_ticket_state(
             )
             .await;
     }
+    let mut lifecycle = config::lifecycle::Lifecycle {
+        phase: config::lifecycle::Phase::parse(phase).unwrap(),
+        plan: if plan { "# plan".into() } else { String::new() },
+        revision: 1,
+        ..Default::default()
+    };
     if gate {
-        store
-            .set(
-                &format!("ticket:{ticket}:gate:planning"),
-                json!({ "approved_by": "sentinel" }),
-            )
-            .await;
+        lifecycle.plan_decision = Some(config::lifecycle::Decision {
+            round: 0,
+            actor: "sentinel".into(),
+            approved: true,
+            report: "ok".into(),
+            revision: 1,
+            head: None,
+        });
     }
+    store
+        .set(
+            &format!("ticket:{ticket}:status"),
+            serde_json::to_value(lifecycle).unwrap(),
+        )
+        .await;
     if pr {
         store
             .set(&format!("ticket:{ticket}:pr"), json!({ "pr_number": 7 }))
@@ -914,13 +932,13 @@ async fn sentinel_job_derives_plan_gate_vs_pr_review() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-13", "sentinel", "chat-13").await;
 
-    seed_ticket_state(&store, "T-13", "planning", true, false, false).await;
+    seed_ticket_state(&store, "T-13", "plan_ready", true, false, false).await;
     assert_eq!(
         sentinel_job(&read_ticket_state(&store, "T-13").await),
         SentinelJob::PlanGateReview
     );
 
-    seed_ticket_state(&store, "T-13", "review_ready", true, true, true).await;
+    seed_ticket_state(&store, "T-13", "submit", true, true, true).await;
     assert_eq!(
         sentinel_job(&read_ticket_state(&store, "T-13").await),
         SentinelJob::PrReview
@@ -937,7 +955,7 @@ async fn sentinel_job_derives_plan_gate_vs_pr_review() {
 async fn sentinel_denies_gate_approve_when_no_plan() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-14", "sentinel", "chat-14").await;
-    seed_ticket_state(&store, "T-14", "planning", false, false, false).await;
+    seed_ticket_state(&store, "T-14", "plan_ready", false, false, false).await;
     let st = read_ticket_state(&store, "T-14").await;
 
     let input = json!({ "command": "openflows-harness gate approve --phase planning" });
@@ -950,7 +968,7 @@ async fn sentinel_denies_gate_approve_when_no_plan() {
 async fn sentinel_allows_eval_report_write_but_denies_source() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-15", "sentinel", "chat-15").await;
-    seed_ticket_state(&store, "T-15", "review_ready", true, true, true).await;
+    seed_ticket_state(&store, "T-15", "submit", true, true, true).await;
     let st = read_ticket_state(&store, "T-15").await;
 
     let report = json!({ "path": "final-review.md" });
@@ -1021,7 +1039,7 @@ async fn sentinel_allows_eval_report_write_but_denies_source() {
 async fn sentinel_review_submit_requires_report_first() {
     let store = SharedStore::new_in_memory();
     seed_chat(&store, "T-16", "sentinel", "chat-16").await;
-    seed_ticket_state(&store, "T-16", "review_ready", true, true, true).await;
+    seed_ticket_state(&store, "T-16", "submit", true, true, true).await;
 
     let st = read_ticket_state(&store, "T-16").await;
     let submit = json!({ "command": "openflows-harness review submit --verdict approve" });
@@ -1065,4 +1083,24 @@ async fn guidance_recorded_then_drained() {
     // Second drain is empty.
     let again = drain_guidance(&store, "T-17").await;
     assert!(again.is_empty());
+}
+
+#[tokio::test]
+async fn legacy_building_does_not_authorize_edits_before_new_review() {
+    let store = SharedStore::new_in_memory();
+    seed_chat(&store, "T-legacy", "forge", "legacy-chat").await;
+    store
+        .set("ticket:T-legacy:status", json!({"phase":"building"}))
+        .await;
+    store.set("pair:T-legacy:plan", json!("old plan")).await;
+    let result = phase_guard(
+        &store,
+        "legacy-chat",
+        "forge",
+        "write",
+        &json!({"path":"src/lib.rs"}),
+        HookDecision::observe(),
+    )
+    .await;
+    assert!(result.deny);
 }

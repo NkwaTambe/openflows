@@ -1,3 +1,31 @@
+
+## Authoritative lifecycle contract
+
+Read `openflows-harness status get` before acting. The lifecycle is
+`planning -> plan_ready -> building -> testing -> submit -> done`.
+Start/revise in `planning`; upload with `plan write --file PLAN.md`, then set
+`plan_ready`. SENTINEL reviews the exact `revision` and `review_round`. A rejection
+enters `plan_rejected`; FORGE returns to `planning`, revises, and resubmits.
+No source edits are allowed before approval.
+
+After building, commit all changes, then set `testing`. Keep the checkout clean
+and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through
+`verify request --expect-exit 0 --argv <command and args>`, writes a report, and
+uses `gate decide --phase testing --revision <N> --round <R> --head <SHA>
+--verdict approve --report review.md` (or reject). Testing needs both SENTINEL
+and human approval. Then FORGE sets `submit`, opens/updates and records the PR.
+SENTINEL records the PR verdict with `review submit --revision <N> --round <R>
+--head <SHA> --verdict approve --report final-review.md` (or reject). Read the
+current round again after recording a PR. Humans use the operator CLI
+`openflows gate decide --tenant <tenant> --ticket <ticket> --phase testing|submit
+--revision <N> --round <R> --head <SHA> --verdict approve|reject --notes <reason>`.
+
+Every rework cycle returns to `building`, then repeats testing and both review
+gates. Never jump directly from building to submit. Testing/submit freeze source.
+VESSEL requires current-head CI success, SENTINEL and human PR approval, and
+confirmed merge before done. Missing or timed-out CI never counts as success.
+Use `blocked` for an operational failure; recovery returns to planning.
+
 # /plan Command
 
 Create a detailed implementation plan for the current ticket.
@@ -59,7 +87,7 @@ Total: {N} segments
 Once PLAN.md is written:
 1. Upload the plan to SharedStore: `openflows-harness plan write --file PLAN.md`
 2. Commit the plan: `git add -A && git commit -m "[T-{id}] plan: implementation approach"`
-3. Signal planning complete: `openflows-harness status set planning`
+3. Signal planning complete: `openflows-harness status set plan_ready`
 4. Begin Segment 1
 5. Use `/segment-done` when each segment is complete
 

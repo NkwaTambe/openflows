@@ -932,6 +932,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "config",
+ "mockito",
  "pocketflow-core",
  "rand 0.8.6",
  "regex",
@@ -1610,6 +1611,7 @@ dependencies = [
  "fred",
  "futures",
  "nix",
+ "pocketflow-core",
  "reqwest",
  "serde",
  "serde_json",

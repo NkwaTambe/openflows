@@ -141,6 +141,12 @@ enum ReviewAction {
         report: PathBuf,
         #[arg(long)]
         pr: Option<u64>,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        round: u64,
+        #[arg(long)]
+        head: String,
     },
 }
 
@@ -165,6 +171,21 @@ enum HeartbeatAction {
 
 #[derive(Subcommand)]
 enum GateAction {
+    /// Decide a review of an exact plan revision and (for testing/submit) head.
+    Decide {
+        #[arg(long)]
+        phase: String,
+        #[arg(long, value_parser=["approve", "reject"])]
+        verdict: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        round: u64,
+        #[arg(long)]
+        head: Option<String>,
+        #[arg(long)]
+        report: PathBuf,
+    },
     /// Approve a gated phase transition (SENTINEL → FORGE)
     Approve {
         /// Phase to approve (e.g., "planning")
@@ -254,6 +275,36 @@ async fn main() -> Result<()> {
     let store = store::HarnessStore::new(&redis_url, &tenant).await?;
 
     match cli.command {
+        Commands::Gate {
+            action:
+                GateAction::Decide {
+                    phase,
+                    verdict,
+                    revision,
+                    round,
+                    head,
+                    report,
+                },
+        } => {
+            anyhow::ensure!(
+                role.eq_ignore_ascii_case("sentinel"),
+                "Worker gate decisions require SENTINEL; human decisions use the operator CLI"
+            );
+            store
+                .gate_decide(
+                    &ticket,
+                    &role,
+                    &phase,
+                    verdict == "approve",
+                    &std::fs::read_to_string(report)?,
+                    store::ReviewTarget {
+                        revision,
+                        round,
+                        head,
+                    },
+                )
+                .await?;
+        }
         Commands::Dispatch {
             action: DispatchAction::Read,
         } => {
@@ -292,10 +343,24 @@ async fn main() -> Result<()> {
                     verdict,
                     report,
                     pr,
+                    revision,
+                    round,
+                    head,
                 },
         } => {
             store
-                .review_submit(&ticket, &role, &verdict, &report, pr)
+                .review_submit(
+                    &ticket,
+                    &role,
+                    &verdict,
+                    &report,
+                    pr,
+                    store::ReviewTarget {
+                        revision,
+                        round,
+                        head: Some(head),
+                    },
+                )
                 .await?;
         }
         Commands::Merge {
