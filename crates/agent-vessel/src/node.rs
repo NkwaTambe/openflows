@@ -662,7 +662,14 @@ impl Node for VesselNode {
                 .clone()
                 .context("VESSEL lifecycle store not initialized")?;
             let ticket = pr["ticket_id"].as_str().or(pr_info.ticket_id.as_deref());
-            let Some(ticket) = ticket.map(str::to_owned) else {
+            let Some(ticket) = ticket
+                .filter(|ticket| !ticket.trim().is_empty())
+                .map(str::to_owned)
+            else {
+                outcomes.push(VesselOutcome::Unmanaged {
+                    pr_number,
+                    reason: "PR has no lifecycle ticket; manual review and merge required".into(),
+                });
                 continue;
             };
             pr_info.ticket_id = Some(ticket.clone());
@@ -1498,6 +1505,17 @@ impl Node for VesselNode {
                     }
 
                     self.remove_from_pending_prs(store, *pr_number).await;
+                }
+                VesselOutcome::Unmanaged { pr_number, reason } => {
+                    warn!(pr_number, reason, "PR requires manual handling");
+                    store
+                        .set(
+                            &format!("pr:{pr_number}:unmanaged"),
+                            json!({"reason": reason}),
+                        )
+                        .await;
+                    self.remove_from_pending_prs(store, *pr_number).await;
+                    any_awaiting_human = true;
                 }
                 VesselOutcome::DocsPrClosed { pr_number, reason } => {
                     info!(
@@ -3173,6 +3191,110 @@ fn parse_repository(repository: Option<&str>) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn merge_reservation_clears_only_for_definitive_rejection() {
+        for (status, pending) in [
+            (405, false),
+            (409, false),
+            (422, false),
+            (408, true),
+            (500, true),
+            (0, true), // Transport failure after the merge request is accepted.
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let _status = server
+                .mock("GET", "/repos/org/repo/commits/head/status")
+                .with_status(200)
+                .with_body(r#"{"state":"success","total_count":1}"#)
+                .create_async()
+                .await;
+            let _checks = server
+                .mock(
+                    "GET",
+                    "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+                )
+                .with_status(200)
+                .with_body(r#"{"check_suites":[]}"#)
+                .create_async()
+                .await;
+            let merge = server
+                .mock("PUT", "/repos/org/repo/pulls/42/merge")
+                .with_status(if status == 0 { 500 } else { status })
+                .with_body(r#"{"message":"rejected"}"#)
+                .expect(if status == 0 { 0 } else { 1 })
+                .create_async()
+                .await;
+            let client = github::GithubRestClient::with_api_base("test", server.url());
+            let mut node = VesselNode::new(VesselConfig::default());
+            node.client = client.clone();
+            let merge_client = if status == 0 {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request).await;
+                    // Drop the connection without reporting whether the merge happened.
+                });
+                github::GithubRestClient::with_api_base("test", endpoint)
+            } else {
+                client
+            };
+            node.merger = PrMerger::new(merge_client, pocketflow_core::MergeMethod::Squash);
+            let store = SharedStore::new_in_memory();
+            let decision = json!({"round":0,"pr_number":42,"actor":"human","approved":true,"report":"approved","revision":1,"head":"head"});
+            store.set("ticket:T-42:status", json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":decision,"pr_human":decision})).await;
+            *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+            let pr = PrInfo {
+                number: 42,
+                head_sha: "head".into(),
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                ticket_id: Some("T-42".into()),
+                title: "Feature".into(),
+                body: None,
+                state: pocketflow_core::PrState::Open,
+                mergeable: Some(true),
+            };
+            let result = node.merge_reviewed("org", "repo", &pr).await;
+            assert_eq!(
+                store.lifecycle("T-42").await.unwrap().merge_pending,
+                pending,
+                "HTTP {status}: {result:?}"
+            );
+            assert_eq!(result.is_err(), pending);
+            merge.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ticketless_pr_is_reported_for_manual_handling_and_dequeued() {
+        let mut server = mockito::Server::new_async().await;
+        let _pr = server.mock("GET", "/repos/org/repo/pulls/42")
+            .with_status(200).with_body(r#"{"number":42,"title":"Dependency update","body":null,"head":{"sha":"head","ref":"dependabot/update"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":true}"#)
+            .create_async().await;
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = client;
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        store.set(KEY_PENDING_PRS, json!([{"number":42}])).await;
+        let result = node
+            .exec(json!({"owner":"org","repo":"repo","pending_prs":[{"number":42}]}))
+            .await
+            .unwrap();
+        assert_eq!(result["outcomes"][0]["type"], "unmanaged");
+        let action = node.post(&store, result).await.unwrap();
+        assert_eq!(action.as_str(), Action::AWAITING_HUMAN);
+        assert!(store
+            .get_typed::<Vec<Value>>(KEY_PENDING_PRS)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(store.get("pr:42:unmanaged").await.is_some());
+    }
 
     #[test]
     fn test_parse_repository() {

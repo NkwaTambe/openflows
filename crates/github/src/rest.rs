@@ -34,13 +34,18 @@ impl GithubRestClient {
         let api_base = config::GithubConfig::init_from_env()
             .map(|cfg| cfg.api_base)
             .unwrap_or_else(|_| "https://api.github.com".to_string());
+        Self::with_api_base(token, api_base)
+    }
+
+    /// Construct a client for an explicit GitHub or GitHub Enterprise API endpoint.
+    pub fn with_api_base(token: impl Into<String>, api_base: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .user_agent("AgentFlow-VESSEL/0.1")
                 .build()
                 .expect("Failed to build reqwest client"),
             token: token.into(),
-            api_base,
+            api_base: api_base.into(),
         }
     }
 
@@ -185,28 +190,6 @@ impl GithubRestClient {
         resp.text()
             .await
             .with_context(|| format!("Failed to read GitHub text response from {}", url))
-    }
-
-    async fn put_json<T: for<'de> Deserialize<'de>, B: Serialize>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> Result<T> {
-        debug!(url, "GitHub API PUT");
-        let payload = serde_json::to_vec(body)?;
-        let resp = self
-            .send_with_retry(|| self.build_put(url, &payload))
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub API error {}: {}", status, body);
-        }
-
-        resp.json::<T>()
-            .await
-            .context("Failed to parse GitHub response")
     }
 
     async fn post_json<T: for<'de> Deserialize<'de>, B: Serialize>(
@@ -626,7 +609,31 @@ impl GithubRestClient {
             merge_method,
         };
 
-        let resp: MergeResponse = self.put_json(&url, &body).await?;
+        // A merge is not safely retryable: after a timeout or server error, a
+        // later rejection cannot prove that the first attempt did not merge.
+        let payload = serde_json::to_vec(&body)?;
+        let response = self.build_put(&url, &payload).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            // Only known rejection statuses prove that this attempt did not merge.
+            // Timeout-like gateway statuses (408/499) and unfamiliar responses stay unknown.
+            if matches!(
+                status.as_u16(),
+                400 | 401 | 403 | 404 | 405 | 409 | 422 | 429
+            ) {
+                return Ok(MergeResult {
+                    merged: false,
+                    sha: None,
+                    message: format!("GitHub rejected merge ({status}): {message}"),
+                });
+            }
+            anyhow::bail!("GitHub merge outcome unknown ({status}): {message}");
+        }
+        let resp: MergeResponse = response
+            .json()
+            .await
+            .context("Failed to parse merge response")?;
 
         Ok(MergeResult {
             merged: resp.merged,
@@ -1821,6 +1828,50 @@ mod lifecycle_ci_tests {
         status.assert_async().await;
         checks.assert_async().await;
     }
+    #[tokio::test]
+    async fn rejected_merge_is_definitive_but_timeouts_and_server_errors_are_unknown() {
+        for (status, definitive) in [
+            (400, true),
+            (401, true),
+            (403, true),
+            (404, true),
+            (405, true),
+            (409, true),
+            (422, true),
+            (429, true),
+            (408, false),
+            (499, false),
+            (500, false),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("PUT", "/repos/org/repo/pulls/1/merge")
+                .with_status(status)
+                .with_body(r#"{"message":"rejected"}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let client = GithubRestClient {
+                api_base: server.url(),
+                client: reqwest::Client::new(),
+                token: "test".into(),
+            };
+            let result = client
+                .merge_pull_request("org", "repo", 1, "Merge", MergeMethod::Squash, "head")
+                .await;
+            if definitive {
+                assert!(
+                    !result
+                        .unwrap_or_else(|e| panic!("status {status}: {e}"))
+                        .merged
+                );
+            } else {
+                assert!(result.is_err(), "status {status} has an unknown outcome");
+            }
+            request.assert_async().await;
+        }
+    }
+
     #[tokio::test]
     async fn merge_http_request_requires_the_reviewed_sha() {
         let mut server = mockito::Server::new_async().await;

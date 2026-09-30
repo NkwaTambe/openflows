@@ -906,6 +906,7 @@ async fn seed_ticket_state(
     };
     if gate {
         lifecycle.plan_decision = Some(config::lifecycle::Decision {
+            pr_number: None,
             round: 0,
             actor: "sentinel".into(),
             approved: true,

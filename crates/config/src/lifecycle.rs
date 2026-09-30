@@ -36,6 +36,8 @@ impl Phase {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Decision {
+    #[serde(default)]
+    pub pr_number: Option<u64>,
     pub round: u64,
     pub actor: String,
     pub approved: bool,
@@ -125,7 +127,19 @@ impl Lifecycle {
             return Ok(Self::default());
         };
         if value.get("version").is_some() {
-            return Ok(serde_json::from_value(value)?);
+            let mut state: Self = serde_json::from_value(value)?;
+            // Older outbox entries did not identify their PR. They cannot be
+            // safely delivered or used as proof of native review delivery.
+            if state
+                .pr_delivery
+                .as_ref()
+                .is_some_and(|d| d.pr_number.is_none())
+            {
+                state.pr_delivery = None;
+                state.pr_decision = None;
+                state.pr_human = None;
+            }
+            return Ok(state);
         }
         let legacy = value
             .as_str()
@@ -192,10 +206,6 @@ impl Lifecycle {
             }
             Event::Move { phase, head } => {
                 ensure!(
-                    self.pr_delivery.is_none(),
-                    "Pending GitHub review delivery must be acknowledged before moving"
-                );
-                ensure!(
                     actor == "forge" || (actor == "vessel" && phase == Phase::Building),
                     "Actor cannot move lifecycle"
                 );
@@ -254,6 +264,10 @@ impl Lifecycle {
                 if matches!(phase, Phase::PlanReady | Phase::Testing | Phase::Submit) {
                     next.review_round += 1;
                 }
+                // Moving on supersedes queued notification of an older review.
+                // Its report remains in history; GitHub availability cannot
+                // prevent rework from reaching a new testing round.
+                next.pr_delivery = None;
                 next.feedback = None;
                 next.phase = phase;
             }
@@ -302,6 +316,7 @@ impl Lifecycle {
                     }
                 }
                 let d = Decision {
+                    pr_number: (phase == Phase::Submit).then_some(self.pr_number).flatten(),
                     round,
                     actor: actor.clone(),
                     approved,
@@ -321,6 +336,10 @@ impl Lifecycle {
                     _ => unreachable!(),
                 }
                 if !approved {
+                    // A human veto supersedes a queued SENTINEL approval.
+                    if actor == "human" {
+                        next.pr_delivery = None;
+                    }
                     next.feedback = Some(report);
                     next.phase = if phase == Phase::PlanReady {
                         Phase::PlanRejected
@@ -348,6 +367,7 @@ impl Lifecycle {
                     "PR publication requires submit"
                 );
                 if self.pr_number != Some(number) {
+                    next.pr_delivery = None;
                     next.pr_decision = None;
                     next.pr_human = None;
                     next.review_round += 1;
@@ -408,6 +428,22 @@ impl Lifecycle {
         next.role = actor;
         next.ts = ts;
         Ok(next)
+    }
+    pub fn deliverable_review(&self) -> Option<&Decision> {
+        self.pr_delivery.as_ref().filter(|d| {
+            d.pr_number.is_some()
+                && d.pr_number == self.pr_number
+                && d.round == self.review_round
+                && d.revision == self.revision
+                && if d.approved {
+                    self.phase == Phase::Submit
+                        && d.head == self.head
+                        && self.pr_decision.as_ref() == Some(*d)
+                        && self.pr_human.as_ref().is_some_and(|h| h.approved)
+                } else {
+                    self.phase == Phase::Building
+                }
+        })
     }
     pub fn merge_ready(&self, head: &str) -> bool {
         self.pr_delivery.is_none()
@@ -823,5 +859,115 @@ mod tests {
                 1
             )
             .is_err());
+    }
+    fn submitted() -> Lifecycle {
+        let mut s = building();
+        run(
+            &mut s,
+            "forge",
+            Event::Move {
+                phase: Phase::Testing,
+                head: Some("abc".into()),
+            },
+        );
+        run(
+            &mut s,
+            "sentinel",
+            Event::Verified {
+                head: "abc".into(),
+                task: "test-1".into(),
+            },
+        );
+        decide(&mut s, "sentinel", Phase::Testing, true);
+        decide(&mut s, "human", Phase::Testing, true);
+        run(
+            &mut s,
+            "forge",
+            Event::Move {
+                phase: Phase::Submit,
+                head: None,
+            },
+        );
+        run(&mut s, "forge", Event::Pr { number: 42 });
+        s
+    }
+
+    #[test]
+    fn human_rejection_cancels_undelivered_approval() {
+        let mut s = submitted();
+        decide(&mut s, "sentinel", Phase::Submit, true);
+        assert!(s.pr_delivery.is_some());
+        decide(&mut s, "human", Phase::Submit, false);
+        assert_eq!(s.phase, Phase::Building);
+        assert!(
+            s.pr_delivery.is_none(),
+            "Rejected candidate must not receive pending approval"
+        );
+    }
+
+    #[test]
+    fn replacing_pr_cancels_old_delivery() {
+        let mut s = submitted();
+        decide(&mut s, "sentinel", Phase::Submit, true);
+        let old_round = s.review_round;
+        run(&mut s, "forge", Event::Pr { number: 43 });
+        assert!(
+            s.pr_delivery.is_none(),
+            "Never deliver the old review to a replacement PR"
+        );
+        assert!(s
+            .apply("sentinel", Event::ReviewDelivered { round: old_round }, 1)
+            .is_err());
+    }
+
+    #[test]
+    fn failed_rejection_delivery_does_not_block_retesting() {
+        let mut s = submitted();
+        decide(&mut s, "sentinel", Phase::Submit, false);
+        assert!(s.pr_delivery.is_some());
+        run(
+            &mut s,
+            "forge",
+            Event::Move {
+                phase: Phase::Testing,
+                head: Some("fixed".into()),
+            },
+        );
+        assert_eq!(s.phase, Phase::Testing);
+        assert!(
+            s.pr_delivery.is_none(),
+            "New review round supersedes obsolete delivery"
+        );
+        assert!(s.history.iter().any(|h| h.detail.contains("reject")));
+    }
+
+    #[test]
+    fn approval_delivery_waits_for_human_and_keeps_original_pr() {
+        let mut s = submitted();
+        decide(&mut s, "sentinel", Phase::Submit, true);
+        assert_eq!(s.pr_delivery.as_ref().unwrap().pr_number, Some(42));
+        assert!(s.deliverable_review().is_none());
+        decide(&mut s, "human", Phase::Submit, true);
+        assert!(s.deliverable_review().is_some());
+        // A detached or old serialized delivery is never paired with the
+        // current lifecycle PR number, even if a caller missed invalidation.
+        s.pr_number = Some(43);
+        assert!(s.deliverable_review().is_none());
+    }
+
+    #[test]
+    fn unbound_legacy_delivery_cannot_authorize_merge() {
+        let mut s = submitted();
+        decide(&mut s, "sentinel", Phase::Submit, true);
+        decide(&mut s, "human", Phase::Submit, true);
+        let mut value = serde_json::to_value(&s).unwrap();
+        value["pr_delivery"]
+            .as_object_mut()
+            .unwrap()
+            .remove("pr_number");
+        let migrated = Lifecycle::decode(Some(value)).unwrap();
+        assert!(migrated.pr_delivery.is_none());
+        assert!(!migrated.merge_ready("abc"));
+        assert!(migrated.pr_decision.is_none());
     }
 }

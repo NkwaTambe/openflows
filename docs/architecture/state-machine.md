@@ -22,8 +22,7 @@ stateDiagram-v2
     done --> [*]
 ```
 
-Any nonterminal stage can report `blocked` (unless a merge or GitHub review
-delivery is being reconciled). Done is terminal. Returning to planning requires
+Any nonterminal stage can report `blocked` unless a merge is being reconciled. Done is terminal. Returning to planning requires
 uploading a new plan; returning to building invalidates testing and PR evidence.
 Every transition records actor, time, version, previous/next phase and detail in
 history. Operational worker allocation and ticket scheduling remain projections.
@@ -87,9 +86,13 @@ as cryptographic identity. GitHub-only approval does not replace these gates.
 ## Merge and recovery
 
 PR decisions and pending GitHub delivery are written in one lifecycle update.
-SENTINEL retries delivery and acknowledges it atomically. Rejection immediately
-returns the work to building; pending delivery prevents advancement and merge.
-A crash may repeat the same GitHub review, but cannot lose its durable decision.
+SENTINEL retries delivery and acknowledges it atomically. Each queued delivery
+binds the original PR number, revision, head and round. Approval delivery waits
+for the human gate. Human rejection and PR replacement cancel obsolete queued
+approval. Rejection immediately returns work to building; a new phase supersedes
+old queued delivery, so a GitHub outage cannot block retesting. Reports remain in
+history. Pending current approval delivery prevents merge. A crash may repeat a
+GitHub review, but cannot erase its durable decision.
 
 VESSEL checks the current head, all observed CI sources, persisted agent/human
 approvals, and completed review delivery. Empty CI, timeouts, unknown results,
@@ -97,7 +100,9 @@ pending checks or failures cannot authorize a merge. GitHub receives the
 expected head SHA. A persisted merge reservation prevents concurrent rejection
 or rework while that request is in flight.
 
-An unknown network outcome retains its reservation. VESSEL reconciles a confirmed
+A definitive rejected merge response releases its reservation. Merge requests
+are not automatically retried after an ambiguous response. An unknown network
+outcome retains its reservation. VESSEL reconciles a confirmed
 GitHub merge to done, recording GitHub's actual merge commit. An unmerged snapshot
 alone never releases a reservation: the earlier request might still be running.
 An unresolved reservation requires operator investigation; no unsafe automatic
@@ -125,3 +130,8 @@ checks. `bash tests/integration/gated_workflow_test.sh` starts a disposable Redi
 checks a real plan round trip, races two review updates, and injects OOM to verify
 that failed writes leave lifecycle/approvals unchanged. It destroys its test
 container on exit and must not target a production Redis.
+
+Ticketless discovered PRs receive an explicit unmanaged/manual outcome and are
+removed from the automated queue. Discovery skips them until they are linked to
+a ticket; it does not bypass the lifecycle gates. PR review chats use the exact
+revision, head and round, so stale chats cannot suppress a fresh review.

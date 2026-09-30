@@ -88,8 +88,9 @@ Once PLAN.md is written:
 1. Upload the plan to SharedStore: `openflows-harness plan write --file PLAN.md`
 2. Commit the plan: `git add -A && git commit -m "[T-{id}] plan: implementation approach"`
 3. Signal planning complete: `openflows-harness status set plan_ready`
-4. Begin Segment 1
-5. Use `/segment-done` when each segment is complete
+4. Halt and wait for SENTINEL to approve the exact plan revision and review round.
+5. After approval, transition FORGE with `openflows-harness status set building`. Begin Segment 1 only once that transition succeeds.
+6. Use `/segment-done` when each segment is complete
 
 ## Important
 

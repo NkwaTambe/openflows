@@ -157,6 +157,11 @@ pub const REVIEW_TYPE_PLANNING_GATE: &str = "planning_gate";
 /// evaluations (`segment-N-eval.md`) are part of this same review.
 pub const REVIEW_TYPE_PR: &str = "pr_review";
 
+/// Bind PR review state to the exact lifecycle revision, head, and review round.
+pub fn pr_review_namespace(revision: u64, head: &str, round: u64) -> String {
+    format!("pr_review:{revision}:{head}:{round}")
+}
+
 /// Build the review-type-scoped SENTINEL chat binding key.
 /// e.g. `ticket:T-42:chat:sentinel:pr_review`
 pub fn review_chat_key(ticket_id: &str, review_type: &str) -> String {

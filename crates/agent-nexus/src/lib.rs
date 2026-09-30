@@ -8,10 +8,11 @@ use coder_client::{
 use config::{
     state::{
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
-        review_action_key, review_chat_key, review_verdict_key, HeartbeatRecord, KEY_COMMAND_GATE,
-        KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH,
-        KEY_TICKET_RECOVERY_ATTEMPTS, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS,
-        KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS, REVIEW_TYPE_PR,
+        pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
+        HeartbeatRecord, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+        KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
+        KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
+        REVIEW_TYPE_PR,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
 };
@@ -469,6 +470,9 @@ Before significant work, read the relevant skill file to understand the workflow
         let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
 
         for pr in &gh_prs {
+            if !Self::should_discover_pr(store, pr.number, pr.ticket_id.as_deref()).await {
+                continue;
+            }
             if !known_numbers.contains(&pr.number) {
                 if let Some(ref tid) = pr.ticket_id {
                     let already_tracked = pending_prs
@@ -2237,14 +2241,16 @@ Use `openflows-harness` for all coordination:
                     }
                 }
                 Some("submit") => {
-                    if !store
-                        .lifecycle(&ticket.id)
-                        .await
-                        .ok()
-                        .is_some_and(|s| s.pr_number.is_some() && s.pr_decision.is_none())
-                    {
-                        continue;
-                    }
+                    let lifecycle = match store.lifecycle(&ticket.id).await {
+                        Ok(s) if s.pr_number.is_some() && s.pr_decision.is_none() => s,
+                        _ => continue,
+                    };
+                    let review_namespace = pr_review_namespace(
+                        lifecycle.revision,
+                        lifecycle.head.as_deref().unwrap_or(""),
+                        lifecycle.review_round,
+                    );
+                    Self::retire_stale_pr_reviews(store, &ticket.id, &review_namespace).await;
 
                     // ── PR Review: SENTINEL reviews completed work ──
 
@@ -2253,14 +2259,14 @@ Use `openflows-harness` for all coordination:
                     // clear it so a fresh one can be spawned. The PR review uses
                     // its own `pr_review` namespace, distinct from the
                     // `planning_gate` review chat.
-                    let sentinel_chat_key = review_chat_key(&ticket.id, REVIEW_TYPE_PR);
+                    let sentinel_chat_key = review_chat_key(&ticket.id, &review_namespace);
                     let mut existing_sentinel_chat: Option<String> =
                         store.get_typed(&sentinel_chat_key).await;
 
                     if let Some(ref chat_id) = existing_sentinel_chat {
                         match client.get_chat_opt(chat_id).await {
                             Ok(Some(chat)) if matches!(chat.status(), ChatStatus::Waiting) => {
-                                let review_key = review_verdict_key(&ticket.id, REVIEW_TYPE_PR);
+                                let review_key = review_verdict_key(&ticket.id, &review_namespace);
                                 let existing_review: Option<Value> =
                                     store.get_typed(&review_key).await;
                                 // Hardening: only treat a Waiting sentinel chat as
@@ -2305,7 +2311,8 @@ Use `openflows-harness` for all coordination:
                                          — clearing to spawn a fresh PR-review reviewer"
                                     );
                                     store.del(&sentinel_chat_key).await;
-                                    let action_key = review_action_key(&ticket.id, REVIEW_TYPE_PR);
+                                    let action_key =
+                                        review_action_key(&ticket.id, &review_namespace);
                                     store.del(&action_key).await;
                                     existing_sentinel_chat = None;
                                 }
@@ -2317,7 +2324,7 @@ Use `openflows-harness` for all coordination:
                                     "Stored sentinel chat no longer exists — clearing key"
                                 );
                                 store.del(&sentinel_chat_key).await;
-                                let action_key = review_action_key(&ticket.id, REVIEW_TYPE_PR);
+                                let action_key = review_action_key(&ticket.id, &review_namespace);
                                 store.del(&action_key).await;
                                 existing_sentinel_chat = None;
                             }
@@ -2342,7 +2349,7 @@ Use `openflows-harness` for all coordination:
                     }
 
                     // Check if Sentinel already reviewed (approved or rejected)
-                    let review_key = review_verdict_key(&ticket.id, REVIEW_TYPE_PR);
+                    let review_key = review_verdict_key(&ticket.id, &review_namespace);
                     let existing_review: Option<Value> = store.get_typed(&review_key).await;
                     if existing_review.is_some() {
                         debug!(ticket_id = %ticket.id, "Sentinel review already exists, skipping spawn");
@@ -2459,11 +2466,14 @@ Use `openflows-harness` for all coordination:
                          3. Write your full evaluation to a markdown report file (e.g. \
                          `segment-N-eval.md` / `final-review.md`)\n\
                          4. Record your verdict for the controller by running:\n\
-                            `openflows-harness review submit --verdict <approve|reject> --report <path-to-report-md> --revision <revision-from-status-get> --round <review_round-from-status-get> --head <head-from-status-get>`\n\n\
+                            `openflows-harness review submit --verdict <approve|reject> --report <path-to-report-md> --revision {revision} --round {round} --head {head}`\n\n\
                          A `reject` loops back to FORGE for rework in its same chat session; \
                          FORGE re-signals `openflows-harness status set testing` when done.\n\n\
                          **Ticket:** {} — {}\n",
                         ticket.id, ticket.id, ticket.title,
+                        revision = lifecycle.revision,
+                        round = lifecycle.review_round,
+                        head = lifecycle.head.as_deref().unwrap_or(""),
                     );
 
                     let chat_req = coder_client::types::CreateChatRequest {
@@ -3226,13 +3236,16 @@ Use `openflows-harness` for all coordination:
                         let gate_approved: Option<Value> = store.get_typed(&gate_key).await;
                         // A PR-review verdict completes the sentinel's work on the
                         // ticket (planning completion is covered by the gate key above).
-                        let review_key = review_verdict_key(ticket_id, REVIEW_TYPE_PR);
-                        let review_done: Option<Value> = store.get_typed(&review_key).await;
+                        let review_done = store
+                            .lifecycle(ticket_id)
+                            .await
+                            .ok()
+                            .is_some_and(|state| state.pr_decision.is_some());
                         let review_complete = phase
                             .as_deref()
                             .is_some_and(|p| !matches!(p, "plan_ready" | "testing" | "submit"))
                             || gate_approved.is_some()
-                            || review_done.is_some();
+                            || review_done;
                         if review_complete {
                             info!(
                                 worker_id = slot.id,
@@ -3499,6 +3512,48 @@ Use `openflows-harness` for all coordination:
         } else {
             true
         }
+    }
+
+    async fn should_discover_pr(store: &SharedStore, number: u64, ticket_id: Option<&str>) -> bool {
+        ticket_id.is_some_and(|id| !id.is_empty())
+            || store.get(&format!("pr:{number}:unmanaged")).await.is_none()
+    }
+
+    async fn retire_stale_pr_reviews(store: &SharedStore, ticket_id: &str, current: &str) {
+        let active_key = format!("ticket:{ticket_id}:pr_review_namespace");
+        let previous: Option<String> = store.get_typed(&active_key).await;
+        if previous.as_deref() == Some(current) {
+            return;
+        }
+        // Retire legacy bindings as well as the previous round. Current round
+        // keys remain intact when recovering after a process restart.
+        for namespace in [Some(REVIEW_TYPE_PR), previous.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if namespace != current {
+                store.del(&review_chat_key(ticket_id, namespace)).await;
+                store.del(&review_action_key(ticket_id, namespace)).await;
+                store.del(&review_verdict_key(ticket_id, namespace)).await;
+            }
+        }
+        if store
+            .get(&review_chat_key(ticket_id, current))
+            .await
+            .is_none()
+        {
+            let mut slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+            for slot in slots.values_mut() {
+                if slot.id.starts_with("sentinel-")
+                    && matches!(&slot.status, WorkerStatus::Assigned { ticket_id: assigned, .. } | WorkerStatus::Working { ticket_id: assigned, .. } if assigned == ticket_id)
+                {
+                    slot.status = WorkerStatus::Idle;
+                }
+            }
+            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        }
+        store.set(&active_key, json!(current)).await;
     }
 
     /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
@@ -5516,6 +5571,118 @@ mod tests {
         assert!(!NexusNode::sentinel_may_own_shared_chat(
             false, false, false, false, false, true
         ));
+    }
+
+    #[tokio::test]
+    async fn unmanaged_pr_stays_out_of_discovery_until_linked_to_ticket() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set("pr:345:unmanaged", json!({"reason":"no ticket"}))
+            .await;
+        assert!(!NexusNode::should_discover_pr(&store, 345, None).await);
+        assert!(NexusNode::should_discover_pr(&store, 345, Some("T-1")).await);
+        assert!(NexusNode::should_discover_pr(&store, 346, None).await);
+    }
+
+    #[tokio::test]
+    async fn pr_review_bindings_do_not_cross_revision_head_or_round() {
+        let store = SharedStore::new_in_memory();
+        let initial = pr_review_namespace(1, "head-a", 3);
+        store
+            .set(&review_chat_key("T-1", &initial), json!("old-live-chat"))
+            .await;
+        for (revision, head, round) in [(2, "head-a", 3), (1, "head-b", 3), (1, "head-a", 4)] {
+            let namespace = pr_review_namespace(revision, head, round);
+            assert!(store
+                .get(&review_chat_key("T-1", &namespace))
+                .await
+                .is_none());
+        }
+        assert!(store
+            .get(&review_chat_key(
+                "T-1",
+                &pr_review_namespace(1, "head-a", 3)
+            ))
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn pr_review_rotation_retires_old_chat_and_releases_only_its_slot() {
+        let store = SharedStore::new_in_memory();
+        let old = "pr_review:1:old-head:3";
+        store
+            .set("ticket:T-1:pr_review_namespace", json!(old))
+            .await;
+        for namespace in [old, REVIEW_TYPE_PR] {
+            store
+                .set(&review_chat_key("T-1", namespace), json!("live-old-chat"))
+                .await;
+            store
+                .set(&review_action_key("T-1", namespace), json!("pending"))
+                .await;
+            store
+                .set(
+                    &review_verdict_key("T-1", namespace),
+                    json!({"verdict":"reject"}),
+                )
+                .await;
+        }
+        let slots = HashMap::from([
+            (
+                "sentinel-1".to_string(),
+                slot(
+                    "sentinel-1",
+                    WorkerStatus::Assigned {
+                        ticket_id: "T-1".into(),
+                        issue_url: None,
+                    },
+                ),
+            ),
+            (
+                "sentinel-2".to_string(),
+                slot(
+                    "sentinel-2",
+                    WorkerStatus::Assigned {
+                        ticket_id: "T-2".into(),
+                        issue_url: None,
+                    },
+                ),
+            ),
+        ]);
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+        NexusNode::retire_stale_pr_reviews(&store, "T-1", "pr_review:1:new-head:5").await;
+        assert!(store.get(&review_chat_key("T-1", old)).await.is_none());
+        assert!(store.get(&review_action_key("T-1", old)).await.is_none());
+        assert!(store
+            .get(&review_verdict_key("T-1", REVIEW_TYPE_PR))
+            .await
+            .is_none());
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert!(matches!(slots["sentinel-1"].status, WorkerStatus::Idle));
+        assert!(matches!(
+            slots["sentinel-2"].status,
+            WorkerStatus::Assigned { .. }
+        ));
+        let current = "pr_review:1:new-head:5";
+        store
+            .set(&review_chat_key("T-1", current), json!("current-live-chat"))
+            .await;
+        store
+            .set(&review_action_key("T-1", current), json!("pending"))
+            .await;
+        NexusNode::retire_stale_pr_reviews(&store, "T-1", current).await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&review_chat_key("T-1", current))
+                .await
+                .as_deref(),
+            Some("current-live-chat")
+        );
+        assert!(store
+            .get(&review_action_key("T-1", current))
+            .await
+            .is_some());
     }
 
     #[test]
