@@ -101,7 +101,6 @@ dependencies = [
  "notifier",
  "pocketflow-core",
  "provisioner",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
