@@ -135,3 +135,8 @@ Ticketless discovered PRs receive an explicit unmanaged/manual outcome and are
 removed from the automated queue. Discovery skips them until they are linked to
 a ticket; it does not bypass the lifecycle gates. PR review chats use the exact
 revision, head and round, so stale chats cannot suppress a fresh review.
+
+Before rotating a PR reviewer, NEXUS interrupts any running old chat, confirms
+it is no longer running, and archives it before deleting bindings or freeing
+the slot. A still-running chat or Coder API failure retains the binding and
+slot for retry on the next controller poll.

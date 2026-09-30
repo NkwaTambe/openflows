@@ -2250,7 +2250,21 @@ Use `openflows-harness` for all coordination:
                         lifecycle.head.as_deref().unwrap_or(""),
                         lifecycle.review_round,
                     );
-                    Self::retire_stale_pr_reviews(store, &ticket.id, &review_namespace).await;
+                    match Self::retire_stale_pr_reviews(
+                        store,
+                        &client,
+                        &ticket.id,
+                        &review_namespace,
+                    )
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => continue, // Old reviewer has not stopped yet.
+                        Err(error) => {
+                            warn!(ticket_id = %ticket.id, %error, "Could not retire old PR reviewer; retaining its slot");
+                            continue;
+                        }
+                    }
 
                     // ── PR Review: SENTINEL reviews completed work ──
 
@@ -3519,11 +3533,55 @@ Use `openflows-harness` for all coordination:
             || store.get(&format!("pr:{number}:unmanaged")).await.is_none()
     }
 
-    async fn retire_stale_pr_reviews(store: &SharedStore, ticket_id: &str, current: &str) {
+    async fn retire_stale_pr_reviews(
+        store: &SharedStore,
+        client: &CoderClient,
+        ticket_id: &str,
+        current: &str,
+    ) -> Result<bool> {
         let active_key = format!("ticket:{ticket_id}:pr_review_namespace");
         let previous: Option<String> = store.get_typed(&active_key).await;
         if previous.as_deref() == Some(current) {
-            return;
+            return Ok(true);
+        }
+        // Stop and archive every stale chat before deleting any binding or
+        // releasing its workspace. Failures retain all metadata for retry.
+        let mut retired_chats = std::collections::HashSet::new();
+        for namespace in [Some(REVIEW_TYPE_PR), previous.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if namespace == current {
+                continue;
+            }
+            if let Some(chat_id) = store
+                .get_typed::<String>(&review_chat_key(ticket_id, namespace))
+                .await
+            {
+                if !retired_chats.insert(chat_id.clone()) {
+                    continue;
+                }
+                if let Some(chat) = client.get_chat_opt(&chat_id).await? {
+                    if matches!(chat.status(), ChatStatus::Running | ChatStatus::Pending) {
+                        client.interrupt_chat(&chat_id).await?;
+                        // Interrupt acknowledgement alone does not prove the worker
+                        // stopped. Poll again on the next controller tick if needed.
+                        match client.get_chat_opt(&chat_id).await? {
+                            Some(chat)
+                                if matches!(
+                                    chat.status(),
+                                    ChatStatus::Running | ChatStatus::Pending
+                                ) =>
+                            {
+                                return Ok(false)
+                            }
+                            None => continue,
+                            _ => {}
+                        }
+                    }
+                    client.archive_chat(&chat_id).await?;
+                }
+            }
         }
         // Retire legacy bindings as well as the previous round. Current round
         // keys remain intact when recovering after a process restart.
@@ -3554,6 +3612,7 @@ Use `openflows-harness` for all coordination:
             store.set(KEY_WORKER_SLOTS, json!(slots)).await;
         }
         store.set(&active_key, json!(current)).await;
+        Ok(true)
     }
 
     /// Whether a `Waiting` sentinel chat should be treated as orphaned and cleared
@@ -5609,6 +5668,22 @@ mod tests {
 
     #[tokio::test]
     async fn pr_review_rotation_retires_old_chat_and_releases_only_its_slot() {
+        let mut server = mockito::Server::new_async().await;
+        let get = server
+            .mock("GET", "/api/v2/chats/live-old-chat")
+            .with_status(200)
+            .with_body(r#"{"id":"live-old-chat","status":"waiting"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let archive = server
+            .mock("PATCH", "/api/v2/chats/live-old-chat")
+            .match_body(mockito::Matcher::Json(json!({"archived":true})))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = CoderClient::new(&server.url(), "test");
         let store = SharedStore::new_in_memory();
         let old = "pr_review:1:old-head:3";
         store
@@ -5651,7 +5726,16 @@ mod tests {
             ),
         ]);
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-        NexusNode::retire_stale_pr_reviews(&store, "T-1", "pr_review:1:new-head:5").await;
+        assert!(NexusNode::retire_stale_pr_reviews(
+            &store,
+            &client,
+            "T-1",
+            "pr_review:1:new-head:5"
+        )
+        .await
+        .unwrap());
+        get.assert_async().await;
+        archive.assert_async().await;
         assert!(store.get(&review_chat_key("T-1", old)).await.is_none());
         assert!(store.get(&review_action_key("T-1", old)).await.is_none());
         assert!(store
@@ -5671,7 +5755,11 @@ mod tests {
         store
             .set(&review_action_key("T-1", current), json!("pending"))
             .await;
-        NexusNode::retire_stale_pr_reviews(&store, "T-1", current).await;
+        assert!(
+            NexusNode::retire_stale_pr_reviews(&store, &client, "T-1", current)
+                .await
+                .unwrap()
+        );
         assert_eq!(
             store
                 .get_typed::<String>(&review_chat_key("T-1", current))
@@ -5683,6 +5771,145 @@ mod tests {
             .get(&review_action_key("T-1", current))
             .await
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn pr_rotation_keeps_binding_and_slot_when_old_chat_is_running() {
+        let mut server = mockito::Server::new_async().await;
+        let get = server
+            .mock("GET", "/api/v2/chats/old-chat")
+            .with_status(200)
+            .with_body(r#"{"id":"old-chat","status":"running"}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let interrupt = server
+            .mock("POST", "/api/v2/chats/old-chat/interrupt")
+            .with_status(200)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        let old = "pr_review:1:old:3";
+        store
+            .set("ticket:T-1:pr_review_namespace", json!(old))
+            .await;
+        store
+            .set(&review_chat_key("T-1", old), json!("old-chat"))
+            .await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!(HashMap::from([(
+                    "sentinel-1",
+                    slot(
+                        "sentinel-1",
+                        WorkerStatus::Assigned {
+                            ticket_id: "T-1".into(),
+                            issue_url: None
+                        }
+                    )
+                )])),
+            )
+            .await;
+        let client = CoderClient::new(&server.url(), "test");
+        assert!(
+            !NexusNode::retire_stale_pr_reviews(&store, &client, "T-1", "pr_review:1:new:5")
+                .await
+                .unwrap()
+        );
+        assert!(get.matched_async().await);
+        interrupt.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&review_chat_key("T-1", old))
+                .await
+                .as_deref(),
+            Some("old-chat")
+        );
+        let slots: HashMap<String, WorkerSlot> = store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert!(matches!(
+            slots["sentinel-1"].status,
+            WorkerStatus::Assigned { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn pr_rotation_retries_without_releasing_slot_on_coder_failures() {
+        for failure in ["lookup", "interrupt", "archive"] {
+            let mut server = mockito::Server::new_async().await;
+            let status = if failure == "interrupt" {
+                "running"
+            } else {
+                "waiting"
+            };
+            let get = server
+                .mock("GET", "/api/v2/chats/old-chat")
+                .with_status(if failure == "lookup" { 500 } else { 200 })
+                .with_body(json!({"id":"old-chat", "status":status}).to_string())
+                .create_async()
+                .await;
+            let interrupt = server
+                .mock("POST", "/api/v2/chats/old-chat/interrupt")
+                .with_status(500)
+                .expect(if failure == "interrupt" { 1 } else { 0 })
+                .create_async()
+                .await;
+            let archive = server
+                .mock("PATCH", "/api/v2/chats/old-chat")
+                .with_status(500)
+                .expect(if failure == "archive" { 1 } else { 0 })
+                .create_async()
+                .await;
+            let store = SharedStore::new_in_memory();
+            let old = "pr_review:1:old:3";
+            store
+                .set("ticket:T-1:pr_review_namespace", json!(old))
+                .await;
+            store
+                .set(&review_chat_key("T-1", old), json!("old-chat"))
+                .await;
+            store
+                .set(
+                    KEY_WORKER_SLOTS,
+                    json!(HashMap::from([(
+                        "sentinel-1",
+                        slot(
+                            "sentinel-1",
+                            WorkerStatus::Working {
+                                ticket_id: "T-1".into(),
+                                issue_url: None,
+                            }
+                        )
+                    )])),
+                )
+                .await;
+            let client = CoderClient::new(&server.url(), "test");
+            assert!(NexusNode::retire_stale_pr_reviews(
+                &store,
+                &client,
+                "T-1",
+                "pr_review:1:new:5"
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                store
+                    .get_typed::<String>("ticket:T-1:pr_review_namespace")
+                    .await
+                    .as_deref(),
+                Some(old)
+            );
+            assert!(store.get(&review_chat_key("T-1", old)).await.is_some());
+            let slots: HashMap<String, WorkerSlot> =
+                store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+            assert!(matches!(
+                slots["sentinel-1"].status,
+                WorkerStatus::Working { .. }
+            ));
+            get.assert_async().await;
+            interrupt.assert_async().await;
+            archive.assert_async().await;
+        }
     }
 
     #[test]
