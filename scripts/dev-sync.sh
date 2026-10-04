@@ -131,7 +131,7 @@ if command -v docker >/dev/null 2>&1; then
     if [ -n "$NEXUS_CONTAINER" ]; then
         echo "Step 3: Hot-deploying to running workspace ($NEXUS_CONTAINER)..."
         docker cp "$DEV_BINARIES_DIR/openflows" "$NEXUS_CONTAINER:/usr/local/bin/openflows"
-        docker exec "$NEXUS_CONTAINER" chmod +x /usr/local/bin/openflows
+        docker exec -u 0 "$NEXUS_CONTAINER" chmod +x /usr/local/bin/openflows
         echo "✓ Hot-deployed"
         echo ""
         echo "Tip: Restart the controller in the workspace with:"

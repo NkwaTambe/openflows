@@ -350,6 +350,14 @@ async fn handle_tasks_complete(state: &A2AServerState, params: &Value) -> anyhow
                 pair_id
             ));
         }
+    } else if let Some(request) = state.relay.get_task_request(task_id).await {
+        if request.pair_id != pair_id {
+            return Err(anyhow::anyhow!(
+                "tasks/complete pair_id mismatch: task belongs to {} but caller claims {}",
+                request.pair_id,
+                pair_id
+            ));
+        }
     }
 
     state.relay.complete_task(task_id, result).await?;

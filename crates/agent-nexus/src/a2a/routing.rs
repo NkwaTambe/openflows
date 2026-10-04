@@ -401,21 +401,42 @@ impl A2ARelay {
     /// to Redis per the plan (result must be durable before Sentinel sees
     /// it). Returns an error if the task is unknown.
     pub async fn complete_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
-        {
+        let audited_request = self.get_task_request(task_id).await;
+        let pair_id = {
             let tasks = self.tasks.lock().await;
-            if !tasks.contains_key(task_id) {
-                return Err(anyhow!("task not found: {}", task_id));
+            match tasks.get(task_id) {
+                Some(entry) => entry.request.pair_id.clone(),
+                None => audited_request
+                    .as_ref()
+                    .map(|request| request.pair_id.clone())
+                    .ok_or_else(|| anyhow!("task not found: {}", task_id))?,
             }
-        }
+        };
+        let request = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(task_id)
+                .map(|entry| entry.request.clone())
+                .or(audited_request)
+                .ok_or_else(|| anyhow!("task not found: {}", task_id))?
+        };
+        let idempotency_key = request.idempotency_seed()?;
 
         // Mirror the terminal result before publishing the Completed state so
         // Sentinel never observes a completed task without a durable result.
-        self.mirror_result(&result).await?;
+        self.mirror_result(&pair_id, &result).await?;
 
         let mut tasks = self.tasks.lock().await;
         let entry = tasks
-            .get_mut(task_id)
-            .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
+            .entry(task_id.to_string())
+            .or_insert_with(|| TaskEntry {
+                task_id: task_id.to_string(),
+                request,
+                idempotency_key,
+                requester: "audit-recovery".to_string(),
+                state: TaskState::Running,
+                result: None,
+            });
         entry.state = TaskState::Completed;
         entry.result = Some(result);
 
@@ -433,7 +454,33 @@ impl A2ARelay {
     /// and its terminal result once complete.
     pub async fn get_task(&self, task_id: &str) -> Option<TaskEntry> {
         let tasks = self.tasks.lock().await;
-        tasks.get(task_id).cloned()
+        if let Some(entry) = tasks.get(task_id).cloned() {
+            if entry.result.is_some() || matches!(entry.state, TaskState::Completed) {
+                return Some(entry);
+            }
+            drop(tasks);
+
+            if let Some(result) = self.get_task_result(task_id).await {
+                let mut recovered = entry;
+                recovered.state = TaskState::Completed;
+                recovered.result = Some(result);
+                return Some(recovered);
+            }
+            return Some(entry);
+        }
+        drop(tasks);
+
+        let request = self.get_task_request(task_id).await?;
+        let result = self.get_task_result(task_id).await?;
+        let idempotency_key = request.idempotency_seed().ok()?;
+        Some(TaskEntry {
+            task_id: task_id.to_string(),
+            request,
+            idempotency_key,
+            requester: "audit-recovery".to_string(),
+            state: TaskState::Completed,
+            result: Some(result),
+        })
     }
 
     /// Mirror a terminal task result to Redis before acking completion.
@@ -441,8 +488,8 @@ impl A2ARelay {
     /// - `pair:{pair_id}:verification` (latest result)
     /// - `audit:a2a:{task_id}:result` (immutable result artifact)
     /// - `audit:a2a:{task_id}:request` (original request for replay)
-    pub async fn mirror_result(&self, result: &VerifyResult) -> Result<()> {
-        let verification_key = a2a_protocol::verification_key(&result.executor.workspace);
+    pub async fn mirror_result(&self, pair_id: &str, result: &VerifyResult) -> Result<()> {
+        let verification_key = a2a_protocol::verification_key(pair_id);
 
         // Mirror to pair:{pair_id}:verification
         self.store
@@ -457,7 +504,7 @@ impl A2ARelay {
 
         debug!(
             task_id = %result.task_id,
-            pair_id = %result.executor.workspace,
+            pair_id,
             "Result mirrored to Redis"
         );
         Ok(())
@@ -519,6 +566,23 @@ impl A2ARelay {
             Some(req) => Some(req),
             None => {
                 warn!(task_id, "Request not found in audit trail");
+                None
+            }
+        }
+    }
+
+    /// Get a task's stored result for recovery after a relay restart.
+    pub async fn get_task_result(&self, task_id: &str) -> Option<VerifyResult> {
+        let audit_result_key = format!("{}:result", a2a_protocol::audit_task_key(task_id));
+        match self
+            .store
+            .get(&audit_result_key)
+            .await
+            .and_then(|v| serde_json::from_value::<VerifyResult>(v).ok())
+        {
+            Some(result) => Some(result),
+            None => {
+                warn!(task_id, "Result not found in audit trail");
                 None
             }
         }
@@ -591,6 +655,14 @@ impl A2ARelay {
     /// (not Completed) so the executor's poller can observe "cancelled" and
     /// kill the child process before the executor submits its own result.
     pub async fn cancel_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
+        let pair_id = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(task_id)
+                .map(|entry| entry.request.pair_id.clone())
+                .ok_or_else(|| anyhow!("task not found: {}", task_id))?
+        };
+
         // Set the cancel flag
         let mut tokens = self.cancel_tokens.lock().await;
         match tokens.get(task_id) {
@@ -603,7 +675,7 @@ impl A2ARelay {
         }
         drop(tokens);
 
-        self.mirror_result(&result).await?;
+        self.mirror_result(&pair_id, &result).await?;
 
         // Publish the Cancelled state only after the result is durable.
         let mut tasks = self.tasks.lock().await;
