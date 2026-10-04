@@ -1945,8 +1945,11 @@ Use `openflows-harness` for all coordination:
                                 ))
                                 .await
                             {
-                                let target = if testing { "submit" } else { "building" };
-                                let prompt=format!("Review gates passed. Run `openflows-harness status set {target}`. Read status get for the approved revision and head. After submit, open/record the PR and wait for PR review and human approval.");
+                                let prompt = if testing {
+                                    "Testing review gates passed. Read status get for the approved revision and head; once lifecycle shows submit, open/record the PR and wait for PR review and human approval.".to_string()
+                                } else {
+                                    "Review gates passed. Run `openflows-harness status set building`. Read status get for the approved revision and head.".to_string()
+                                };
                                 if client
                                     .send_chat_message(
                                         &chat,
@@ -2239,15 +2242,46 @@ Use `openflows-harness` for all coordination:
                 }
                 Some("submit") => {
                     let lifecycle = match store.lifecycle(&ticket.id).await {
-                        Ok(s)
-                            if s.phase == config::lifecycle::Phase::Submit
-                                && s.pr_number.is_some()
-                                && s.pr_decision.is_none() =>
-                        {
-                            s
-                        }
+                        Ok(s) if s.phase == config::lifecycle::Phase::Submit => s,
                         _ => continue,
                     };
+                    if lifecycle.pr_number.is_none() {
+                        if lifecycle.test_decision.as_ref().is_some_and(|d| d.approved) {
+                            let key = format!(
+                                "ticket:{}:gate_notified:{}:{}:{}",
+                                ticket.id,
+                                lifecycle.phase.as_str(),
+                                lifecycle.revision,
+                                lifecycle.review_round
+                            );
+                            if store.get(&key).await.is_none() {
+                                if let Some(chat) = store
+                                    .get_typed::<String>(&full_ticket_key(
+                                        &ticket.id,
+                                        KEY_TICKET_CHAT,
+                                        "forge",
+                                    ))
+                                    .await
+                                {
+                                    let prompt = "Testing review gates passed and lifecycle is already submit. Continue work: open or update the PR, record it with `openflows-harness pr opened`, then wait for PR review, human approval, and CI.";
+                                    if client
+                                        .send_chat_message(
+                                            &chat,
+                                            vec![coder_client::types::ChatInputPart::text(prompt)],
+                                        )
+                                        .await
+                                        .is_ok()
+                                    {
+                                        store.set(&key, json!(true)).await;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if lifecycle.pr_decision.is_some() {
+                        continue;
+                    }
                     let review_namespace = pr_review_namespace(
                         lifecycle.revision,
                         lifecycle.head.as_deref().unwrap_or(""),
@@ -5664,7 +5698,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let notify = server
             .mock("POST", "/api/v2/chats/forge-chat/messages")
-            .match_body(mockito::Matcher::Regex("status set submit".into()))
+            .match_body(mockito::Matcher::Regex("already submit".into()))
             .with_status(200)
             .with_body(r#"{"id":"notification"}"#)
             .expect(1)
@@ -5681,10 +5715,10 @@ mod tests {
         }))
         .unwrap();
         let state = config::lifecycle::Lifecycle {
-            phase: config::lifecycle::Phase::Testing,
+            phase: config::lifecycle::Phase::Submit,
             revision: 1,
-            review_round: 1,
-            version: 3,
+            review_round: 2,
+            version: 4,
             plan: "# Plan".into(),
             head: Some("abc".into()),
             verified_head: Some("abc".into()),

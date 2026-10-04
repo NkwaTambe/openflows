@@ -351,6 +351,14 @@ impl Lifecycle {
                     next.clear_work();
                     next.feedback = None;
                 }
+                if approved && phase == Phase::Testing && actor == "sentinel" {
+                    // The verified testing verdict and permission to publish
+                    // commit atomically, matching plan approval.
+                    next.phase = Phase::Submit;
+                    next.review_round += 1;
+                    next.pr_delivery = None;
+                    next.feedback = None;
+                }
                 if !approved {
                     // A human veto supersedes a queued SENTINEL approval.
                     if actor == "human" {
@@ -602,6 +610,79 @@ mod tests {
     }
 
     #[test]
+    fn testing_approval_enters_submit_in_the_same_transition() {
+        let mut state = building();
+        run(
+            &mut state,
+            "forge",
+            Event::Move {
+                phase: Phase::Testing,
+                head: Some("candidate".into()),
+            },
+        );
+        run(
+            &mut state,
+            "sentinel",
+            Event::Verified {
+                head: "candidate".into(),
+                task: "task-1".into(),
+            },
+        );
+
+        decide(&mut state, "sentinel", Phase::Testing, true);
+
+        assert_eq!(state.phase, Phase::Submit);
+        assert!(state.test_decision.as_ref().unwrap().approved);
+        assert_eq!(state.review_round, 3);
+        assert_eq!(state.version, 6);
+        let transition = state.history.last().unwrap();
+        assert_eq!(transition.actor, "sentinel");
+        assert_eq!(transition.from, Phase::Testing);
+        assert_eq!(transition.to, Phase::Submit);
+        assert!(state
+            .apply(
+                "sentinel",
+                Event::Decide {
+                    phase: Phase::Testing,
+                    round: 2,
+                    revision: 1,
+                    approved: true,
+                    report: "duplicate".into(),
+                    head: Some("candidate".into()),
+                },
+                2
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn human_testing_approval_cannot_replace_sentinel_testing_approval() {
+        let mut state = building();
+        run(
+            &mut state,
+            "forge",
+            Event::Move {
+                phase: Phase::Testing,
+                head: Some("candidate".into()),
+            },
+        );
+        run(
+            &mut state,
+            "sentinel",
+            Event::Verified {
+                head: "candidate".into(),
+                task: "task-1".into(),
+            },
+        );
+
+        decide(&mut state, "human", Phase::Testing, true);
+
+        assert_eq!(state.phase, Phase::Testing);
+        assert!(state.test_decision.is_none());
+        assert!(state.test_human.as_ref().unwrap().approved);
+    }
+
+    #[test]
     fn plan_approval_cannot_override_a_later_blocker() {
         let state = Lifecycle {
             phase: Phase::PlanReady,
@@ -721,39 +802,39 @@ mod tests {
             .is_err(),
             "A2A success without SENTINEL approval is insufficient"
         );
-        decide(&mut s, "sentinel", Phase::Testing, true);
-        assert!(s.test_human.is_none(), "human testing review is deferred");
         for mismatch in ["revision", "round", "head", "task"] {
             let mut stale = s.clone();
+            let mut event = Event::Decide {
+                round: stale.review_round,
+                phase: Phase::Testing,
+                approved: true,
+                report: "ok".into(),
+                revision: stale.revision,
+                head: stale.head.clone(),
+            };
             match mismatch {
-                "revision" => stale.test_decision.as_mut().unwrap().revision += 1,
-                "round" => stale.test_decision.as_mut().unwrap().round += 1,
+                "revision" => {
+                    if let Event::Decide { revision, .. } = &mut event {
+                        *revision += 1;
+                    }
+                }
+                "round" => {
+                    if let Event::Decide { round, .. } = &mut event {
+                        *round += 1;
+                    }
+                }
                 "head" => stale.verified_head = Some("different-head".into()),
                 "task" => stale.verification_task = None,
                 _ => unreachable!(),
             }
             assert!(
-                stale
-                    .apply(
-                        "forge",
-                        Event::Move {
-                            phase: Phase::Submit,
-                            head: None,
-                        },
-                        1
-                    )
-                    .is_err(),
+                stale.apply("sentinel", event, 1).is_err(),
                 "must reject missing or stale {mismatch} evidence"
             );
         }
-        run(
-            &mut s,
-            "forge",
-            Event::Move {
-                phase: Phase::Submit,
-                head: None,
-            },
-        );
+        decide(&mut s, "sentinel", Phase::Testing, true);
+        assert_eq!(s.phase, Phase::Submit);
+        assert!(s.test_human.is_none(), "human testing review is deferred");
         run(&mut s, "forge", Event::Pr { number: 42 });
         decide(&mut s, "sentinel", Phase::Submit, true);
         assert!(!s.merge_ready("abc"));
@@ -1008,15 +1089,6 @@ mod tests {
             },
         );
         decide(&mut s, "sentinel", Phase::Testing, true);
-        decide(&mut s, "human", Phase::Testing, true);
-        run(
-            &mut s,
-            "forge",
-            Event::Move {
-                phase: Phase::Submit,
-                head: None,
-            },
-        );
         run(&mut s, "forge", Event::Pr { number: 1 });
         decide(&mut s, "sentinel", Phase::Submit, true);
         decide(&mut s, "human", Phase::Submit, true);
@@ -1068,15 +1140,6 @@ mod tests {
             },
         );
         decide(&mut s, "sentinel", Phase::Testing, true);
-        decide(&mut s, "human", Phase::Testing, true);
-        run(
-            &mut s,
-            "forge",
-            Event::Move {
-                phase: Phase::Submit,
-                head: None,
-            },
-        );
         run(&mut s, "forge", Event::Pr { number: 42 });
         s
     }
