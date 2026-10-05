@@ -9,8 +9,8 @@ use coder_client::CoderClient;
 use config::{
     state::{
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
-        full_ticket_key_flat, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT, KEY_TICKET_DEPLOYMENT,
-        KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
+        full_ticket_key_flat, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
+        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
@@ -584,7 +584,8 @@ impl Node for VesselNode {
         debug!("VESSEL prep: reading pending PRs and CI readiness");
 
         let repository: Option<String> = store.get_typed("repository").await;
-        let pending_prs: Option<Vec<Value>> = store.get_typed("pending_prs").await;
+        let pending_prs: Option<Vec<Value>> = store.get_typed(KEY_PENDING_PRS).await;
+        let merge_ready_prs: Option<Vec<Value>> = store.get_typed(KEY_MERGE_READY_PRS).await;
         let ci_readiness: Option<crate::types::CiReadiness> = store.get_typed("ci_readiness").await;
 
         let (owner, repo) = parse_repository(repository.as_deref());
@@ -610,7 +611,7 @@ impl Node for VesselNode {
         Ok(json!({
             "owner": owner,
             "repo": repo,
-            "pending_prs": pending_prs.unwrap_or_default(),
+            "pending_prs": merge_ready_prs.unwrap_or_else(|| pending_prs.unwrap_or_default()),
             "has_ci_workflows": has_ci_workflows,
         }))
     }
@@ -3349,6 +3350,36 @@ mod tests {
         assert_eq!(result["owner"], "test-owner");
         assert_eq!(result["repo"], "test-repo");
         assert_eq!(result["pending_prs"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_prep_prefers_merge_ready_prs_handoff() {
+        let store = SharedStore::new_in_memory();
+        store.set("repository", json!("test-owner/test-repo")).await;
+        store
+            .set(
+                KEY_PENDING_PRS,
+                json!([
+                    {"number": 1, "ticket_id": "T-1"},
+                    {"number": 2, "ticket_id": "T-2"},
+                ]),
+            )
+            .await;
+        store
+            .set(
+                KEY_MERGE_READY_PRS,
+                json!([{"number": 2, "ticket_id": "T-2"}]),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let result = node.prep(&store).await.unwrap();
+
+        let pending = result["pending_prs"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["number"].as_u64(), Some(2));
     }
 
     #[tokio::test]

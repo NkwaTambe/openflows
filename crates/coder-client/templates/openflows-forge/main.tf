@@ -225,6 +225,31 @@ resource "coder_agent" "main" {
       sudo cp /home/coder/.git-credentials /root/.git-credentials
       sudo chmod 600 /root/.git-credentials
       log "Configured git credentials for GitHub push auth"
+
+      # Install the GitHub CLI so the agent can open PRs with `gh pr create`
+      # instead of hand-rolling the REST API. Auth uses the same external-auth
+      # token that backs the git credential helper above, so a logged-in gh
+      # works for both the agent user and the sudo'd root (their $HOME differ).
+      if ! command -v gh >/dev/null 2>&1; then
+        # Ubuntu base image (codercom/enterprise-base): prefer the official
+        # GitHub apt repo (always current), fall back to the distro package.
+        sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
+        sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
+        if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+        fi
+        sudo apt-get update -qq >/dev/null 2>&1 || true
+        sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
+      fi
+      if command -v gh >/dev/null 2>&1; then
+        echo "$${GIT_TOKEN}" | gh auth login --with-token 2>/dev/null || true
+        sudo -H bash -c "echo '$${GIT_TOKEN}' | gh auth login --with-token" 2>/dev/null || true
+        log "Configured GitHub CLI (gh) auth from external-auth token"
+      else
+        log "WARNING: could not install gh CLI — agent must fall back to the REST API for PR creation"
+      fi
     else
       log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
     fi

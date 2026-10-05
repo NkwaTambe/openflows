@@ -9,8 +9,8 @@ use config::{
     state::{
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
-        HeartbeatRecord, KEY_COMMAND_GATE, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-        KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
+        HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
+        KEY_TICKET_CHAT, KEY_TICKET_CHAT_ACTION, KEY_TICKET_DISPATCH, KEY_TICKET_RECOVERY_ATTEMPTS,
         KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_STATUS, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Registry, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_MERGE_PRS, ACTION_NO_WORK,
@@ -3696,6 +3696,107 @@ Use `openflows-harness` for all coordination:
             && !Self::gate_approved(store, ticket_id, "planning").await
     }
 
+    async fn pending_prs_ready_for_vessel(
+        store: &SharedStore,
+        pending_prs: &[Value],
+    ) -> Vec<Value> {
+        let mut ready = Vec::new();
+        for pr in pending_prs {
+            let pr_number = pr["number"].as_u64().unwrap_or(0);
+            let Some(ticket_id) = pr["ticket_id"]
+                .as_str()
+                .filter(|tid| !tid.trim().is_empty())
+            else {
+                warn!(
+                    pr_number,
+                    "Holding PR with no ticket_id; manual lifecycle association is required"
+                );
+                continue;
+            };
+
+            let rework_key = full_ticket_key(ticket_id, KEY_TICKET_REWORK_DIRECTIVE, "forge");
+            if store.get(&rework_key).await.is_some() {
+                debug!(
+                    pr_number,
+                    ticket_id, "Holding PR for persisted FORGE rework directive"
+                );
+                continue;
+            }
+
+            let lifecycle = match store.lifecycle(ticket_id).await {
+                Ok(state) => state,
+                Err(e) => {
+                    warn!(
+                        pr_number,
+                        ticket_id,
+                        error = %e,
+                        "Holding PR because lifecycle could not be read"
+                    );
+                    continue;
+                }
+            };
+
+            if lifecycle.phase == config::lifecycle::Phase::Submit {
+                ready.push(pr.clone());
+                continue;
+            }
+
+            let reason = format!(
+                "PR #{} is pending but ticket {} is in {}. Move the lifecycle through the state machine before merge resumes.",
+                pr_number,
+                ticket_id,
+                lifecycle.phase.as_str()
+            );
+            if lifecycle.phase == config::lifecycle::Phase::Blocked
+                && lifecycle.feedback.as_deref() == Some(reason.as_str())
+            {
+                debug!(
+                    pr_number,
+                    ticket_id, "PR is already held by the lifecycle block"
+                );
+                continue;
+            }
+
+            if lifecycle.phase == config::lifecycle::Phase::Blocked {
+                debug!(
+                    pr_number,
+                    ticket_id, "PR is already blocked; preserving existing blocker"
+                );
+                continue;
+            }
+
+            match store
+                .transition(
+                    ticket_id,
+                    lifecycle.version,
+                    "nexus",
+                    config::lifecycle::Event::Block {
+                        reason: reason.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        pr_number,
+                        ticket_id,
+                        reason,
+                        "Holding non-submit PR and continuing controller dispatch"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        pr_number,
+                        ticket_id,
+                        error = %e,
+                        "Could not block non-submit PR this pass"
+                    );
+                }
+            }
+        }
+        ready
+    }
+
     async fn workspace_link_for_worker(
         &self,
         store: &SharedStore,
@@ -4400,10 +4501,11 @@ impl Node for NexusNode {
             store.set(KEY_WORKER_SLOTS, json!(worker_slots)).await;
         }
 
-        let mut open_prs = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
+        let pending_prs_snapshot = store.get(KEY_PENDING_PRS).await.unwrap_or(json!([]));
         let command_gate = store.get(KEY_COMMAND_GATE).await.unwrap_or(json!({}));
 
-        let mut pending_prs_vec: Vec<Value> = open_prs.as_array().cloned().unwrap_or_default();
+        let mut pending_prs_vec: Vec<Value> =
+            pending_prs_snapshot.as_array().cloned().unwrap_or_default();
         let worker_slots_map: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let mut recovery = Self::reconcile(&tickets, &worker_slots_map, &pending_prs_vec);
@@ -4727,10 +4829,8 @@ impl Node for NexusNode {
                                 }));
                             }
                         }
-                        // Persist the restored PRs and refresh the value returned in
-                        // the prep context so discovery stays consistent.
+                        // Persist the restored PRs so discovery stays consistent.
                         store.set(KEY_PENDING_PRS, json!(pending_prs_vec)).await;
-                        open_prs = json!(pending_prs_vec);
                     }
                 }
             }
@@ -4760,6 +4860,12 @@ impl Node for NexusNode {
                 );
             }
         }
+
+        let merge_ready_prs = Self::pending_prs_ready_for_vessel(store, &pending_prs_vec).await;
+        store
+            .set(KEY_MERGE_READY_PRS, json!(merge_ready_prs.clone()))
+            .await;
+        let open_prs = json!(merge_ready_prs);
 
         Ok(json!({
             "tickets": tickets,
@@ -5393,6 +5499,125 @@ mod tests {
         assert_eq!(decision.action, "work_assigned");
         assert_eq!(decision.assign_to.as_deref(), Some("forge-1"));
         assert_eq!(decision.ticket_id.as_deref(), Some("T-049"));
+    }
+
+    #[tokio::test]
+    async fn held_pending_pr_does_not_block_next_assignable_ticket() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                KEY_PENDING_PRS,
+                json!([{
+                    "number": 41,
+                    "ticket_id": "T-041",
+                    "head_sha": "abc",
+                    "head_branch": "forge-1/T-041"
+                }]),
+            )
+            .await;
+        store
+            .set(
+                &full_ticket_key_flat("T-041", KEY_TICKET_STATUS),
+                json!(config::lifecycle::Lifecycle {
+                    phase: config::lifecycle::Phase::Building,
+                    version: 2,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-042",
+                    "title": "Next issue",
+                    "body": "",
+                    "priority": 0,
+                    "status": { "type": "open" }
+                }]),
+            )
+            .await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "idle" },
+                        "workspace_id": null
+                    }
+                }),
+            )
+            .await;
+
+        let pending: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap();
+        let merge_ready = NexusNode::pending_prs_ready_for_vessel(&store, &pending).await;
+        store
+            .set(KEY_MERGE_READY_PRS, json!(merge_ready.clone()))
+            .await;
+
+        assert!(merge_ready.is_empty());
+        let held = store.lifecycle("T-041").await.unwrap();
+        assert_eq!(held.phase, config::lifecycle::Phase::Blocked);
+        assert!(held
+            .feedback
+            .as_deref()
+            .unwrap()
+            .contains("PR #41 is pending"));
+
+        let node = NexusNode::new("nexus.agent.md", "registry.json");
+        let context = json!({
+            "assignable_tickets": [{
+                "id": "T-042",
+                "title": "Next issue",
+                "body": "",
+                "priority": 0,
+                "status": { "type": "open" }
+            }],
+            "open_prs": merge_ready,
+            "worker_slots": {
+                "forge-1": {
+                    "id": "forge-1",
+                    "status": { "type": "idle" },
+                    "workspace_id": null
+                }
+            },
+            "rework_provision": []
+        });
+        let decision: AgentDecision = serde_json::from_value(node.exec(context).await.unwrap())
+            .expect("nexus exec returns an AgentDecision");
+        assert_eq!(decision.action, "work_assigned");
+        assert_eq!(decision.ticket_id.as_deref(), Some("T-042"));
+    }
+
+    #[tokio::test]
+    async fn submit_pending_pr_remains_eligible_for_vessel() {
+        let store = SharedStore::new_in_memory();
+        let pending = vec![json!({
+            "number": 42,
+            "ticket_id": "T-042",
+            "head_sha": "abc",
+            "head_branch": "forge-1/T-042"
+        })];
+        store
+            .set(
+                &full_ticket_key_flat("T-042", KEY_TICKET_STATUS),
+                json!(config::lifecycle::Lifecycle {
+                    phase: config::lifecycle::Phase::Submit,
+                    version: 4,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let ready = NexusNode::pending_prs_ready_for_vessel(&store, &pending).await;
+
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0]["number"].as_u64(), Some(42));
+        assert_eq!(
+            store.lifecycle("T-042").await.unwrap().phase,
+            config::lifecycle::Phase::Submit
+        );
     }
 
     #[test]
