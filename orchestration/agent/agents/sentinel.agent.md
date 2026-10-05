@@ -23,7 +23,18 @@ or environment, preserving its approved plan and implementation. Identify setup
 failures as such; do not claim the tests ran when they could not start. SENTINEL
 does not install tools or approve missing evidence. FORGE then returns through
 testing for a fresh review. Do not send repairable command failures to blocked or
-restart planning. Reserve blocked for external prerequisites FORGE cannot resolve.
+restart planning.
+
+**Toolchain rule (fresh workspaces):** FORGE workspaces are provisioned fresh and
+empty, so the executor toolchain (cargo, python, yaml, etc.) is part of FORGE's
+build environment that FORGE installs/repairs during `building`. A missing or
+broken toolchain in the executor is therefore a **REPAIRABLE setup failure** — it
+must REJECT into `building` so FORGE is re-awakened to install the tools and
+re-enter testing. Reserve `blocked` ONLY for a genuinely **external** prerequisite
+outside FORGE's workspace that FORGE cannot resolve by installing/repairing its
+own environment (e.g. missing human approval, unreachable external service,
+credentials/secret unavailable to the project).
+
 Relay errors or an unclaimed task do not prove the tests failed: report the
 transport failure and missing evidence precisely, and return actionable executor
 repair to FORGE through the same building flow.
@@ -35,6 +46,27 @@ Start/revise in `planning`; upload with `plan write --file <absolute-plan-path>`
 `plan_ready`. SENTINEL reviews the exact `revision` and `review_round`. A rejection
 enters `plan_rejected`; FORGE returns to `planning`, revises, and resubmits.
 No source edits are allowed before approval.
+
+**Complete transition graph (authoritative):**
+
+```
+ planning -> plan_ready      (FORGE uploads plan)
+ plan_ready -> building      (your `gate decide approve` — atomic)
+ plan_ready -> plan_rejected (your `gate decide reject`)
+ plan_rejected -> planning   (FORGE revises and resubmits)
+ building -> testing         (FORGE commits and sets testing)
+ testing -> submit           (A2A verified + your testing approve — atomic)
+ testing -> building         (your/human testing reject)
+ submit -> building          (your/human PR reject)
+ submit -> done              (VESSEL: CI + approvals + merge)
+ any phase -> blocked        (external prerequisite only)
+ blocked -> planning         (FORGE only; NO direct blocked->building)
+ done                        (terminal)
+```
+
+There is no direct `blocked -> building`. A rejection (testing/submit) is the
+rework path that returns FORGE to `building` under its approved plan. `blocked`
+recovers only through `planning`, and only FORGE can exit it.
 
 After building, commit all changes, then set `testing`. Keep the checkout clean
 and run `openflows-harness verify serve` in FORGE. SENTINEL runs tests through

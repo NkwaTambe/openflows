@@ -29,6 +29,29 @@ plan into source just to upload it; the harness reads the supplied path directly
 
 `planning -> plan_ready -> building -> testing -> submit -> done`
 
+Complete transition graph (authoritative):
+
+```
+ planning -> plan_ready      (upload plan, set plan_ready)
+ plan_ready -> building      (SENTINEL `gate decide approve` — atomic)
+ plan_ready -> plan_rejected (SENTINEL `gate decide reject`)
+ plan_rejected -> planning   (FORGE revises and resubmits)
+ building -> testing         (FORGE commits, clean checkout, set testing)
+ testing -> submit           (A2A verified + SENTINEL testing approve — atomic)
+ testing -> building         (SENTINEL/human testing reject, or FORGE rework)
+ submit -> building          (SENTINEL/human PR reject, or FORGE rework)
+ submit -> done              (VESSEL: CI + SENTINEL + human PR approve + merge)
+ any phase -> blocked        (external prerequisite only)
+ blocked -> planning         (FORGE only, once blocker clears; NO direct blocked->building)
+ done                        (terminal — no exit)
+```
+
+Rework always returns through `building`, then repeats `testing` and both review
+gates; never jump from `building` directly to `submit`. There is no path from
+`blocked` straight to `building` — recovery returns through `planning` and a
+fresh plan approval. NEXUS re-awakens FORGE when a ticket is blocked so it can
+resume autonomously once the blocker clears.
+
 - **Planning:** FORGE reads source, tests, repository metadata, deployment
   configuration, and runtime capabilities before writing a grounded plan.
   Read-only inspection needs no approved plan. Writing the plan and coordination
@@ -64,18 +87,25 @@ Testing and submit freeze source. Rework returns through the permitted
 `building` transition, then repeats testing and both review gates; never jump
 from building directly to submit. An old approval cannot override `blocked`.
 
-Use `blocked` for an operational failure and record exact evidence and an
-answerable unblock question. Recovery returns to planning through the
-authorized lifecycle. Do not retry configuration failures or policy denials in
-a loop, or delegate denied work to bypass the hook. A denied read-only planning
-probe should be reported to NEXUS with the command and rejection.
+A rejected test/command/setup failure returns FORGE to `building` under the
+approved plan so it is re-awakened to fix code, command setup or environment.
+Identify setup failures as such; do not claim the tests ran when they could not
+start. FORGE workspaces are provisioned fresh and empty, so the executor
+toolchain (cargo, python, yaml, etc.) is part of FORGE's build environment that
+FORGE installs/repairs during `building` — a missing or broken toolchain in the
+executor is a REPAIRABLE setup failure and must reject into `building`, never
+`blocked`. Use `blocked` only for a genuinely **external** prerequisite outside
+FORGE's workspace that FORGE cannot resolve by installing/repairing its own
+environment (e.g. missing human approval, unreachable external service,
+credentials/secret unavailable to the project), and record exact evidence and an
+answerable unblock question. Recovery returns to planning
+through the authorized `blocked -> planning` transition (FORGE only) — there is
+no direct `blocked -> building`. Do not retry configuration failures or policy
+denials in a loop, or delegate denied work to bypass the hook. A denied
+read-only planning probe should be reported to NEXUS with the command and
+rejection.
 
 After submitting for review, wait for the orchestrator notification without
 polling loops. Retry only genuinely transient transport failures with bounded
 backoff. Keep handoffs in the harness with `handoff write --contract <file>
 --notes <notes>`. Never dump credentials or secrets into coordination artifacts.
-
-During testing SENTINEL may use `status set blocked` for an infrastructure or
-verification-policy blocker. Record the error and missing evidence in review.md
-and stop; reserve rejection/rework for actionable code defects. FORGE recovers
-from blocked through planning after the infrastructure is repaired.

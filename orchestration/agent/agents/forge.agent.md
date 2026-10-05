@@ -82,7 +82,30 @@ of these phases — any other value is rejected by the harness and wastes your w
 | `building` | Implementing after SENTINEL approves the plan |
 | `testing` | Running the test suite and verifying behavior |
 | `submit` | PR is open and SENTINEL is reviewing the completed work |
-| `blocked` | Cannot proceed — include an exact, answerable question |
+| `blocked` | External prerequisite you cannot resolve — include an exact, answerable question |
+
+**Complete transition graph (authoritative):**
+
+```
+ planning -> plan_ready      (you upload plan, then set plan_ready)
+ plan_ready -> building      (SENTINEL `gate decide approve` — atomic; you confirm via status get)
+ plan_ready -> plan_rejected (SENTINEL `gate decide reject`)
+ plan_rejected -> planning   (you revise and resubmit)
+ building -> testing         (you commit, clean checkout, set testing)
+ testing -> submit           (A2A verified + SENTINEL testing approve — atomic)
+ testing -> building         (SENTINEL/human testing reject, or your rework)
+ submit -> building          (SENTINEL/human PR reject, or your rework)
+ submit -> done              (VESSEL: CI + SENTINEL + human PR approve + merge)
+ any phase -> blocked        (external prerequisite only)
+ blocked -> planning         (you only, once the blocker clears; NO direct blocked->building)
+ done                        (terminal)
+```
+
+Rework always returns through `building`, then repeats `testing` and both review
+gates — never jump from `building` straight to `submit`. `blocked` has **no**
+direct path to `building`: once the blocker clears you must set `planning`,
+revise/upload the plan, and get a fresh approval. NEXUS re-awakens you when a
+ticket is blocked so you can resume autonomously.
 
 Do NOT invent other phase values and do NOT write a `STATUS.json` file expecting the
 controller to read it. The controller reads the harness command's Redis writes, not local

@@ -2164,7 +2164,7 @@ Use `openflows-harness` for all coordination:
 
                     // Build a prompt that instructs SENTINEL to review the plan
                     let plan_review_prompt = if testing {
-                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features` to run tests in FORGE. Pass separate tokens after --; never quote the entire command as one --argv value. Correct tokenization errors before declaring a policy blocker. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Map approved-plan acceptance criteria to the commands, results, and any gaps in review.md. For infrastructure failure or unavailable workspace toolchain prerequisites, record the blocker in review.md, run `openflows-harness status set blocked`, and stop instead of rejecting into building. Unfamiliar test tools are allowed in the temporary verification checkout. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Successful A2A verification plus SENTINEL approval allows submit; human testing review is TODO and does not block submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
+                        format!("Testing review for {}. Review implementation against approved plan revision {} at head {}. Read `openflows-harness plan read` and `status get`. Use `openflows-harness verify request --expect-exit 0 -- cargo test --workspace --all-features` to run tests in FORGE. Pass separate tokens after --; never quote the entire command as one --argv value. Correct tokenization errors before declaring a policy blocker. Write review.md. Decide with `openflows-harness gate decide --phase testing --revision {} --head {} --round {} --verdict approve --report review.md` (or reject). Map approved-plan acceptance criteria to the commands, results, and any gaps in review.md. A rejection returns FORGE to building to fix the code, command setup or environment, preserving its approved plan; do not claim the tests ran when they could not start — identify setup failures as such. IMPORTANT: FORGE workspaces are provisioned fresh and empty, so the executor toolchain (cargo, python, yaml, etc.) is part of FORGE's build environment and FORGE installs/repairs it during building. A missing or broken toolchain in the executor is therefore a REPAIRABLE setup failure FORGE must fix — REJECT into building so FORGE is re-awakened to install the tools and re-enter testing. Reserve `status set blocked` ONLY for a genuinely EXTERNAL prerequisite outside FORGE's workspace that FORGE cannot resolve by installing/repairing its own environment (e.g. missing human approval, unreachable external service, credentials/secret unavailable to the project). Unfamiliar test tools are allowed in the temporary verification checkout. Known destructive/control-plane operations are denied. A successful echo is only a transport probe, not acceptance evidence. Successful A2A verification plus SENTINEL approval allows submit; human testing review is TODO and does not block submit.",ticket.id,lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.revision,lifecycle.head.as_deref().unwrap_or(""),lifecycle.review_round)
                     } else {
                         format!("Review plan revision {} for {}. Read `openflows-harness plan read`. Write review.md with actionable feedback. Run `openflows-harness gate decide --phase plan_ready --revision {} --round {} --verdict approve --report review.md` (or reject). Do not change source. A rejection is recorded and returned to FORGE.",lifecycle.revision,ticket.id,lifecycle.revision,lifecycle.review_round)
                     };
@@ -2589,6 +2589,63 @@ Use `openflows-harness` for all coordination:
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+                Some("blocked") => {
+                    // Blocked is not terminal: it recovers through planning (see
+                    // config::lifecycle). The worker set it while awaiting an
+                    // external prerequisite or an answerable unblock question.
+                    // Re-awaken FORGE once so it can resume autonomously: once the
+                    // blocker clears it must move back to planning (blocked ->
+                    // planning), revise/upload the plan and set plan_ready. Without
+                    // this notification the ticket sits blocked forever.
+                    let lifecycle = match store.lifecycle(&ticket.id).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(error = %e, "Cannot load lifecycle for blocked ticket");
+                            continue;
+                        }
+                    };
+                    if lifecycle.phase != config::lifecycle::Phase::Blocked {
+                        continue; // Already recovered.
+                    }
+                    let key = format!(
+                        "ticket:{}:blocked_notified:{}",
+                        ticket.id, lifecycle.version
+                    );
+                    if store.get(&key).await.is_some() {
+                        continue;
+                    }
+                    if let Some(chat) = store
+                        .get_typed::<String>(&full_ticket_key(
+                            &ticket.id,
+                            KEY_TICKET_CHAT,
+                            "forge",
+                        ))
+                        .await
+                    {
+                        let feedback = lifecycle.feedback.as_deref().unwrap_or(
+                            "A blocker was recorded (see review.md / `status get`).",
+                        );
+                        let prompt = format!(
+                            "Your ticket is BLOCKED. Blocker: {feedback}\n\
+                             Read `openflows-harness status get` for the exact blocker and evidence.\n\
+                             Recovery returns through planning: once the blocker is resolved, run \
+                             `openflows-harness status set planning`, revise/upload the plan, and set \
+                             `plan_ready` for a fresh SENTINEL review. Never jump from blocked straight \
+                             to building. If the blocker is external and still unresolved, preserve it \
+                             and wait — do not loop."
+                        );
+                        if client
+                            .send_chat_message(
+                                &chat,
+                                vec![coder_client::types::ChatInputPart::text(prompt)],
+                            )
+                            .await
+                            .is_ok()
+                        {
+                            store.set(&key, json!(true)).await;
                         }
                     }
                 }
