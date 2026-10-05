@@ -555,7 +555,7 @@ fn has_nonstandard_plan_upload(tool_name: &str, input: &Value, chat_id: &str) ->
         } else {
             return false;
         };
-        if args.get(0).map(String::as_str) != Some("plan")
+        if args.first().map(String::as_str) != Some("plan")
             || args.get(1).map(String::as_str) != Some("write")
         {
             return false;

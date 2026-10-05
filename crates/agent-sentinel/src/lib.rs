@@ -482,7 +482,7 @@ impl Node for SentinelNode {
             {
                 continue;
             }
-            Self::record_review_delivery(store, ticket, &state, &decision).await?;
+            Self::record_review_delivery(store, ticket, &state, decision).await?;
             any_approved |= decision.approved;
         }
         Ok(Action::new(if any_approved {

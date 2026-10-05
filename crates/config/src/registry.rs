@@ -541,7 +541,7 @@ mod tests {
             r#""max_instances":2,"instances":1"#,
             r#""model":"ignored-model""#,
             r#""plan_mode":true"#,
-            r#""max_instnaces":2"#,
+            r#""unsupported_field":2"#,
         ] {
             let input = format!(r#"{{"team":[{{"id":"forge",{fields}}}]}}"#);
             assert!(serde_json::from_str::<Registry>(&input).is_err(), "{input}");

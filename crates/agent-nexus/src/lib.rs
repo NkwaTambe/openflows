@@ -2618,16 +2618,13 @@ Use `openflows-harness` for all coordination:
                         continue;
                     }
                     if let Some(chat) = store
-                        .get_typed::<String>(&full_ticket_key(
-                            &ticket.id,
-                            KEY_TICKET_CHAT,
-                            "forge",
-                        ))
+                        .get_typed::<String>(&full_ticket_key(&ticket.id, KEY_TICKET_CHAT, "forge"))
                         .await
                     {
-                        let feedback = lifecycle.feedback.as_deref().unwrap_or(
-                            "A blocker was recorded (see review.md / `status get`).",
-                        );
+                        let feedback = lifecycle
+                            .feedback
+                            .as_deref()
+                            .unwrap_or("A blocker was recorded (see review.md / `status get`).");
                         let prompt = format!(
                             "Your ticket is BLOCKED. Blocker: {feedback}\n\
                              Read `openflows-harness status get` for the exact blocker and evidence.\n\
@@ -2781,7 +2778,7 @@ Use `openflows-harness` for all coordination:
             };
 
             if let Err(e) = self
-                .ensure_workspace_instructions(store, &client, &workspace_id, &lore_worker_id)
+                .ensure_workspace_instructions(store, client, &workspace_id, &lore_worker_id)
                 .await
             {
                 warn!(error = %e, "Lore instructions unavailable; deferring chat");
