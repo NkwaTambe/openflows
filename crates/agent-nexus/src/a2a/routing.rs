@@ -9,6 +9,7 @@ use a2a_protocol::{VerifyProgressEvent, VerifyRequest, VerifyResult};
 use anyhow::{anyhow, Result};
 use pocketflow_core::SharedStore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -213,6 +214,47 @@ impl A2ARelay {
         self.sessions.read().await.get(&key).cloned()
     }
 
+    pub fn pair_token_key(pair_id: &str) -> String {
+        format!("pair:{pair_id}:a2a_token_sha256")
+    }
+
+    pub fn hash_pair_token(token: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(token.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub async fn record_pair_token(&self, pair_id: &str, token: &str) -> Result<()> {
+        anyhow::ensure!(!pair_id.trim().is_empty(), "pair_id must not be empty");
+        anyhow::ensure!(!token.trim().is_empty(), "pair token must not be empty");
+        self.store
+            .set(
+                &Self::pair_token_key(pair_id),
+                serde_json::json!(Self::hash_pair_token(token)),
+            )
+            .await;
+        Ok(())
+    }
+
+    pub async fn verify_pair_token(&self, pair_id: &str, token: &str) -> Result<()> {
+        anyhow::ensure!(!pair_id.trim().is_empty(), "pair_id must not be empty");
+        anyhow::ensure!(
+            !token.trim().is_empty(),
+            "A2A pair token is required; reprovision Sentinel/FORGE workspaces"
+        );
+        let expected: Option<String> = self.store.get_typed(&Self::pair_token_key(pair_id)).await;
+        let Some(expected) = expected else {
+            return Err(anyhow!(
+                "A2A pair token is not registered for {pair_id}; reprovision Sentinel/FORGE workspaces"
+            ));
+        };
+        anyhow::ensure!(
+            expected == Self::hash_pair_token(token),
+            "A2A pair token mismatch for {pair_id}"
+        );
+        Ok(())
+    }
+
     /// Validate a verify request: check allowlist, cwd, pair_id match.
     /// Returns error if validation fails (caller logs to audit:a2a:rejected).
     ///
@@ -226,16 +268,9 @@ impl A2ARelay {
         req: &VerifyRequest,
         requester_pair_id: &str,
     ) -> Result<()> {
-        // Rule 1: Requester and request must agree on pair_id. In v1 the
-        // requester is caller-supplied (self-declared) — this check prevents
-        // accidental mismatches between a misconfigured client's pair_id and
-        // the pair_id it writes into the request body.  It is NOT a
-        // cryptographic authorization: a workspace on the Docker network
-        // can supply any value here.
-        //
-        // TODO(v2): verify requester_pair_id against a workspace identity
-        // token (plan task 2) so the relay can enforce pair-scoped access
-        // without trusting self-declared values.
+        // Rule 1: Requester and request must agree on pair_id. HTTP callers
+        // are authenticated before this point with the pair token provisioned
+        // by Nexus; this sync check still catches accidental internal misuse.
         if req.pair_id != requester_pair_id {
             return Err(anyhow!(
                 "pair_id mismatch: request says {}, requester is {}",
@@ -245,9 +280,7 @@ impl A2ARelay {
         }
 
         // Rule 2: Command allowlist
-        if !a2a_protocol::is_allowlisted(&req.argv) {
-            return Err(anyhow!("command not allowlisted: {}", req.argv.join(" ")));
-        }
+        a2a_protocol::validate_command_argv(&req.argv)?;
 
         // Rule 3: cwd validation
         // Only "repo" and "worktree" are allowed; nothing else.
@@ -284,14 +317,18 @@ impl A2ARelay {
     ) -> Result<String> {
         let idempotency_key = req.idempotency_seed()?;
 
-        // Dedup: reuse the existing task_id for an identical (pair, body).
-        if let Some(task_id) = self.idempotency.lock().await.get(&idempotency_key) {
-            debug!(
-                task_id = %task_id,
-                pair_id = %req.pair_id,
-                "Task already exists (dedup)"
-            );
-            return Ok(task_id.clone());
+        // Serialize lookup, terminal replacement, and insertion with task state.
+        // All multi-map operations acquire tasks before idempotency before ts.
+        let mut tasks = self.tasks.lock().await;
+        let mut idempotency = self.idempotency.lock().await;
+        let mut idempotency_ts = self.idempotency_ts.lock().await;
+        if let Some(task_id) = idempotency.get(&idempotency_key) {
+            if tasks
+                .get(task_id)
+                .is_some_and(|task| matches!(task.state, TaskState::Pending | TaskState::Running))
+            {
+                return Ok(task_id.clone());
+            }
         }
 
         // Generate new task_id (uuid v4)
@@ -306,16 +343,13 @@ impl A2ARelay {
             result: None,
         };
 
-        let mut tasks = self.tasks.lock().await;
         tasks.insert(task_id.clone(), entry);
-        self.idempotency
-            .lock()
-            .await
-            .insert(idempotency_key.clone(), task_id.clone());
-        self.idempotency_ts
-            .lock()
-            .await
-            .insert(idempotency_key, std::time::Instant::now());
+        idempotency.insert(idempotency_key.clone(), task_id.clone());
+        idempotency_ts.insert(idempotency_key, std::time::Instant::now());
+
+        drop(idempotency_ts);
+        drop(idempotency);
+        drop(tasks);
 
         // Mirror the request to the audit trail so it can be replayed later
         let _ = self.mirror_request(&task_id, req).await;
@@ -367,17 +401,44 @@ impl A2ARelay {
     /// to Redis per the plan (result must be durable before Sentinel sees
     /// it). Returns an error if the task is unknown.
     pub async fn complete_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
+        let audited_request = self.get_task_request(task_id).await;
+        let pair_id = {
+            let tasks = self.tasks.lock().await;
+            match tasks.get(task_id) {
+                Some(entry) => entry.request.pair_id.clone(),
+                None => audited_request
+                    .as_ref()
+                    .map(|request| request.pair_id.clone())
+                    .ok_or_else(|| anyhow!("task not found: {}", task_id))?,
+            }
+        };
+        let request = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(task_id)
+                .map(|entry| entry.request.clone())
+                .or(audited_request)
+                .ok_or_else(|| anyhow!("task not found: {}", task_id))?
+        };
+        let idempotency_key = request.idempotency_seed()?;
+
+        // Mirror the terminal result before publishing the Completed state so
+        // Sentinel never observes a completed task without a durable result.
+        self.mirror_result(&pair_id, &result).await?;
+
         let mut tasks = self.tasks.lock().await;
         let entry = tasks
-            .get_mut(task_id)
-            .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
+            .entry(task_id.to_string())
+            .or_insert_with(|| TaskEntry {
+                task_id: task_id.to_string(),
+                request,
+                idempotency_key,
+                requester: "audit-recovery".to_string(),
+                state: TaskState::Running,
+                result: None,
+            });
         entry.state = TaskState::Completed;
-        entry.result = Some(result.clone());
-
-        // Mirror the terminal result to Redis before releasing the lock so a
-        // concurrent `tasks/get` from Sentinel never observes a completed task
-        // without a durable result.
-        self.mirror_result(&result).await?;
+        entry.result = Some(result);
 
         debug!(task_id, "Task completed and result mirrored");
         Ok(())
@@ -393,7 +454,33 @@ impl A2ARelay {
     /// and its terminal result once complete.
     pub async fn get_task(&self, task_id: &str) -> Option<TaskEntry> {
         let tasks = self.tasks.lock().await;
-        tasks.get(task_id).cloned()
+        if let Some(entry) = tasks.get(task_id).cloned() {
+            if entry.result.is_some() || matches!(entry.state, TaskState::Completed) {
+                return Some(entry);
+            }
+            drop(tasks);
+
+            if let Some(result) = self.get_task_result(task_id).await {
+                let mut recovered = entry;
+                recovered.state = TaskState::Completed;
+                recovered.result = Some(result);
+                return Some(recovered);
+            }
+            return Some(entry);
+        }
+        drop(tasks);
+
+        let request = self.get_task_request(task_id).await?;
+        let result = self.get_task_result(task_id).await?;
+        let idempotency_key = request.idempotency_seed().ok()?;
+        Some(TaskEntry {
+            task_id: task_id.to_string(),
+            request,
+            idempotency_key,
+            requester: "audit-recovery".to_string(),
+            state: TaskState::Completed,
+            result: Some(result),
+        })
     }
 
     /// Mirror a terminal task result to Redis before acking completion.
@@ -401,8 +488,8 @@ impl A2ARelay {
     /// - `pair:{pair_id}:verification` (latest result)
     /// - `audit:a2a:{task_id}:result` (immutable result artifact)
     /// - `audit:a2a:{task_id}:request` (original request for replay)
-    pub async fn mirror_result(&self, result: &VerifyResult) -> Result<()> {
-        let verification_key = a2a_protocol::verification_key(&result.executor.workspace);
+    pub async fn mirror_result(&self, pair_id: &str, result: &VerifyResult) -> Result<()> {
+        let verification_key = a2a_protocol::verification_key(pair_id);
 
         // Mirror to pair:{pair_id}:verification
         self.store
@@ -417,7 +504,7 @@ impl A2ARelay {
 
         debug!(
             task_id = %result.task_id,
-            pair_id = %result.executor.workspace,
+            pair_id,
             "Result mirrored to Redis"
         );
         Ok(())
@@ -441,43 +528,29 @@ impl A2ARelay {
         const IDEMPOTENCY_TTL_SECS: u64 = 3600; // 1 hour
         let now = std::time::Instant::now();
 
-        let stale_keys: Vec<String> = {
-            let ts = self.idempotency_ts.lock().await;
-            ts.iter()
-                .filter(|(_, instant)| {
-                    now.duration_since(**instant).as_secs() > IDEMPOTENCY_TTL_SECS
-                })
-                .map(|(k, _)| k.clone())
-                .collect()
-        };
-
-        let to_evict: Vec<(String, String)> = {
-            let idempotency = self.idempotency.lock().await;
-            let tasks = self.tasks.lock().await;
-            stale_keys
-                .iter()
-                .filter_map(|key| {
-                    let task_id = idempotency.get(key)?;
-                    let should_evict = match tasks.get(task_id) {
-                        Some(t) => matches!(t.state, TaskState::Completed | TaskState::Cancelled),
-                        None => true,
-                    };
-                    if should_evict {
-                        Some((key.clone(), task_id.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
-
+        // Inspect and evict under the same locks as enqueue. A stale snapshot
+        // must never remove a replacement task's deduplication mapping.
+        let mut tasks = self.tasks.lock().await;
         let mut idempotency = self.idempotency.lock().await;
         let mut ts = self.idempotency_ts.lock().await;
-        let mut tasks = self.tasks.lock().await;
-        for (key, task_id) in to_evict {
-            idempotency.remove(&key);
+        let stale_keys: Vec<String> = ts
+            .iter()
+            .filter(|(_, inserted)| now.duration_since(**inserted).as_secs() > IDEMPOTENCY_TTL_SECS)
+            .filter(|(key, _)| {
+                idempotency
+                    .get(*key)
+                    .and_then(|id| tasks.get(id))
+                    .is_none_or(|task| {
+                        matches!(task.state, TaskState::Completed | TaskState::Cancelled)
+                    })
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            if let Some(task_id) = idempotency.remove(&key) {
+                tasks.remove(&task_id);
+            }
             ts.remove(&key);
-            tasks.remove(&task_id);
         }
     }
 
@@ -493,6 +566,23 @@ impl A2ARelay {
             Some(req) => Some(req),
             None => {
                 warn!(task_id, "Request not found in audit trail");
+                None
+            }
+        }
+    }
+
+    /// Get a task's stored result for recovery after a relay restart.
+    pub async fn get_task_result(&self, task_id: &str) -> Option<VerifyResult> {
+        let audit_result_key = format!("{}:result", a2a_protocol::audit_task_key(task_id));
+        match self
+            .store
+            .get(&audit_result_key)
+            .await
+            .and_then(|v| serde_json::from_value::<VerifyResult>(v).ok())
+        {
+            Some(result) => Some(result),
+            None => {
+                warn!(task_id, "Result not found in audit trail");
                 None
             }
         }
@@ -565,6 +655,14 @@ impl A2ARelay {
     /// (not Completed) so the executor's poller can observe "cancelled" and
     /// kill the child process before the executor submits its own result.
     pub async fn cancel_task(&self, task_id: &str, result: VerifyResult) -> Result<()> {
+        let pair_id = {
+            let tasks = self.tasks.lock().await;
+            tasks
+                .get(task_id)
+                .map(|entry| entry.request.pair_id.clone())
+                .ok_or_else(|| anyhow!("task not found: {}", task_id))?
+        };
+
         // Set the cancel flag
         let mut tokens = self.cancel_tokens.lock().await;
         match tokens.get(task_id) {
@@ -577,15 +675,14 @@ impl A2ARelay {
         }
         drop(tokens);
 
-        // Transition task state to Cancelled and store result
+        self.mirror_result(&pair_id, &result).await?;
+
+        // Publish the Cancelled state only after the result is durable.
         let mut tasks = self.tasks.lock().await;
         if let Some(entry) = tasks.get_mut(task_id) {
             entry.state = TaskState::Cancelled;
-            entry.result = Some(result.clone());
+            entry.result = Some(result);
         }
-        drop(tasks);
-
-        self.mirror_result(&result).await?;
         debug!(task_id, "Task cancelled and result mirrored");
         Ok(())
     }
