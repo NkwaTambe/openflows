@@ -39,7 +39,7 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 
 ## Step 1 — Create a GitHub App
 
-OpenFlows agents authenticate to your GitHub repos (including private ones) through a GitHub App. Create a new one at **https://github.com/settings/apps/new**:
+OpenFlows agents authenticate to your GitHub repos (including private ones) through a GitHub App. Create a new one at https://github.com/settings/apps/new
 
 > **Important:** If your repository belongs to an organization, you must create the GitHub App directly within that organization's settings (`https://github.com/organizations/<your-org>/settings/apps`), not your personal account.
 
@@ -159,7 +159,7 @@ OpenFlows agents need at least one model.
 
 ## Step 7 — Test the AI setup
 
-Open **http://localhost:7080/agents** and confirm agents/models show up. Say "hello" in the chat to verify the model responds.
+Open **http://localhost:7080/agents** and confirm agents/models show up.
 
 ---
 
