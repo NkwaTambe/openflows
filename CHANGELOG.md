@@ -3,6 +3,48 @@
 All notable changes to this project will be documented in this file.
 <!-- markdownlint-disable line-length no-bare-urls ul-style emphasis-style -->
 
+## [1.6.0] - 2026-10-06
+
+### Features
+
+- *(vessel)* Implement rework provisioning for tickets without live FORGE chat
+
+
+
+
+
+
+- *(uncategorized)* Implement PR-state lifecycle monitor and address review directive
+
+
+
+
+
+
+### Bug Fixes
+
+- *(lifecycle)* Enforce reviewed state transitions and merge gates
+
+
+
+
+
+
+### Refactor
+
+- *(skills)* Improve FORGE and SENTINEL planning and review processes
+
+
+
+
+
+
+
+
+**Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.5.8...openflows-1.6.0
+
+
+
 ## [1.5.8] - 2026-09-22
 
 ### Bug Fixes
