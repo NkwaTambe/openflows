@@ -656,21 +656,37 @@ impl CoderClient {
             }
         }
 
-        let output = cmd
-            .output()
-            .await
-            .context("Failed to run coder templates push")?;
+        let output = match cmd.output().await {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "Failed to run coder templates push: the `coder` CLI is not on your PATH. \
+                     Install it (curl -fsSL https://coder.com/install.sh | sh) and re-run bootstrap."
+                )
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to run coder templates push: {e}")
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !output.status.success() {
-            warn!(
+            let err = anyhow::anyhow!(
+                "coder templates push for template '{}' failed (exit {}). \
+                 Verify the session token has template management permissions. stderr: {}",
                 name,
-                stderr = %stderr,
-                stdout = %stdout,
-                "coder templates push returned non-zero exit code"
+                output.status,
+                if stderr.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    stderr.trim()
+                }
             );
+            // Clean up temp directory before returning the error
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            return Err(err);
         } else {
             info!(name, stderr = %stderr, "coder templates push succeeded");
         }
