@@ -1,8 +1,8 @@
-# OpenFlows — Quick Start (Local Development)
+# OpenFlows — Manual Setup & Reference
 
-Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and how it works, see the [README](README.md).
+Most people only need the [Quick Start](../quick_start.md) (`./scripts/setup.sh` does everything below automatically). Use this page to understand what the script does, run the steps by hand, or look up hooks, roles, configuration and troubleshooting.
 
-> **Working directory:** all commands run from the **project root** (the directory containing `docker-compose.yml`). No need to `cd` into subdirectories.
+> **Working directory:** run all commands from the **project root** (the directory containing `docker-compose.yml`).
 
 ## Contents
 
@@ -13,10 +13,9 @@ Get OpenFlows running on a fresh machine in 10 steps. For what OpenFlows is and 
 - [Step 4 — Sign in with GitHub](#step-4--sign-in-with-github)
 - [Step 5 — Get your Coder session token](#step-5--get-your-coder-session-token)
 - [Step 6 — Configure an LLM model](#step-6--configure-an-llm-model)
-- [Step 7 — Test the AI setup](#step-7--test-the-ai-setup)
-- [Step 8 — Bootstrap](#step-8--bootstrap)
-- [Step 9 — Add a tenant](#step-9--add-a-tenant)
-- [Step 10 — Run the controller](#step-10--run-the-controller)
+- [Step 7 — Bootstrap](#step-7--bootstrap)
+- [Step 8 — Add a tenant](#step-8--add-a-tenant)
+- [Step 9 — Let the controller run](#step-9--let-the-controller-run)
 - [Verify it's working](#verify-its-working)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Configuration](#configuration)
@@ -70,7 +69,7 @@ Fill in the required values:
 | `CODER_CHAT_HOOK_SECRET` | The shared signing secret for lifecycle hooks. Generate 32+ random bytes: `openssl rand -hex 32`. The bundled stack requires it before enabling hooks (see [Lifecycle hooks](#lifecycle-hooks)). |
 | `CODER_SESSION_TOKEN` | Leave empty for now — you'll fill it in [Step 5](#step-5--get-your-coder-session-token). |
 
-> **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 9](#step-9--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team> --fleet <N>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
+> **Note:** The target repo is **not** configured in `.env`. It is bound per-tenant in [Step 8](#step-8--add-a-tenant) via `./scripts/prod.sh tenant <owner/repo> --name <team> --fleet <N>`. Each tenant gets its own nexus workspace and controller scoped to that repo.
 
 Then set the three GitHub external auth values in `.env` from [Step 1](#step-1--create-a-github-app):
 
@@ -157,13 +156,7 @@ OpenFlows agents need at least one model.
 
 ---
 
-## Step 7 — Test the AI setup
-
-Open **http://localhost:7080/agents** and confirm agents/models show up. Say "hello" in the chat to verify the model responds.
-
----
-
-## Step 8 — Bootstrap
+## Step 7 — Bootstrap
 
 Run the one-time setup to initialize Coder with the OpenFlows templates and config:
 
@@ -177,7 +170,7 @@ Confirm the templates were pushed at **http://localhost:7080/templates**.
 
 ---
 
-## Step 9 — Add a tenant
+## Step 8 — Add a tenant
 
 Bind a GitHub repo to OpenFlows. A tenant is scoped to a single `owner/repo` and provisions its own nexus workspace + controller:
 
@@ -199,11 +192,9 @@ You'll see the tenant's nexus workspace under **http://localhost:7080/workspaces
 
 > **Note:** Each tenant is isolated (per-tenant Redis namespaces, separate workspaces/controllers). The model supports multiple tenants; running several concurrently is part of the design and still being validated — start with one tenant per controller host for now.
 
-> **Upgrading from an earlier setup?** Tenant workspaces created before this change were built with `start_controller=false` and are returned unchanged if you re-run `tenant add`. Recreate an existing tenant's workspace **once** to pick up `start_controller=true` (the controller then auto-starts inside it). The same applies to **`--fleet`**: `tenant add` on an existing nexus workspace leaves its build parameters (including the fleet) unchanged, so the fleet value only applies to newly added tenants, or after you recreate the tenant's workspace. New tenants get these automatically — nothing extra to do.
-
 ---
 
-## Step 10 — Let the controller run
+## Step 9 — Let the controller run
 
 The controller runs **inside the tenant's nexus workspace** and auto-starts when the workspace is ready. You don't run it on your machine — the workspace was created with `start_controller` enabled, and its `GITHUB_REPOSITORY`/`OPENFLOWS_TENANT` are injected from the tenant you added.
 
@@ -229,7 +220,7 @@ Lifecycle hooks let OpenFlows observe and steer agent behaviour as it happens. T
 
 ### Verify hooks are working
 
-After [Step 10](#step-10--run-the-controller), confirm the consumer started and the stack is not logging `InvalidAudience`. For explicit confirmation, set `OPENFLOWS_HOOK_LOGS=true` in `.env`, restart the controller, and watch for:
+After [Step 9](#step-9--let-the-controller-run), confirm the consumer started and the stack is not logging `InvalidAudience`. For explicit confirmation, set `OPENFLOWS_HOOK_LOGS=true` in `.env`, restart the controller, and watch for:
 
 ```text
 INFO ... Coder lifecycle hook consumer started
@@ -276,6 +267,9 @@ These are optional — the defaults work out of the box. Only touch them if you 
 | `CODER_ADMIN_PASSWORD` | `Op3nFl0ws!` | Must be ≥8 chars with upper, lower, digit, and special char — otherwise bootstrap silently falls back to the default. |
 | `REDIS_URL` | `redis://localhost:6379` | Set only if you host Redis elsewhere. |
 | `CODER_URL` | `http://localhost:7080` | Set only if you host Coder elsewhere. |
+| `CODER_PORT` / `REDIS_PORT` | `7080` / `6379` | Host ports for Coder and Redis. Change if the defaults are taken. |
+| `CODER_MAX_TOKEN_LIFETIME` / `CODER_DEFAULT_TOKEN_LIFETIME` | `8760h` | Coder's own default cap is 7 days, which would expire `CODER_SESSION_TOKEN` weekly. |
+| `OPENFLOWS_LLM_PROVIDER` / `OPENFLOWS_LLM_API_KEY` / `OPENFLOWS_LLM_MODEL` | unset | Read by `./scripts/setup.sh` for non-interactive LLM setup (`anthropic`, `openai`, `openrouter`, `google`). |
 | `OPENFLOWS_TENANT` | `default` | Namespace for Redis keys. |
 | `CODER_CHAT_HOOK_SECRET` | required | Generate 32+ random bytes, for example `openssl rand -hex 32`; hook URL/experiment/bind values are wired automatically. |
 | `OPENFLOWS_HOOK_URL` | `http://openflows-nexus:3001/experimental/hooks/chat` | Single source of truth for the hook endpoint, shared between Coder and the consumer. The consumer picks it up via bootstrap; after changing it on an existing deployment, recreate the Nexus workspace (see [Rotating the secret](#rotating-the-secret)). |
@@ -393,7 +387,7 @@ Verify inside a workspace **without printing the token**: `test -s ~/.git-creden
 
 ## More
 
-- **Full docs:** [README.md](README.md)
-- **Testing & debugging:** [testing_quick_start.md](testing_quick_start.md)
-- **Token acquisition:** [token_guide.md](token_guide.md)
-- **Lifecycle hooks (design):** [docs/experiments/hook-driven-state-derivation.md](docs/experiments/hook-driven-state-derivation.md) and [docs/experiments/coder-lifecycle-hooks-feedback.md](docs/experiments/coder-lifecycle-hooks-feedback.md)
+- **Full docs:** [README.md](../README.md)
+- **Testing & debugging:** [testing_quick_start.md](../testing_quick_start.md)
+- **Token acquisition:** [token_guide.md](../token_guide.md)
+- **Lifecycle hooks (design):** [docs/experiments/hook-driven-state-derivation.md](experiments/hook-driven-state-derivation.md) and [docs/experiments/coder-lifecycle-hooks-feedback.md](experiments/coder-lifecycle-hooks-feedback.md)
