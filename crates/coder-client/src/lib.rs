@@ -664,6 +664,7 @@ impl CoderClient {
             info!(template_name = %name, "Creating new template via coder CLI");
         }
 
+        
         // Write archive to temp directory
         let temp_dir = std::env::temp_dir().join(format!("coder-template-{}", name));
         let _ = std::fs::remove_dir_all(&temp_dir);
