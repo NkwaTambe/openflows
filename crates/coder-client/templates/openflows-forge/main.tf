@@ -262,7 +262,7 @@ resource "coder_agent" "main" {
       # another process could read. Failures are fatal, never swallowed.
       printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
         || { log "FATAL: gh auth login failed for user coder"; exit 1; }
-      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'read -r tok && printf "%s" "$tok" | gh auth login --hostname github.com --git-protocol https --with-token' \
+      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'IFS= read -r tok || [ -n "$tok" ] || exit 1; printf "%s" "$tok" | gh auth login --hostname github.com --git-protocol https --with-token' \
         || { log "FATAL: gh auth login failed for user root"; exit 1; }
     else
       log "WARNING: GitHub CLI (gh) unavailable — agent should push via git and open the PR through the REST API or GitHub UI"
