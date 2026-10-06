@@ -125,7 +125,10 @@ run_openflows() {
     if ! command -v "$bin" >/dev/null 2>&1 && [ ! -x "$bin" ]; then
         echo "❌ openflows binary not found"
         echo ""
-        echo "Build it with:"
+        echo "Install it with:"
+        echo "  curl -fsSL https://get.openflows.dev | bash"
+        echo ""
+        echo "Or build from source:"
         echo "  cargo build --release -p openflows"
         exit 1
     fi
