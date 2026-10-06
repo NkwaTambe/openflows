@@ -7,12 +7,55 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- *(docs)* Add comprehensive state machine whitepaper detailing lifecycle and roles
+
+
+
+
+
+
+
+  by @Christiantyemele
+
 - *(vessel)* Implement rework provisioning for tickets without live FORGE chat
 
 
 
 
 
+
+
+  by @Christian Yemele
+
+- *(uncategorized)* Add NeedsReview state to PR monitor and enhance review handling in VesselNode
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(uncategorized)* Introduce rework directive handling and review type namespaces for SENTINEL
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(uncategorized)* Implement /ci_fix directive handling for CI failures
+
+
+
+
+
+
+
+  by @Christian Yemele
 
 - *(uncategorized)* Implement PR-state lifecycle monitor and address review directive
 
@@ -21,7 +64,188 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @Christian Yemele
+
 ### Bug Fixes
+
+- *(a2a)* Authenticate verification pairs
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(coder)* Provision forge verification toolchain and PATH
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(coder)* Use immutable pair token parameter
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(coder)* Allow ephemeral a2a pair token parameter
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(coder-client)* Surface real stderr on coder templates push failure
+
+
+
+
+
+
+
+  by @ndefokou
+
+- *(controller)* Bound redis and coder provisioning waits
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(forge)* Read root gh token across EOF without failing
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(forge)* Keep gh best-effort and pass token via stdin
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(forge)* Hard-fail GitHub credential inheritance in workspace startup
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(forge)* Make branch-mismatch marker write non-fatal in startup
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(forge)* Flag branch mismatch when rework cannot reach the PR branch
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(forge)* Make branch-switch failure non-fatal in workspace startup
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(forge)* Accept valid PR branches and stop fabricating missing PR branch
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(forge)* Sanitize branch and avoid detached HEAD in workspace startup
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(github)* Deserialize reviewer user object into login for reviews and comments
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(hygiene)* Removed unwanted docs
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(lifecycle)* Refine handling of blocked state and clarify transition rules
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(lifecycle)* Invalidate obsolete reviews and recover rejected merges
+
+
+
+
+
+
+  by @NkwaTambe
 
 - *(lifecycle)* Enforce reviewed state transitions and merge gates
 
@@ -29,6 +253,177 @@ All notable changes to this project will be documented in this file.
 
 
 
+
+  by @NkwaTambe
+
+- *(merge)* Withhold non-submit PRs without clearing ticket progress
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(merge)* Gate VESSEL on merge-ready PRs and hold non-submit PRs
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(nexus)* Stop stale reviewer before releasing its slot
+
+
+
+
+
+
+  by @NkwaTambe
+
+- *(nexus)* Restore rework PR under the rework ticket id
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(nexus)* Only restore rework PRs for provisionable tickets and match directive PR
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(nexus)* Skip escalated tickets and restore PR branch for rework provisioning
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(nexus)* Find rework directives on InProgress tickets and verify forge chat liveness
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(nexus)* Keep rework directive until chat created; stop escalated PR reentry
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(review)* Enforce SENTINEL role on review submit and validate verdict PR
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(routing)* Enhance task completion handling and recovery from audit trail
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(state-machine)* Refine lifecycle transitions and improve testing approval handling
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(verification)* Simplify execution and return failures to building
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(verification)* Hand off project environments and recover infrastructure failures
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(verification)* Reuse forge checkout and recover review execution
+
+
+
+
+
+
+
+  by @Christiantyemele
+
+- *(vessel)* Remove unused reqwest dependency
+
+
+
+
+
+
+
+  by @Chrstian Yemele
+
+- *(vessel)* Close review-gate gaps in timeout, fallback, and rework dispatch
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(uncategorized)* Update review command documentation to clarify PR review verdict namespace
+
+
+
+
+
+
+
+  by @Christian Yemele
 
 ### Refactor
 
@@ -40,6 +435,40 @@ All notable changes to this project will be documented in this file.
 
 
 
+  by @Christiantyemele
+
+### Styling
+
+- *(nexus)* Run rustfmt on rework provisioning code
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+- *(uncategorized)* Apply rustfmt formatting
+
+
+
+
+
+
+
+  by @Christian Yemele
+
+
+
+
+### Contributors
+
+- @Christian
+- @Christiantyemele
+- @Chrstian
+- @NkwaTambe
+- @ndefokou
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.5.8...openflows-1.6.0
 
@@ -72,12 +501,6 @@ All notable changes to this project will be documented in this file.
   by @NkwaTambe
 
 
-
-
-### Contributors
-
-- @NkwaTambe
-- @test
 
 **Full Changelog**: https://github.com/The-AgenticFlow/openflows/compare/openflows-1.5.7...openflows-1.5.8
 
