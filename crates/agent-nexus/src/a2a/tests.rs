@@ -29,6 +29,7 @@ mod tests {
 
     fn sample_result(task_id: &str) -> VerifyResult {
         VerifyResult {
+            head_sha: None,
             task_id: task_id.to_string(),
             exit_code: Some(0),
             timed_out: false,
@@ -95,12 +96,12 @@ mod tests {
     }
 
     #[test]
-    fn test_allowlist_validation_rejects_unknown_commands() {
+    fn test_policy_validation_rejects_prohibited_operations() {
         let invalid_commands = vec![
             vec!["rm", "-rf", "/"],
             vec!["cargo", "publish"],
-            vec!["sh", "-c", "evil"],
-            vec!["bash"],
+            vec!["redis-cli", "FLUSHALL"],
+            vec!["sudo", "id"],
             vec![],
         ];
 
@@ -161,9 +162,11 @@ mod tests {
     async fn test_relay_lifecycle_submit_claim_complete_get() {
         use crate::a2a::routing::{A2ARelay, TaskState};
         use crate::a2a::verify_handler::submit_verify_request;
+        use serde_json::json;
 
         let store = SharedStore::new_in_memory();
-        let relay = A2ARelay::new(Arc::new(store));
+        let store = Arc::new(store);
+        let relay = A2ARelay::new(Arc::clone(&store));
 
         let req = sample_request();
 
@@ -204,6 +207,131 @@ mod tests {
         let entry = relay.get_task(&task_id).await.unwrap();
         assert!(entry.result.is_some());
         assert_eq!(entry.result.unwrap().task_id, task_id);
+        assert_eq!(
+            store
+                .get(&a2a_protocol::verification_key("T-048"))
+                .await
+                .and_then(|v| v.get("task_id").cloned()),
+            Some(json!(task_id))
+        );
+        assert!(store
+            .get(&a2a_protocol::verification_key("forge-T-048"))
+            .await
+            .is_none());
+
+        // Terminal tasks are retryable. This matters when an executor setup
+        // failure is fixed and Sentinel reruns the same verification request.
+        let retry_task_id = submit_verify_request(&relay, &req, "T-048").await.unwrap();
+        assert_ne!(task_id, retry_task_id);
+        assert_eq!(
+            relay.get_task_state(&retry_task_id).await,
+            Some(TaskState::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_task_recovers_from_audit_after_relay_restart() {
+        use crate::a2a::routing::{A2ARelay, TaskState};
+        use crate::a2a::verify_handler::submit_verify_request;
+        use serde_json::json;
+
+        let store = Arc::new(SharedStore::new_in_memory());
+        let req = sample_request();
+        let original_relay = A2ARelay::new(Arc::clone(&store));
+        let task_id = submit_verify_request(&original_relay, &req, "T-048")
+            .await
+            .unwrap();
+
+        // Simulate the nexus relay process restarting after Sentinel submits
+        // and before Forge reports the terminal result.
+        let restarted_relay = A2ARelay::new(Arc::clone(&store));
+        restarted_relay
+            .complete_task(&task_id, sample_result(&task_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted_relay.get_task_state(&task_id).await,
+            Some(TaskState::Completed)
+        );
+
+        // A later restarted relay can still answer Sentinel's status poll from
+        // the durable audit trail.
+        let later_relay = A2ARelay::new(Arc::clone(&store));
+        let recovered = later_relay.get_task(&task_id).await.unwrap();
+        assert_eq!(recovered.state, TaskState::Completed);
+        assert_eq!(recovered.result.unwrap().task_id, task_id);
+        assert_eq!(
+            store
+                .get(&a2a_protocol::verification_key("T-048"))
+                .await
+                .and_then(|v| v.get("task_id").cloned()),
+            Some(json!(task_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn audited_result_overrides_stale_running_task_state() {
+        use crate::a2a::routing::{A2ARelay, TaskState};
+        use crate::a2a::verify_handler::submit_verify_request;
+
+        let store = Arc::new(SharedStore::new_in_memory());
+        let relay = A2ARelay::new(Arc::clone(&store));
+        let req = sample_request();
+        let task_id = submit_verify_request(&relay, &req, "T-048").await.unwrap();
+        relay.claim_next_task("T-048").await.unwrap();
+        assert_eq!(
+            relay.get_task_state(&task_id).await,
+            Some(TaskState::Running)
+        );
+
+        relay
+            .mirror_result("T-048", &sample_result(&task_id))
+            .await
+            .unwrap();
+
+        let recovered = relay.get_task(&task_id).await.unwrap();
+        assert_eq!(recovered.state, TaskState::Completed);
+        assert_eq!(recovered.result.unwrap().task_id, task_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_terminal_retries_enqueue_one_replacement() {
+        use crate::a2a::routing::A2ARelay;
+        use crate::a2a::verify_handler::submit_verify_request;
+        let relay = Arc::new(A2ARelay::new(Arc::new(SharedStore::new_in_memory())));
+        let req = sample_request();
+        let original = submit_verify_request(&relay, &req, "T-048").await.unwrap();
+        relay.claim_next_task("T-048").await.unwrap().unwrap();
+        relay
+            .complete_task(&original, sample_result(&original))
+            .await
+            .unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let relay = relay.clone();
+            let req = req.clone();
+            let barrier = barrier.clone();
+            workers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                relay.cleanup_idempotency().await;
+                submit_verify_request(&relay, &req, "T-048").await.unwrap()
+            }));
+        }
+        let ids = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut ids = std::collections::HashSet::new();
+            for worker in workers {
+                ids.insert(worker.await.unwrap());
+            }
+            ids
+        })
+        .await
+        .expect("enqueue and cleanup must not deadlock");
+        assert_eq!(ids.len(), 1);
+        assert!(!ids.contains(&original));
+        let claimed = relay.claim_next_task("T-048").await.unwrap().unwrap();
+        assert!(ids.contains(&claimed.task_id));
+        assert!(relay.claim_next_task("T-048").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -460,6 +588,7 @@ mod tests {
 
         // Build a synthetic cancelled result (as done in http_server cancel handler)
         let cancelled_result = VerifyResult {
+            head_sha: None,
             task_id: task_id.clone(),
             exit_code: None,
             timed_out: false,
