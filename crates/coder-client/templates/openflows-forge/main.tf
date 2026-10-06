@@ -212,47 +212,91 @@ resource "coder_agent" "main" {
     print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
     PYEOF
 
-    # Setup git credentials from Coder external auth (the tenant's linked
-    # GitHub App token). PAT flow removed — external auth is the sole source.
+    # Inherit the controller-spawner's GitHub identity from Coder external
+    # auth (the tenant's linked GitHub App token). The workspace owner IS the
+    # controller-spawner (see create_workspace_for_user in coder-client), so
+    # this token resolves to the real account the workspace should commit and
+    # open PRs as. This is a REQUIRED, verified identity: startup fails loudly
+    # if it cannot be established — never a silent REST-API fallback.
     GIT_TOKEN="${data.coder_external_auth.github.access_token}"
-    if [ -n "$GIT_TOKEN" ]; then
-      # System-level helper so git works for BOTH the agent user (pushes) and
-      # the sudo'd root clone below (their $HOME differ).
-      sudo git config --system credential.helper store
-      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
-      chmod 600 /home/coder/.git-credentials
-      sudo mkdir -p /root
-      sudo cp /home/coder/.git-credentials /root/.git-credentials
-      sudo chmod 600 /root/.git-credentials
-      log "Configured git credentials for GitHub push auth"
-
-      # Install the GitHub CLI so the agent can open PRs with `gh pr create`
-      # instead of hand-rolling the REST API. Auth uses the same external-auth
-      # token that backs the git credential helper above, so a logged-in gh
-      # works for both the agent user and the sudo'd root (their $HOME differ).
-      if ! command -v gh >/dev/null 2>&1; then
-        # Ubuntu base image (codercom/enterprise-base): prefer the official
-        # GitHub apt repo (always current), fall back to the distro package.
-        sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
-        sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-          -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
-        if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-            | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-        fi
-        sudo apt-get update -qq >/dev/null 2>&1 || true
-        sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
-      fi
-      if command -v gh >/dev/null 2>&1; then
-        echo "$${GIT_TOKEN}" | gh auth login --with-token 2>/dev/null || true
-        sudo -H bash -c "echo '$${GIT_TOKEN}' | gh auth login --with-token" 2>/dev/null || true
-        log "Configured GitHub CLI (gh) auth from external-auth token"
-      else
-        log "WARNING: could not install gh CLI — agent must fall back to the REST API for PR creation"
-      fi
-    else
-      log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
+    if [ -z "$GIT_TOKEN" ]; then
+      log "FATAL: no inherited GitHub credential for the controller-spawner (workspace owner external auth is not linked)"
+      exit 1
     fi
+
+    # System-level helper so git works for BOTH the agent user (pushes) and
+    # the sudo'd root clone below (their $HOME differ).
+    sudo git config --system credential.helper store
+    echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
+    chmod 600 /home/coder/.git-credentials
+    sudo mkdir -p /root
+    sudo cp /home/coder/.git-credentials /root/.git-credentials
+    sudo chmod 600 /root/.git-credentials
+    log "Configured git credentials for GitHub push auth"
+
+    # Install the GitHub CLI so the agent can open PRs with `gh pr create`
+    # instead of hand-rolling the REST API. gh is a REQUIRED part of the FORGE
+    # toolchain: failures here surface (no `|| true` swallows) and abort startup.
+    if ! command -v gh >/dev/null 2>&1; then
+      # Ubuntu base image (codercom/enterprise-base): prefer the official
+      # GitHub apt repo (always current), fall back to the distro package.
+      sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
+      sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
+      if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+          | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+      fi
+      sudo apt-get update -qq >/dev/null 2>&1 || true
+      sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
+    fi
+    if ! command -v gh >/dev/null 2>&1; then
+      log "FATAL: GitHub CLI (gh) is required for FORGE PR creation but could not be installed"
+      exit 1
+    fi
+
+    # Authenticate gh persistently as the inherited identity for BOTH the
+    # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
+    # --hostname + --git-protocol make the stored credential explicit and
+    # deterministic (non-interactive). Failures are fatal, never swallowed.
+    printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
+      || { log "FATAL: gh auth login failed for user coder"; exit 1; }
+    sudo -H bash -c "printf '%s' '$${GIT_TOKEN}' | gh auth login --hostname github.com --git-protocol https --with-token" \
+      || { log "FATAL: gh auth login failed for user root"; exit 1; }
+
+    # Resolve the expected account from the inherited token via the GitHub API
+    # (the coder_external_auth data source does not expose the login). Honor
+    # GITHUB_API_BASE so self-hosted setups match the rest of the system.
+    EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
+      || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+    if [ -z "$EXPECTED_LOGIN" ]; then
+      log "FATAL: resolved an empty inherited GitHub identity from the external-auth token"
+      exit 1
+    fi
+
+    # Verify the authed gh identity actually matches the inherited account, so
+    # gh/git act as the controller-spawner — never a dummy or mismatched login.
+    AUTHED_LOGIN=$(gh api user --jq .login) \
+      || { log "FATAL: could not query the authed gh identity"; exit 1; }
+    if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
+      log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"
+      exit 1
+    fi
+    log "Inherited GitHub identity verified: $EXPECTED_LOGIN"
+
+    # Set git author identity from the inherited account (the template sets
+    # none today, so commits would fail or use a wrong default identity).
+    # GitHub's noreply email keeps the address private and avoids the
+    # "private email" bot. Apply for coder and root (both push/clone).
+    git config --global user.name "$EXPECTED_LOGIN"
+    git config --global user.email "$EXPECTED_LOGIN@users.noreply.github.com"
+    sudo -H bash -c "git config --global user.name '$EXPECTED_LOGIN'; git config --global user.email '$EXPECTED_LOGIN@users.noreply.github.com'"
+
+    # Record the resolved identity (non-secret) so FORGE knows which account it
+    # is committing/pushing as. Never write the token anywhere.
+    mkdir -p /home/coder/workspace 2>/dev/null || true
+    echo "$EXPECTED_LOGIN" > /home/coder/workspace/.openflows-gh-identity 2>/dev/null || true
 
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (see docs §3.2): copy -> refresh -> checkout -> work.
