@@ -235,8 +235,10 @@ resource "coder_agent" "main" {
     log "Configured git credentials for GitHub push auth"
 
     # Install the GitHub CLI so the agent can open PRs with `gh pr create`
-    # instead of hand-rolling the REST API. gh is a REQUIRED part of the FORGE
-    # toolchain: failures here surface (no `|| true` swallows) and abort startup.
+    # instead of hand-rolling the REST API. gh is best-effort, NOT a hard
+    # startup dependency: the git credential helper above is the real push
+    # mechanism, so a workspace with a valid repo seed still starts even if gh
+    # cannot be installed (the agent can open the PR via REST/UI instead).
     if ! command -v gh >/dev/null 2>&1; then
       # Ubuntu base image (codercom/enterprise-base): prefer the official
       # GitHub apt repo (always current), fall back to the distro package.
@@ -250,19 +252,21 @@ resource "coder_agent" "main" {
       sudo apt-get update -qq >/dev/null 2>&1 || true
       sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
     fi
-    if ! command -v gh >/dev/null 2>&1; then
-      log "FATAL: GitHub CLI (gh) is required for FORGE PR creation but could not be installed"
-      exit 1
-    fi
 
-    # Authenticate gh persistently as the inherited identity for BOTH the
-    # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
-    # --hostname + --git-protocol make the stored credential explicit and
-    # deterministic (non-interactive). Failures are fatal, never swallowed.
-    printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
-      || { log "FATAL: gh auth login failed for user coder"; exit 1; }
-    sudo -H bash -c "printf '%s' '$${GIT_TOKEN}' | gh auth login --hostname github.com --git-protocol https --with-token" \
-      || { log "FATAL: gh auth login failed for user root"; exit 1; }
+    if command -v gh >/dev/null 2>&1; then
+      # Authenticate gh persistently as the inherited identity for BOTH the
+      # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
+      # --hostname + --git-protocol make the stored credential explicit and
+      # deterministic (non-interactive). The token travels through stdin for
+      # the root login too — never embedded in a command-line argument that
+      # another process could read. Failures are fatal, never swallowed.
+      printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
+        || { log "FATAL: gh auth login failed for user coder"; exit 1; }
+      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'read -r tok && printf "%s" "$tok" | gh auth login --hostname github.com --git-protocol https --with-token' \
+        || { log "FATAL: gh auth login failed for user root"; exit 1; }
+    else
+      log "WARNING: GitHub CLI (gh) unavailable — agent should push via git and open the PR through the REST API or GitHub UI"
+    fi
 
     # Resolve the expected account from the inherited token via the GitHub API
     # (the coder_external_auth data source does not expose the login). Honor
@@ -275,15 +279,19 @@ resource "coder_agent" "main" {
       exit 1
     fi
 
-    # Verify the authed gh identity actually matches the inherited account, so
-    # gh/git act as the controller-spawner — never a dummy or mismatched login.
-    AUTHED_LOGIN=$(gh api user --jq .login) \
-      || { log "FATAL: could not query the authed gh identity"; exit 1; }
-    if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
-      log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"
-      exit 1
+    if command -v gh >/dev/null 2>&1; then
+      # Verify the authed gh identity actually matches the inherited account, so
+      # gh/git act as the controller-spawner — never a dummy or mismatched login.
+      AUTHED_LOGIN=$(gh api user --jq .login) \
+        || { log "FATAL: could not query the authed gh identity"; exit 1; }
+      if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
+        log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"
+        exit 1
+      fi
+      log "Inherited GitHub identity verified: $EXPECTED_LOGIN"
+    else
+      log "WARNING: gh unavailable — skipping gh identity check; git push uses the inherited token via the credential helper"
     fi
-    log "Inherited GitHub identity verified: $EXPECTED_LOGIN"
 
     # Set git author identity from the inherited account (the template sets
     # none today, so commits would fail or use a wrong default identity).
@@ -294,9 +302,10 @@ resource "coder_agent" "main" {
     sudo -H bash -c "git config --global user.name '$EXPECTED_LOGIN'; git config --global user.email '$EXPECTED_LOGIN@users.noreply.github.com'"
 
     # Record the resolved identity (non-secret) so FORGE knows which account it
-    # is committing/pushing as. Never write the token anywhere.
-    mkdir -p /home/coder/workspace 2>/dev/null || true
-    echo "$EXPECTED_LOGIN" > /home/coder/workspace/.openflows-gh-identity 2>/dev/null || true
+    # is committing/pushing as. Stored in $HOME, NOT the clone destination
+    # (/home/coder/workspace), so it never makes the destination non-empty and
+    # blocks `git clone`/`cp -a` below. Never write the token anywhere.
+    echo "$EXPECTED_LOGIN" > /home/coder/.openflows-gh-identity 2>/dev/null || true
 
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (see docs §3.2): copy -> refresh -> checkout -> work.
