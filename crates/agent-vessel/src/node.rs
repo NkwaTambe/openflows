@@ -773,15 +773,32 @@ impl Node for VesselNode {
                 continue;
             }
             if !state.merge_ready(&pr_info.head_sha) {
-                info!(
-                    pr_number,
-                    ticket,
-                    review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
-                    human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
-                    delivery_pending = state.pr_delivery.is_some(),
-                    "Deferring PR: waiting for lifecycle approvals or review delivery"
-                );
-                continue;
+                // Reconcile a human's GitHub approval into the lifecycle before
+                // deferring. SENTINEL shares the PR author's GitHub identity, so
+                // it cannot self-approve; an APPROVED review therefore comes from
+                // a distinct human account, which satisfies the `pr_human` gate.
+                let reconciled = self
+                    .reconcile_github_approval(&store, ticket, &state, owner, repo, pr_number)
+                    .await?;
+                let ready = if reconciled {
+                    store
+                        .lifecycle(ticket)
+                        .await?
+                        .merge_ready(&pr_info.head_sha)
+                } else {
+                    false
+                };
+                if !ready {
+                    info!(
+                        pr_number,
+                        ticket,
+                        review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
+                        human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
+                        delivery_pending = state.pr_delivery.is_some(),
+                        "Deferring PR: waiting for lifecycle approvals or review delivery"
+                    );
+                    continue;
+                }
             }
 
             let outcome = self.process_single_pr(owner, repo, pr_info).await?;
@@ -2176,6 +2193,86 @@ impl VesselNode {
         }
     }
 
+    /// Reconcile a human's GitHub approval into the lifecycle `pr_human` record.
+    ///
+    /// SENTINEL shares the PR author's GitHub identity, and GitHub blocks
+    /// self-review, so an `APPROVED` review can only originate from a distinct
+    /// human account. That approval satisfies the `pr_human` merge gate without
+    /// a manual operator CLI entry.
+    ///
+    /// Returns true if the lifecycle was advanced. No-op (false) when the ticket
+    /// is not in `submit`, `pr_human` is already present, or the PR is not
+    /// GitHub-approved.
+    async fn reconcile_github_approval(
+        &self,
+        store: &SharedStore,
+        ticket: &str,
+        state: &config::lifecycle::Lifecycle,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<bool> {
+        if state.phase != config::lifecycle::Phase::Submit || state.pr_human.is_some() {
+            return Ok(false);
+        }
+        // Confirm the PR is genuinely approved on GitHub.
+        let reviews = self.client.list_pr_reviews(owner, repo, pr_number).await?;
+        if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
+            return Ok(false);
+        }
+        // Identify the approving human for the audit report (any APPROVED review).
+        let approver = reviews
+            .iter()
+            .filter(|r| r.state_enum() == github::PrReviewState::Approved)
+            .filter_map(|r| r.user.clone())
+            .next();
+        let report = format!(
+            "Approved on GitHub by {}",
+            approver.as_deref().unwrap_or("human reviewer")
+        );
+
+        let current = store.lifecycle(ticket).await?;
+        if current.pr_human.is_some() {
+            return Ok(false);
+        }
+        // Record the human approval, then complete the review-delivery handshake
+        // so `merge_ready()` no longer blocks on a pending delivery.
+        let cur = store
+            .transition(
+                ticket,
+                current.version,
+                "human",
+                config::lifecycle::Event::Decide {
+                    round: current.review_round,
+                    phase: config::lifecycle::Phase::Submit,
+                    approved: true,
+                    report,
+                    revision: current.revision,
+                    head: current.head.clone(),
+                },
+            )
+            .await?;
+        if cur.pr_delivery.is_some() {
+            store
+                .transition(
+                    ticket,
+                    cur.version,
+                    "sentinel",
+                    config::lifecycle::Event::ReviewDelivered {
+                        round: cur.review_round,
+                    },
+                )
+                .await?;
+        }
+        info!(
+            pr_number,
+            ticket,
+            approver = ?approver,
+            "Reconciled GitHub approval into lifecycle (pr_human)"
+        );
+        Ok(true)
+    }
+
     /// Reserve and merge only the reviewed candidate with successful current-head CI.
     async fn merge_reviewed(
         &self,
@@ -3325,6 +3422,110 @@ mod tests {
             assert_eq!(result.is_err(), pending);
             merge.assert_async().await;
         }
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_sets_pr_human_from_approved_review() {
+        let mut server = mockito::Server::new_async().await;
+        // A human (alice) approved the PR on GitHub. SENTINEL shares the PR
+        // author's identity and cannot self-approve, so an APPROVED review
+        // means a real human approved.
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100")
+            .with_status(200)
+            .with_body(r#"[{"state":"APPROVED","user":{"login":"alice"},"submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#)
+            .create_async()
+            .await;
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = client;
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        // Lifecycle: submit, SENTINEL already approved (pr_decision), but the
+        // human gate (pr_human) is absent and delivery is still pending.
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_delivery":sentinel}),
+            )
+            .await;
+
+        let state = store.lifecycle("T-42").await.unwrap();
+        assert!(!state.merge_ready("head"));
+
+        let reconciled = node
+            .reconcile_github_approval(&store, "T-42", &state, "org", "repo", 42)
+            .await
+            .unwrap();
+        assert!(reconciled, "GitHub-approved PR should be reconciled");
+
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(
+            after.pr_human.as_ref().is_some_and(|d| d.approved),
+            "pr_human must be recorded from the human's GitHub approval"
+        );
+        assert_eq!(
+            after.pr_human.as_ref().unwrap().actor,
+            "human",
+            "approval must be attributed to a human, not SENTINEL"
+        );
+        assert!(
+            after.pr_delivery.is_none(),
+            "delivery handshake must complete"
+        );
+        assert!(
+            after.merge_ready("head"),
+            "reconciled PR must be merge-ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_skips_when_not_approved_or_not_submit() {
+        // No approve review on GitHub -> no reconcile.
+        let mut server = mockito::Server::new_async().await;
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100")
+            .with_status(200)
+            .with_body(r#"[{"state":"COMMENTED","user":{"login":"alice"},"submitted_at":"2026-10-05T00:00:00Z","body":"comments"}]"#)
+            .create_async()
+            .await;
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut node = VesselNode::new(VesselConfig::default());
+        node.client = client;
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel}),
+            )
+            .await;
+        let state = store.lifecycle("T-42").await.unwrap();
+        let reconciled = node
+            .reconcile_github_approval(&store, "T-42", &state, "org", "repo", 42)
+            .await
+            .unwrap();
+        assert!(!reconciled, "not-approved PR must not be reconciled");
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+
+        // Already has a human approval -> idempotent no-op.
+        let store2 = SharedStore::new_in_memory();
+        let human = json!({"round":0,"pr_number":42,"actor":"human","approved":true,"report":"ok","revision":1,"head":"head"});
+        store2
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_human":human}),
+            )
+            .await;
+        *node.lifecycle_store.lock().unwrap() = Some(store2.clone());
+        let state2 = store2.lifecycle("T-42").await.unwrap();
+        let reconciled2 = node
+            .reconcile_github_approval(&store2, "T-42", &state2, "org", "repo", 42)
+            .await
+            .unwrap();
+        assert!(!reconciled2, "already human-approved must be a no-op");
     }
 
     #[tokio::test]
