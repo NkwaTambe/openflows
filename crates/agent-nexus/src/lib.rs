@@ -3738,60 +3738,19 @@ Use `openflows-harness` for all coordination:
 
             if lifecycle.phase == config::lifecycle::Phase::Submit {
                 ready.push(pr.clone());
-                continue;
-            }
-
-            let reason = format!(
-                "PR #{} is pending but ticket {} is in {}. Move the lifecycle through the state machine before merge resumes.",
-                pr_number,
-                ticket_id,
-                lifecycle.phase.as_str()
-            );
-            if lifecycle.phase == config::lifecycle::Phase::Blocked
-                && lifecycle.feedback.as_deref() == Some(reason.as_str())
-            {
-                debug!(
+            } else {
+                // Withhold the PR from VESSEL without transitioning the
+                // lifecycle. A `Block` would clear the ticket's approved plan,
+                // head, verification, and review decisions, forcing already-done
+                // work to repeat through planning. The merge-ready handoff alone
+                // gates VESSEL, so omitting the PR keeps the queue moving while
+                // preserving the ticket's in-flight progress.
+                info!(
                     pr_number,
-                    ticket_id, "PR is already held by the lifecycle block"
-                );
-                continue;
-            }
-
-            if lifecycle.phase == config::lifecycle::Phase::Blocked {
-                debug!(
-                    pr_number,
-                    ticket_id, "PR is already blocked; preserving existing blocker"
-                );
-                continue;
-            }
-
-            match store
-                .transition(
                     ticket_id,
-                    lifecycle.version,
-                    "nexus",
-                    config::lifecycle::Event::Block {
-                        reason: reason.clone(),
-                    },
-                )
-                .await
-            {
-                Ok(_) => {
-                    info!(
-                        pr_number,
-                        ticket_id,
-                        reason,
-                        "Holding non-submit PR and continuing controller dispatch"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        pr_number,
-                        ticket_id,
-                        error = %e,
-                        "Could not block non-submit PR this pass"
-                    );
-                }
+                    phase = %lifecycle.phase.as_str(),
+                    "Holding PR from VESSEL until its ticket reaches submit"
+                );
             }
         }
         ready
@@ -5558,12 +5517,8 @@ mod tests {
 
         assert!(merge_ready.is_empty());
         let held = store.lifecycle("T-041").await.unwrap();
-        assert_eq!(held.phase, config::lifecycle::Phase::Blocked);
-        assert!(held
-            .feedback
-            .as_deref()
-            .unwrap()
-            .contains("PR #41 is pending"));
+        assert_eq!(held.phase, config::lifecycle::Phase::Building);
+        assert!(held.feedback.is_none());
 
         let node = NexusNode::new("nexus.agent.md", "registry.json");
         let context = json!({

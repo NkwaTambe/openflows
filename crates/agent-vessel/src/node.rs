@@ -584,7 +584,7 @@ impl Node for VesselNode {
         debug!("VESSEL prep: reading pending PRs and CI readiness");
 
         let repository: Option<String> = store.get_typed("repository").await;
-        let pending_prs: Option<Vec<Value>> = store.get_typed(KEY_PENDING_PRS).await;
+        let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
         let merge_ready_prs: Option<Vec<Value>> = store.get_typed(KEY_MERGE_READY_PRS).await;
         let ci_readiness: Option<crate::types::CiReadiness> = store.get_typed("ci_readiness").await;
 
@@ -594,6 +594,39 @@ impl Node for VesselNode {
         // addresses a `/address_review` and re-arms the PR. Re-add those PRs so we
         // resume polling them without depending on NEXUS re-discovery.
         self.rearm_review_prs(store, owner, repo).await;
+
+        // The NEXUS merge-ready handoff is a snapshot from the last NEXUS pass.
+        // A PR can reach `submit` via FORGE/SENTINEL (or leave the queue) between
+        // passes, so when a snapshot exists, refresh it against the live pending
+        // queue: keep the snapshot, then re-include any pending PR whose lifecycle
+        // has since reached submit. When no snapshot exists, fall back to the full
+        // pending queue (VESSEL re-validates the phase before merging, so this is
+        // never unsafe).
+        let effective_merge_ready = match merge_ready_prs {
+            Some(snapshot) => {
+                let lifecycle_store = self.lifecycle_store.lock().unwrap().clone();
+                let mut effective = snapshot;
+                for pr in &pending_prs {
+                    if effective.iter().any(|m| m["number"] == pr["number"]) {
+                        continue;
+                    }
+                    let ticket = pr["ticket_id"].as_str().unwrap_or_default();
+                    let is_submit = match lifecycle_store.as_ref() {
+                        Some(s) => s
+                            .lifecycle(ticket)
+                            .await
+                            .map(|state| state.phase == config::lifecycle::Phase::Submit)
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if is_submit {
+                        effective.push(pr.clone());
+                    }
+                }
+                effective
+            }
+            None => pending_prs,
+        };
 
         let has_ci_workflows = match ci_readiness {
             Some(crate::types::CiReadiness::Ready) => true,
@@ -611,7 +644,7 @@ impl Node for VesselNode {
         Ok(json!({
             "owner": owner,
             "repo": repo,
-            "pending_prs": merge_ready_prs.unwrap_or_else(|| pending_prs.unwrap_or_default()),
+            "pending_prs": effective_merge_ready,
             "has_ci_workflows": has_ci_workflows,
         }))
     }
@@ -3380,6 +3413,35 @@ mod tests {
         let pending = result["pending_prs"].as_array().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0]["number"].as_u64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn test_prep_refreshes_stale_empty_merge_ready_handoff() {
+        let store = SharedStore::new_in_memory();
+        store.set("repository", json!("test-owner/test-repo")).await;
+        // NEXUS wrote an empty merge-ready snapshot, but a PR has since reached
+        // submit via FORGE/SENTINEL without another NEXUS pass.
+        store
+            .set(KEY_PENDING_PRS, json!([{"number": 3, "ticket_id": "T-3"}]))
+            .await;
+        store.set(KEY_MERGE_READY_PRS, json!([])).await;
+        store
+            .set(
+                &full_ticket_key_flat("T-3", config::state::KEY_TICKET_STATUS),
+                json!(config::lifecycle::Lifecycle {
+                    phase: config::lifecycle::Phase::Submit,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let result = node.prep(&store).await.unwrap();
+        let pending = result["pending_prs"].as_array().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0]["number"].as_u64(), Some(3));
     }
 
     #[tokio::test]
