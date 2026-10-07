@@ -775,10 +775,19 @@ impl Node for VesselNode {
             if !state.merge_ready(&pr_info.head_sha) {
                 // Reconcile a human's GitHub approval into the lifecycle before
                 // deferring. SENTINEL shares the PR author's GitHub identity, so
-                // it cannot self-approve; an APPROVED review therefore comes from
-                // a distinct human account, which satisfies the `pr_human` gate.
+                // it cannot self-approve; an authorized reviewer's APPROVED review
+                // of the current head therefore satisfies the `pr_human` gate.
+                // Review-fetch failures defer only this PR, never the batch.
                 let reconciled = self
-                    .reconcile_github_approval(&store, ticket, &state, owner, repo, pr_number)
+                    .reconcile_github_approval(
+                        &store,
+                        ticket,
+                        &state,
+                        owner,
+                        repo,
+                        pr_number,
+                        &pr_info.head_sha,
+                    )
                     .await?;
                 let ready = if reconciled {
                     store
@@ -2197,12 +2206,17 @@ impl VesselNode {
     ///
     /// SENTINEL shares the PR author's GitHub identity, and GitHub blocks
     /// self-review, so an `APPROVED` review can only originate from a distinct
-    /// human account. That approval satisfies the `pr_human` merge gate without
-    /// a manual operator CLI entry.
+    /// account. That approval satisfies the `pr_human` merge gate without a
+    /// manual operator CLI entry, provided that:
+    /// - no reviewer currently requests changes (fail closed),
+    /// - the approving reviewer is an `OWNER`, `MEMBER`, or `COLLABORATOR`, and
+    /// - their latest review is `APPROVED` on exactly `head_sha`.
     ///
     /// Returns true if the lifecycle was advanced. No-op (false) when the ticket
-    /// is not in `submit`, `pr_human` is already present, or the PR is not
-    /// GitHub-approved.
+    /// is not in `submit`, `pr_human` is already present, the PR has no
+    /// qualifying approval, or reviews could not be fetched (the PR is simply
+    /// deferred to the next pass so other queued PRs keep processing).
+    #[allow(clippy::too_many_arguments)]
     async fn reconcile_github_approval(
         &self,
         store: &SharedStore,
@@ -2211,28 +2225,48 @@ impl VesselNode {
         owner: &str,
         repo: &str,
         pr_number: u64,
+        head_sha: &str,
     ) -> Result<bool> {
         if state.phase != config::lifecycle::Phase::Submit || state.pr_human.is_some() {
             return Ok(false);
         }
-        // Confirm the PR is genuinely approved on GitHub.
-        let reviews = self.client.list_pr_reviews(owner, repo, pr_number).await?;
+        let reviews = match self.client.list_pr_reviews(owner, repo, pr_number).await {
+            Ok(reviews) => reviews,
+            Err(e) => {
+                warn!(pr_number, ticket, error = %e,
+                    "Failed to list PR reviews; deferring approval reconciliation");
+                return Ok(false);
+            }
+        };
+        // Any reviewer currently requesting changes vetoes reconciliation.
         if github::effective_review_state(&reviews) != github::PrReviewState::Approved {
             return Ok(false);
         }
-        // Identify the approving human for the audit report (any APPROVED review).
-        let approver = reviews
-            .iter()
-            .filter(|r| r.state_enum() == github::PrReviewState::Approved)
-            .filter_map(|r| r.user.clone())
-            .next();
-        let report = format!(
-            "Approved on GitHub by {}",
-            approver.as_deref().unwrap_or("human reviewer")
-        );
+        // The effective approver: an authorized reviewer whose *latest* review
+        // approves the current head. Stale approvals of older commits and
+        // drive-by approvals from outside accounts do not count.
+        let Some(approver) = github::latest_review_per_user(&reviews)
+            .into_iter()
+            .filter(|r| {
+                r.state_enum() == github::PrReviewState::Approved
+                    && r.is_authorized_reviewer()
+                    && r.commit_id.as_deref() == Some(head_sha)
+            })
+            .max_by(|a, b| a.submitted_at.cmp(&b.submitted_at))
+            .and_then(|r| r.user.clone())
+        else {
+            info!(
+                pr_number,
+                ticket,
+                head = head_sha,
+                "No authorized GitHub approval of the current head; not reconciling"
+            );
+            return Ok(false);
+        };
+        let report = format!("Approved on GitHub by {approver} at {head_sha}");
 
         let current = store.lifecycle(ticket).await?;
-        if current.pr_human.is_some() {
+        if current.pr_human.is_some() || current.head.as_deref() != Some(head_sha) {
             return Ok(false);
         }
         // Record the human approval, then complete the review-delivery handshake
@@ -2267,7 +2301,7 @@ impl VesselNode {
         info!(
             pr_number,
             ticket,
-            approver = ?approver,
+            approver = %approver,
             "Reconciled GitHub approval into lifecycle (pr_human)"
         );
         Ok(true)
@@ -3424,25 +3458,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reconcile_github_approval_sets_pr_human_from_approved_review() {
+    /// Build a VESSEL node whose GitHub reviews endpoint returns `status`/`body`,
+    /// plus a store holding a `submit` lifecycle at head `head` where SENTINEL
+    /// has approved but the human gate is absent and delivery is pending.
+    async fn reconcile_fixture(
+        status: usize,
+        body: &str,
+    ) -> (mockito::ServerGuard, VesselNode, SharedStore) {
         let mut server = mockito::Server::new_async().await;
-        // A human (alice) approved the PR on GitHub. SENTINEL shares the PR
-        // author's identity and cannot self-approve, so an APPROVED review
-        // means a real human approved.
-        let _reviews = server
-            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100")
-            .with_status(200)
-            .with_body(r#"[{"state":"APPROVED","user":{"login":"alice"},"submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#)
+        server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/reviews?per_page=100&page=1",
+            )
+            .with_status(status)
+            .with_body(body)
             .create_async()
             .await;
-        let client = github::GithubRestClient::with_api_base("test", server.url());
         let mut node = VesselNode::new(VesselConfig::default());
-        node.client = client;
+        node.client = github::GithubRestClient::with_api_base("test", server.url());
         let store = SharedStore::new_in_memory();
         *node.lifecycle_store.lock().unwrap() = Some(store.clone());
-        // Lifecycle: submit, SENTINEL already approved (pr_decision), but the
-        // human gate (pr_human) is absent and delivery is still pending.
         let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
         store
             .set(
@@ -3450,26 +3486,41 @@ mod tests {
                 json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_delivery":sentinel}),
             )
             .await;
+        (server, node, store)
+    }
 
+    async fn run_reconcile(node: &VesselNode, store: &SharedStore) -> bool {
         let state = store.lifecycle("T-42").await.unwrap();
-        assert!(!state.merge_ready("head"));
-
-        let reconciled = node
-            .reconcile_github_approval(&store, "T-42", &state, "org", "repo", 42)
+        node.reconcile_github_approval(store, "T-42", &state, "org", "repo", 42, "head")
             .await
-            .unwrap();
-        assert!(reconciled, "GitHub-approved PR should be reconciled");
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_sets_pr_human_from_approved_review() {
+        // An authorized collaborator (alice) approved the current head. SENTINEL
+        // shares the PR author's identity and cannot self-approve, so this is
+        // a genuine human sign-off.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        assert!(!store.lifecycle("T-42").await.unwrap().merge_ready("head"));
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "GitHub-approved PR should be reconciled"
+        );
 
         let after = store.lifecycle("T-42").await.unwrap();
-        assert!(
-            after.pr_human.as_ref().is_some_and(|d| d.approved),
-            "pr_human must be recorded from the human's GitHub approval"
-        );
+        let human = after.pr_human.as_ref().expect("pr_human must be recorded");
+        assert!(human.approved);
         assert_eq!(
-            after.pr_human.as_ref().unwrap().actor,
-            "human",
+            human.actor, "human",
             "approval must be attributed to a human, not SENTINEL"
         );
+        assert!(human.report.contains("alice"));
         assert!(
             after.pr_delivery.is_none(),
             "delivery handshake must complete"
@@ -3481,51 +3532,107 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_github_approval_skips_when_not_approved_or_not_submit() {
-        // No approve review on GitHub -> no reconcile.
-        let mut server = mockito::Server::new_async().await;
-        let _reviews = server
-            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100")
-            .with_status(200)
-            .with_body(r#"[{"state":"COMMENTED","user":{"login":"alice"},"submitted_at":"2026-10-05T00:00:00Z","body":"comments"}]"#)
-            .create_async()
-            .await;
-        let client = github::GithubRestClient::with_api_base("test", server.url());
-        let mut node = VesselNode::new(VesselConfig::default());
-        node.client = client;
-        let store = SharedStore::new_in_memory();
-        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
-        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
-        store
-            .set(
-                "ticket:T-42:status",
-                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel}),
-            )
-            .await;
-        let state = store.lifecycle("T-42").await.unwrap();
-        let reconciled = node
-            .reconcile_github_approval(&store, "T-42", &state, "org", "repo", 42)
-            .await
-            .unwrap();
-        assert!(!reconciled, "not-approved PR must not be reconciled");
+    async fn reconcile_github_approval_skips_when_not_approved() {
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"COMMENTED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"comments"}]"#,
+        )
+        .await;
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "not-approved PR must not be reconciled"
+        );
         assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
 
-        // Already has a human approval -> idempotent no-op.
-        let store2 = SharedStore::new_in_memory();
+    #[tokio::test]
+    async fn reconcile_github_approval_is_noop_when_human_already_approved() {
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head"}]"#,
+        )
+        .await;
+        let sentinel = json!({"round":0,"pr_number":42,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
         let human = json!({"round":0,"pr_number":42,"actor":"human","approved":true,"report":"ok","revision":1,"head":"head"});
-        store2
+        store
             .set(
                 "ticket:T-42:status",
                 json!({"version":1,"phase":"submit","head":"head","pr_number":42,"pr_decision":sentinel,"pr_human":human}),
             )
             .await;
-        *node.lifecycle_store.lock().unwrap() = Some(store2.clone());
-        let state2 = store2.lifecycle("T-42").await.unwrap();
-        let reconciled2 = node
-            .reconcile_github_approval(&store2, "T-42", &state2, "org", "repo", 42)
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "already human-approved must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_rejects_unauthorized_reviewer() {
+        // A drive-by account without repository authority approves: not a
+        // valid human sign-off.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"mallory"},"author_association":"NONE","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
+                {"state":"APPROVED","user":{"login":"eve"},"author_association":"CONTRIBUTOR","commit_id":"head","submitted_at":"2026-10-05T00:00:01Z"}]"#,
+        )
+        .await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_rejects_stale_approval_of_older_commit() {
+        // The owner approved an earlier commit; new code has since been pushed.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"old-head","submitted_at":"2026-10-05T00:00:00Z"}]"#,
+        )
+        .await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_names_effective_approver() {
+        // alice's only approval is stale (older commit); bob approved the
+        // current head. The audit record must name bob, not alice.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"MEMBER","commit_id":"old-head","submitted_at":"2026-10-04T00:00:00Z"},
+                {"state":"APPROVED","user":{"login":"bob"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"}]"#,
+        )
+        .await;
+        assert!(run_reconcile(&node, &store).await);
+        let report = store
+            .lifecycle("T-42")
             .await
-            .unwrap();
-        assert!(!reconciled2, "already human-approved must be a no-op");
+            .unwrap()
+            .pr_human
+            .unwrap()
+            .report;
+        assert!(report.contains("bob"), "report: {report}");
+        assert!(!report.contains("alice"), "report: {report}");
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_vetoed_by_current_changes_requested() {
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
+                {"state":"CHANGES_REQUESTED","user":{"login":"bob"},"author_association":"MEMBER","commit_id":"head","submitted_at":"2026-10-05T00:00:01Z"}]"#,
+        )
+        .await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_defers_on_review_fetch_error() {
+        // A GitHub error must not propagate (which would abort the whole VESSEL
+        // pass); the PR is simply deferred.
+        let (_server, node, store) = reconcile_fixture(404, r#"{"message":"Not Found"}"#).await;
+        assert!(!run_reconcile(&node, &store).await);
+        assert!(store.lifecycle("T-42").await.unwrap().pr_human.is_none());
     }
 
     #[tokio::test]

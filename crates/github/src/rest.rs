@@ -1074,11 +1074,24 @@ impl GithubRestClient {
         repo: &str,
         pr_number: u64,
     ) -> Result<Vec<PrReview>> {
-        let url = format!(
-            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
-            self.api_base, owner, repo, pr_number
-        );
-        self.get_json(&url).await
+        // Fetch every page: a verdict-changing review (e.g. a later
+        // CHANGES_REQUESTED) must never be missed because it fell past page 1.
+        let mut reviews = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/pulls/{}/reviews?per_page=100&page={}",
+                self.api_base, owner, repo, pr_number, page
+            );
+            let batch: Vec<PrReview> = self.get_json(&url).await?;
+            let len = batch.len();
+            reviews.extend(batch);
+            if len < 100 {
+                break;
+            }
+            page += 1;
+        }
+        Ok(reviews)
     }
 
     /// List the inline review comments on a pull request.
@@ -1545,11 +1558,27 @@ pub struct PrReview {
     pub submitted_at: Option<String>,
     #[serde(default)]
     pub body: Option<String>,
+    /// SHA of the commit the review was submitted against.
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    /// Reviewer's relationship to the repository (`OWNER`, `MEMBER`,
+    /// `COLLABORATOR`, `CONTRIBUTOR`, `NONE`, ...).
+    #[serde(default)]
+    pub author_association: Option<String>,
 }
 
 impl PrReview {
     pub fn state_enum(&self) -> PrReviewState {
         PrReviewState::from_api_state(&self.state)
+    }
+
+    /// Whether the reviewer holds maintainer/collaborator authority on the
+    /// repository. Drive-by reviews from outside accounts do not qualify.
+    pub fn is_authorized_reviewer(&self) -> bool {
+        matches!(
+            self.author_association.as_deref(),
+            Some("OWNER" | "MEMBER" | "COLLABORATOR")
+        )
     }
 }
 
@@ -1606,17 +1635,11 @@ pub struct ReviewCommentInput {
     pub body: String,
 }
 
-/// Compute the effective review state of a PR from the (possibly superseded)
-/// list of reviews returned by `GET /pulls/{n}/reviews`.
+/// Reduce a PR's review history to the latest review per reviewer.
 ///
-/// Rules:
-/// - Consider only the latest review per reviewer.
-/// - A current `CHANGES_REQUESTED` beats an older `APPROVED` (a reviewer can
-///   approve then re-request changes).
-/// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
-/// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
-pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
-    // Latest review per reviewer (later `submitted_at` wins).
+/// Later `submitted_at` wins; when timestamps are absent, later insertion
+/// order wins. Reviews without a reviewer login are ignored.
+pub fn latest_review_per_user(reviews: &[PrReview]) -> Vec<&PrReview> {
     let mut latest: Vec<&PrReview> = Vec::new();
     for review in reviews {
         if review.user.as_deref().is_none() || review.user.as_deref() == Some("") {
@@ -1647,6 +1670,20 @@ pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
             _ => {}
         }
     }
+    latest
+}
+
+/// Compute the effective review state of a PR from the (possibly superseded)
+/// list of reviews returned by `GET /pulls/{n}/reviews`.
+///
+/// Rules:
+/// - Consider only the latest review per reviewer.
+/// - A current `CHANGES_REQUESTED` beats an older `APPROVED` (a reviewer can
+///   approve then re-request changes).
+/// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
+/// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
+pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
+    let latest = latest_review_per_user(reviews);
 
     let mut any_approved = false;
     for review in latest {
@@ -1688,6 +1725,8 @@ mod pr_review_tests {
             user: Some(user.to_string()),
             submitted_at: Some(ts.to_string()),
             body: None,
+            commit_id: None,
+            author_association: None,
         }
     }
 
@@ -1798,6 +1837,41 @@ mod status_api_tests {
 #[cfg(test)]
 mod lifecycle_ci_tests {
     use super::*;
+    #[tokio::test]
+    async fn list_pr_reviews_follows_pagination_so_later_veto_is_seen() {
+        let mut server = mockito::Server::new_async().await;
+        let approvals: Vec<_> = (0..100)
+            .map(|i| {
+                serde_json::json!({"state":"APPROVED","user":{"login":format!("u{i}")},
+                    "submitted_at":"2026-10-05T00:00:00Z"})
+            })
+            .collect();
+        let page1 = server
+            .mock("GET", "/repos/org/repo/pulls/7/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(serde_json::to_string(&approvals).unwrap())
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", "/repos/org/repo/pulls/7/reviews?per_page=100&page=2")
+            .with_status(200)
+            .with_body(r#"[{"state":"CHANGES_REQUESTED","user":{"login":"veto"},"submitted_at":"2026-10-06T00:00:00Z"}]"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        let reviews = client.list_pr_reviews("org", "repo", 7).await.unwrap();
+        assert_eq!(reviews.len(), 101);
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+        page1.assert_async().await;
+        page2.assert_async().await;
+    }
     #[tokio::test]
     async fn ci_api_does_not_mask_failed_checks_with_successful_status() {
         let mut server = mockito::Server::new_async().await;
