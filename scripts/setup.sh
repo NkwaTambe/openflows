@@ -94,6 +94,7 @@ spin() {
     local pid=$1 label=$2 frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 start=$SECONDS
     if [ "$FANCY" = 1 ]; then
         while kill -0 "$pid" 2>/dev/null; do
+            if [ -n "${SPIN_STATUS_FN:-}" ] && [ $((i % 5)) -eq 0 ]; then label="$($SPIN_STATUS_FN)"; fi
             printf '\r%s%s%s %s%s%s %s%ds%s\033[K' "$(rail)" "$C" "${frames:i++%${#frames}:1}" "$N" "$label" "$N" "$D" "$((SECONDS - start))" "$N"
             sleep 0.1
         done
@@ -224,6 +225,29 @@ api() { # api METHOD PATH [JSON] — uses CODER_TOKEN; prints body; on HTTP erro
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 # ── stage 1: preflight ──────────────────────────────────────────────────────
+# clean_installer_log FILE — installer output without progress bars, ANSI codes or shell-trace (+ …) lines
+clean_installer_log() {
+    tr '\r' '\n' <"$1" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        | grep -Ev '^[[:space:]]*[#=O -]*[0-9.]*%?[[:space:]]*$|^\+ |^[[:space:]]*$' || true
+}
+# status line for the spinner: latest meaningful installer line + download percent
+coder_install_status() {
+    local last pct
+    last="$(clean_installer_log "$LOG_FILE" | tail -n 1 | cut -c1-60)"
+    pct="$(tr '\r' '\n' <"$LOG_FILE" | grep -Eo '[0-9]+(\.[0-9])?%' | tail -n 1)"
+    printf 'Installing the coder CLI%s%s' "${last:+ · $last}" "${pct:+ · $pct}"
+}
+# install_coder PREFIX — run Coder's official installer behind a live status line; show what it did afterwards
+install_coder() {
+    local prefix="$1" rc
+    : >"$LOG_FILE"
+    curl -fsSL https://coder.com/install.sh 2>>"$LOG_FILE" | sh -s -- --method standalone --prefix "$prefix" >>"$LOG_FILE" 2>&1 &
+    SPIN_STATUS_FN=coder_install_status spin $! "Installing the coder CLI (downloading ~100 MB)"
+    rc=$?
+    clean_installer_log "$LOG_FILE" | while IFS= read -r line; do info "$line"; done
+    [ "$rc" -eq 0 ] && [ -x "${prefix}/bin/coder" ]
+}
+
 stage_preflight() {
     step "Checking your machine"
     local missing=()
@@ -244,8 +268,7 @@ stage_preflight() {
         local cmd='curl -fsSL https://coder.com/install.sh | sh -s -- --method standalone --prefix "$HOME/.local"'
         warn "The 'coder' CLI is not installed"
         if is_tty && [[ "$(ask "Install it now? (runs the official installer from coder.com)" "Y")" =~ ^[Yy] ]]; then
-            curl -fsSL https://coder.com/install.sh | sh -s -- --method standalone --prefix "$HOME/.local" >/dev/null 2>&1 \
-                || die "Could not install the coder CLI." "Run it yourself:  ${cmd}"
+            install_coder "$HOME/.local" || die "Could not install the coder CLI." "Run it yourself:  ${cmd}" "Installer output: ${LOG_FILE}"
             export PATH="$HOME/.local/bin:$PATH"
             have coder || die "coder CLI installed but not on PATH." "Add ~/.local/bin to PATH"
         else
