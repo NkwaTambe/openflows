@@ -269,6 +269,7 @@ These are optional — the defaults work out of the box. Only touch them if you 
 | `CODER_URL` | `http://localhost:7080` | Set only if you host Coder elsewhere. |
 | `CODER_PORT` | `7080` | Host port for Coder. Change if the default is taken. |
 | `OPENFLOWS_LLM_PROVIDER` / `OPENFLOWS_LLM_API_KEY` / `OPENFLOWS_LLM_MODEL` | unset | Read by `./scripts/setup.sh` for non-interactive LLM setup (`anthropic`, `openai`, `openrouter`, `google`). |
+| `CODER_MAX_TOKEN_LIFETIME` / `CODER_DEFAULT_TOKEN_LIFETIME` | `2160h` | Coder API token lifetime cap and default (Coder's own default is 7 days). Applied to a running stack on the next `docker compose up -d`. |
 | `OPENFLOWS_TENANT` | `default` | Namespace for Redis keys. |
 | `CODER_CHAT_HOOK_SECRET` | required | Generate 32+ random bytes, for example `openssl rand -hex 32`; hook URL/experiment/bind values are wired automatically. |
 | `OPENFLOWS_HOOK_URL` | `http://openflows-nexus:3001/experimental/hooks/chat` | Single source of truth for the hook endpoint, shared between Coder and the consumer. The consumer picks it up via bootstrap; after changing it on an existing deployment, recreate the Nexus workspace (see [Rotating the secret](#rotating-the-secret)). |
@@ -309,7 +310,9 @@ Or via the dashboard: **Admin settings → Organizations → `<your org>` → Me
 
 ### My `CODER_SESSION_TOKEN` stopped working
 
-Coder API tokens last 7 days by default. Re-run `./scripts/setup.sh` — it detects the expired token and walks you through creating a new one.
+Tokens created by `setup.sh` last 90 days (`CODER_MAX_TOKEN_LIFETIME` / `CODER_DEFAULT_TOKEN_LIFETIME`, default `2160h`, set in `docker-compose.yml`). Re-run `./scripts/setup.sh` — it refreshes the token (silently if the password admin login is saved in `.env`, otherwise it walks you through creating a new one).
+
+The token is also copied into each tenant's nexus workspace when the tenant is created, and that copy is **not** refreshed. After rotating the token, delete the tenant's nexus workspace and add the tenant again.
 
 ### Changed `--fleet` or the repo for an existing tenant
 

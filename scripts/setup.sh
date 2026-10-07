@@ -426,6 +426,31 @@ stage_docker() {
 }
 
 # ── stage 5: Coder admin + token ────────────────────────────────────────────
+# mint_token — create a 90-day API token for the current CODER_TOKEN user (falls back to Coder's default lifetime).
+# The token is copied into each tenant's nexus workspace, so it must outlive Coder's 7-day default.
+mint_token() {
+    local t name body
+    name="openflows-setup-$(date +%Y%m%d%H%M%S)"   # unique: Coder rejects duplicate token names
+    body="{\"token_name\":\"${name}\",\"lifetime\":7776000000000000}"
+    t="$(api POST /api/v2/users/me/keys/tokens "$body" 2>/dev/null | json key || true)"
+    [ -n "$t" ] || t="$(api POST /api/v2/users/me/keys/tokens "{\"token_name\":\"${name}\"}" | json key)"
+    printf '%s' "$t"
+}
+
+# refresh_admin_token — expired token + saved password admin: log in again and mint a new token (works headless)
+refresh_admin_token() {
+    local email password session
+    email="$(env_get CODER_ADMIN_EMAIL)"; password="$(env_get CODER_ADMIN_PASSWORD)"
+    [ -n "$email" ] && [ -n "$password" ] || return 1
+    session="$(api POST /api/v2/users/login "$(python3 -c 'import json,sys;print(json.dumps({"email":sys.argv[1],"password":sys.argv[2]}))' "$email" "$password")" 2>/dev/null | json session_token || true)"
+    [ -n "$session" ] || return 1
+    CODER_TOKEN="$session"
+    local token; token="$(mint_token)"
+    [ -n "$token" ] || return 1
+    CODER_TOKEN="$token"
+    env_set CODER_SESSION_TOKEN "$token"
+}
+
 # Headless fallback (no browser): create a password admin + token through the API.
 create_admin_account() {
     local email username password session token
@@ -441,8 +466,7 @@ create_admin_account() {
     session="$(api POST /api/v2/users/login "$(python3 -c 'import json,sys;print(json.dumps({"email":sys.argv[1],"password":sys.argv[2]}))' "$email" "$password")" | json session_token)"
     [ -n "$session" ] || die "Could not log in to Coder as the new admin."
     CODER_TOKEN="$session"
-    # Coder's default token lifetime (7 days): short-lived on purpose. Re-run setup to refresh it.
-    token="$(api POST /api/v2/users/me/keys/tokens '{"token_name":"openflows-setup"}' | json key)"
+    token="$(mint_token)"
     [ -n "$token" ] || die "Could not create a Coder API token."
     CODER_TOKEN="$token"
     env_set CODER_ADMIN_EMAIL "$email"
@@ -461,6 +485,10 @@ stage_coder_token() {
         return
     fi
     CODER_TOKEN=""
+    if refresh_admin_token; then
+        ok "token expired — refreshed it with the saved admin login"
+        return
+    fi
     first_status="$(curl -s -m 10 -o /dev/null -w '%{http_code}' "$(coder_url)/api/v2/users/first")"
     if [ "$first_status" != "200" ]; then   # Coder has no users yet
         if ! is_tty || [ "${OPENFLOWS_SETUP_ADMIN:-}" = 1 ]; then
@@ -485,7 +513,7 @@ stage_coder_token() {
         "Create a token at $(coder_url)/settings/tokens and put it in .env as CODER_SESSION_TOKEN."
     info "Now create an API token so the setup can act as you:"
     info "  $(public_url)/settings/tokens   → Create Token → copy it"
-    info "  (tokens last 7 days by default — re-run this script to refresh it)"
+    info "  Pick the longest lifetime offered: the controller in each tenant workspace uses this token."
     open_url "$(coder_url)/settings/tokens"
     CODER_TOKEN="$(ask_secret 'Paste the token')"
     me="$(api GET /api/v2/users/me 2>/dev/null)" || die "That token was rejected by Coder." "Create a new one at $(coder_url)/settings/tokens"
@@ -618,9 +646,14 @@ stage_llm() {
 }
 
 # ── stage 7: bootstrap (templates) ──────────────────────────────────────────
-# templates_ready — true when all five openflows-* templates exist and the dev binary is built
+# templates_ready — true when all five openflows-* templates exist and the dev binary is newer than every source file
 templates_ready() {
-    [ -x "${ROOT}/.dev-binaries/openflows" ] || return 1
+    local bin="${ROOT}/.dev-binaries/openflows"
+    [ -x "$bin" ] || return 1
+    # Rebuild when any source or template is newer than the built binary.
+    if [ -n "$(find "${ROOT}/crates" "${ROOT}/binary" "${ROOT}/Cargo.lock" -type f -newer "$bin" -print -quit 2>/dev/null)" ]; then
+        return 1
+    fi
     api GET /api/v2/templates 2>/dev/null | python3 -c '
 import sys, json
 names = {t.get("name") for t in json.load(sys.stdin)}
@@ -632,7 +665,7 @@ stage_bootstrap() {
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
     if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && templates_ready; then
         ok "binaries and 5 templates already in place"
-        info "Rebuild after code changes with: OPENFLOWS_SETUP_FORCE_BOOTSTRAP=1 ./scripts/setup.sh"
+        info "Sources unchanged since the last build. Force a rebuild: OPENFLOWS_SETUP_FORCE_BOOTSTRAP=1 ./scripts/setup.sh"
         return
     fi
     info "Safe to wait — details are logged to .setup.log"
@@ -724,7 +757,11 @@ main() {
         REPO="$(ask 'GitHub repo to connect (owner/repo)' "$guess")"
     fi
     [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "Repo must look like owner/repo (got '${REPO}')."
-    NAME="${NAME:-${REPO/\//-}}"   # owner-repo, so orgA/backend and orgB/backend do not collide
+    if [ "$REPO" = "$saved_repo" ]; then   # same repo as last time: keep its tenant name/fleet so the workspace is reused, not duplicated
+        [ -n "$NAME" ] || NAME="$(env_get OPENFLOWS_SETUP_NAME)"
+        [ -n "$FLEET" ] || FLEET="$(env_get OPENFLOWS_SETUP_FLEET)"
+    fi
+    NAME="${NAME:-${REPO/\//-}}"   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
     NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
     FLEET="${FLEET:-1}"
     [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] || die "--fleet must be a whole number >= 1."

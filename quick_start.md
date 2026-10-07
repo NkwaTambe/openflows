@@ -39,4 +39,4 @@ Open an issue in your repo. OpenFlows picks it up, writes code, reviews it and o
 
 ## Something went wrong?
 
-Re-run `./scripts/setup.sh owner/repo` after fixing the problem it printed. Your Coder token lasts 7 days; re-running the script refreshes it. For manual steps, hooks, roles, configuration and troubleshooting, see [docs/setup-reference.md](docs/setup-reference.md).
+Re-run `./scripts/setup.sh owner/repo` after fixing the problem it printed. Your Coder token lasts 90 days; re-running the script refreshes it. For manual steps, hooks, roles, configuration and troubleshooting, see [docs/setup-reference.md](docs/setup-reference.md).
