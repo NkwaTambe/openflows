@@ -127,6 +127,11 @@ resource "coder_agent" "main" {
 
     log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >&2; }
 
+    # Ensure docker socket permissions if mounted
+    if [ -S /var/run/docker.sock ]; then
+      sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+    fi
+
     # Ensure the workspace dir is owned by the coder user so the agent and
     # the provisioner (skills/standards writes) can create files there.
     # The volume is initialized root-owned inside codercom/enterprise-base.
@@ -253,10 +258,16 @@ resource "docker_container" "workspace" {
   image = "codercom/enterprise-base:ubuntu"
   # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
   platform = "linux/amd64"
+  privileged = true
 
   volumes {
     container_path = "/home/coder/workspace"
     volume_name    = docker_volume.workspace.name
+  }
+
+  volumes {
+    container_path = "/var/run/docker.sock"
+    host_path      = "/var/run/docker.sock"
   }
 
   # Mount shared artifact files (agent definitions, skills, standards, plans).
