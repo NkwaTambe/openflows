@@ -2305,9 +2305,8 @@ impl VesselNode {
                 );
                 return Ok(false);
             }
-            let sentinel_report = format!(
-                "Satisfied by verified testing review and GitHub approval by {approver}"
-            );
+            let sentinel_report =
+                format!("Satisfied by verified testing review and GitHub approval by {approver}");
             cur = store
                 .transition(
                     ticket,
