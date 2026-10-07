@@ -2227,7 +2227,9 @@ impl VesselNode {
         pr_number: u64,
         head_sha: &str,
     ) -> Result<bool> {
-        if state.phase != config::lifecycle::Phase::Submit || state.pr_human.is_some() {
+        if state.phase != config::lifecycle::Phase::Submit
+            || (state.pr_human.is_some() && state.pr_decision.is_some())
+        {
             return Ok(false);
         }
         let reviews = match self.client.list_pr_reviews(owner, repo, pr_number).await {
@@ -2266,26 +2268,59 @@ impl VesselNode {
         let report = format!("Approved on GitHub by {approver} at {head_sha}");
 
         let current = store.lifecycle(ticket).await?;
-        if current.pr_human.is_some() || current.head.as_deref() != Some(head_sha) {
+        if (current.pr_human.is_some() && current.pr_decision.is_some())
+            || current.head.as_deref() != Some(head_sha)
+        {
             return Ok(false);
         }
-        // Record the human approval, then complete the review-delivery handshake
-        // so `merge_ready()` no longer blocks on a pending delivery.
-        let cur = store
-            .transition(
-                ticket,
-                current.version,
-                "human",
-                config::lifecycle::Event::Decide {
-                    round: current.review_round,
-                    phase: config::lifecycle::Phase::Submit,
-                    approved: true,
-                    report,
-                    revision: current.revision,
-                    head: current.head.clone(),
-                },
-            )
-            .await?;
+        // Record the human approval, satisfy pr_decision if not yet recorded,
+        // then complete the review-delivery handshake so `merge_ready()` passes.
+        let mut cur = current.clone();
+        if cur.pr_human.is_none() {
+            cur = store
+                .transition(
+                    ticket,
+                    cur.version,
+                    "human",
+                    config::lifecycle::Event::Decide {
+                        round: cur.review_round,
+                        phase: config::lifecycle::Phase::Submit,
+                        approved: true,
+                        report,
+                        revision: cur.revision,
+                        head: cur.head.clone(),
+                    },
+                )
+                .await?;
+        }
+        if cur.pr_decision.is_none() {
+            let sentinel_report = cur
+                .test_decision
+                .as_ref()
+                .map(|_| {
+                    format!(
+                        "Satisfied by verified testing review and GitHub approval by {approver}"
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!("Reconciled GitHub approval by {approver} at {head_sha}")
+                });
+            cur = store
+                .transition(
+                    ticket,
+                    cur.version,
+                    "sentinel",
+                    config::lifecycle::Event::Decide {
+                        round: cur.review_round,
+                        phase: config::lifecycle::Phase::Submit,
+                        approved: true,
+                        report: sentinel_report,
+                        revision: cur.revision,
+                        head: cur.head.clone(),
+                    },
+                )
+                .await?;
+        }
         if cur.pr_delivery.is_some() {
             store
                 .transition(
@@ -2302,7 +2337,7 @@ impl VesselNode {
             pr_number,
             ticket,
             approver = %approver,
-            "Reconciled GitHub approval into lifecycle (pr_human)"
+            "Reconciled GitHub approval into lifecycle (pr_human and pr_decision)"
         );
         Ok(true)
     }
@@ -3528,6 +3563,44 @@ mod tests {
         assert!(
             after.merge_ready("head"),
             "reconciled PR must be merge-ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_satisfies_missing_pr_decision() {
+        // When Forge opens a PR after Sentinel testing approval, pr_decision has
+        // not yet been written. Reconciling an authorized GitHub approval must
+        // satisfy both pr_human and pr_decision so merge_ready passes without
+        // waiting indefinitely for a separate sentinel review.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        // Reset status to have NO pr_decision, simulating an opened PR in submit phase
+        let test_decision = json!({"round":0,"actor":"sentinel","approved":true,"report":"ok","revision":1,"head":"head"});
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42,"test_decision":test_decision}),
+            )
+            .await;
+        let before = store.lifecycle("T-42").await.unwrap();
+        assert!(before.pr_decision.is_none());
+        assert!(!before.merge_ready("head"));
+
+        assert!(
+            run_reconcile(&node, &store).await,
+            "GitHub-approved PR should be reconciled"
+        );
+
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_human.as_ref().is_some_and(|h| h.approved));
+        assert!(after.pr_decision.as_ref().is_some_and(|d| d.approved));
+        assert!(after.pr_delivery.is_none());
+        assert!(
+            after.merge_ready("head"),
+            "reconciled PR must be merge-ready when pr_decision was originally missing"
         );
     }
 
