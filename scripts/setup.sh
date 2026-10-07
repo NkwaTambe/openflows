@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # OpenFlows one-command setup.
 #
-#   ./scripts/setup.sh [owner/repo] [--name TEAM] [--fleet N]
+#   ./scripts/setup.sh [owner/repo] [--name TEAM] [--fleet N]   (N = FORGE-SENTINEL pairs; asked when omitted)
 #
 # Idempotent: every stage checks the real state first and skips if already
 # done, so re-running after fixing a blocker resumes where it stopped.
@@ -812,6 +812,14 @@ main() {
     fi
     NAME="${NAME:-${REPO/\//-}}"   # new repo: owner-repo, so orgA/backend and orgB/backend do not collide
     NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+    if [ -z "$FLEET" ] && is_tty; then   # first run, no --fleet given: ask (a re-run reuses the saved value)
+        printf '\n  %sFleet = FORGE-SENTINEL pairs (a builder plus its reviewer). 1 pair works one issue at a time;\n  N pairs work N issues in parallel, using more LLM tokens and workspaces. Start small — you can add more later.%s\n' "$D" "$N"
+        while true; do
+            FLEET="$(ask 'How many FORGE-SENTINEL pairs?' 1)"
+            [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] && break
+            warn "Enter a whole number, 1 or more"
+        done
+    fi
     FLEET="${FLEET:-1}"
     [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] || die "--fleet must be a whole number >= 1."
 
@@ -830,6 +838,7 @@ main() {
     RAIL_OPEN=0
     panel "$G" "✓ All set · $((SECONDS - START_TIME))s" "" \
         "Open an issue in ${REPO} and OpenFlows picks it up." "" \
+        "Fleet        ${FLEET} FORGE-SENTINEL pair(s)" \
         "Dashboard    $(coder_url)" \
         "Health       ./scripts/prod.sh doctor" \
         "Add a repo   ./scripts/prod.sh tenant owner/repo --name team --fleet 1" ""

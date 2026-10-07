@@ -27,7 +27,7 @@ It will:
 7. Build binaries and push the workspace templates (first run takes about 10 minutes).
 8. Connect your repo. You click **Authorize** once to link GitHub to your Coder account; the script opens the page and waits.
 
-Options: `--name TEAM` (default: repo name) and `--fleet N` (FORGE-SENTINEL pairs, default `1`).
+The script asks how many **FORGE-SENTINEL pairs** (the fleet) to run: one pair works one issue at a time, N pairs work N issues in parallel and use more LLM tokens. Start with `1`. To skip the question, pass it: `./scripts/setup.sh owner/repo --fleet 3`. Other option: `--name TEAM` (default: `owner-repo`).
 
 ## Use it
 
