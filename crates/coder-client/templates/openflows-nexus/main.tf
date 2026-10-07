@@ -64,13 +64,6 @@ data "coder_parameter" "github_repository" {
   type        = "string"
 }
 
-data "coder_parameter" "github_pat" {
-  name        = "github_pat"
-  description  = "GitHub Personal Access Token for issue/PR sync"
-  default     = ""
-  type        = "string"
-}
-
 data "coder_parameter" "coder_chat_hook_secret" {
   name        = "coder_chat_hook_secret"
   description = "Required shared OpenFlows/Coder lifecycle hook signing secret (32+ random bytes)"
@@ -109,45 +102,48 @@ resource "coder_agent" "main" {
     # TEMPORARY: Use mounted dev binary for local testing
     # (In production, download from GitHub releases instead)
     if [ -f /opt/openflows-dev/openflows ]; then
-      echo "Using mounted dev binary..."
-      sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
-      sudo chmod +x /usr/local/bin/openflows
+      # Guard against a non-ELF binary being mounted (e.g. a macOS Mach-O
+      # accidentally synced from a macOS dev host). Copying it over
+      # /usr/local/bin/openflows would brick the controller with cryptic
+      # `__PAGEZERO__: not found` errors when sh falls back to parsing the
+      # binary as a script after the kernel returns ENOEXEC.
+      if head -c 4 /opt/openflows-dev/openflows | grep -q $'\x7fELF'; then
+        echo "Using mounted dev binary..."
+        sudo cp /opt/openflows-dev/openflows /usr/local/bin/openflows
+        sudo chmod +x /usr/local/bin/openflows
 
-      # Self-healing: if the workspace has a git checkout, warn when the
-      # mounted binary is older than the latest source commit.  This catches
-      # the case where someone forgot to run 'make dev-sync' before starting
-      # the workspace.
-      if [ -d /home/coder/workspace/.git ]; then
-        BIN_MTIME=$(stat -c %Y /opt/openflows-dev/openflows 2>/dev/null || echo 0)
-        LAST_COMMIT=$(cd /home/coder/workspace && git log -1 --format=%ct 2>/dev/null || echo 0)
-        if [ "$LAST_COMMIT" -gt 0 ] && [ "$BIN_MTIME" -gt 0 ] && [ "$LAST_COMMIT" -gt "$BIN_MTIME" ]; then
-          echo "WARNING: Dev binary (mt=$BIN_MTIME) is older than the latest commit (ts=$LAST_COMMIT)" >&2
-          echo "         Run 'make dev-sync' on the host to rebuild and update the binary" >&2
+        # Self-healing: if the workspace has a git checkout, warn when the
+        # mounted binary is older than the latest source commit.  This catches
+        # the case where someone forgot to run 'make dev-sync' before starting
+        # the workspace.
+        if [ -d /home/coder/workspace/.git ]; then
+          BIN_MTIME=$(stat -c %Y /opt/openflows-dev/openflows 2>/dev/null || echo 0)
+          LAST_COMMIT=$(cd /home/coder/workspace && git log -1 --format=%ct 2>/dev/null || echo 0)
+          if [ "$LAST_COMMIT" -gt 0 ] && [ "$BIN_MTIME" -gt 0 ] && [ "$LAST_COMMIT" -gt "$BIN_MTIME" ]; then
+            echo "WARNING: Dev binary (mt=$BIN_MTIME) is older than the latest commit (ts=$LAST_COMMIT)" >&2
+            echo "         Run 'make dev-sync' on the host to rebuild and update the binary" >&2
+          fi
         fi
+      else
+        echo "WARNING: Mounted dev binary is not a Linux ELF; keeping the image's built-in binary." >&2
+        echo "         Run 'make dev-sync' on the host to rebuild for $${LINUX_TARGET:-x86_64-unknown-linux-musl}." >&2
       fi
     else
       echo "WARNING: Dev binary not found at /opt/openflows-dev/openflows"
       echo "Controller will not start. Mount .dev-binaries in docker-compose.yml"
     fi
 
-    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
-    # (github_pat) because a PAT can be scoped to the target repo/org and works
-    # regardless of GitHub App install scope. Fall back to the Coder GitHub App
-    # external-auth token (surfaces the "Login with GitHub" button in the UI).
-    # A persistent store is a deliberate fallback over Coder's automatic
-    # GIT_ASKPASS auth: agent-executed git (push) can run in a subprocess
-    # environment without GIT_ASKPASS, so we pin the token once here.
-    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
-    if [ -z "$GIT_TOKEN" ]; then
-      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
-    fi
+    # Setup git credentials from Coder external auth (the tenant's linked
+    # GitHub App token). PAT flow removed — external auth is the sole source.
+    # The Controller resolves its own GitHub token from CODER_EXTERNAL_AUTH_*.
+    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
     if [ -n "$GIT_TOKEN" ]; then
       git config --global credential.helper store
       echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
       chmod 600 /home/coder/.git-credentials
       echo "Configured git credentials for GitHub"
     else
-      echo "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth)"
+      echo "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth)"
     fi
 
     # git pull or clone (creds via Coder external auth)
@@ -198,9 +194,6 @@ resource "coder_agent" "main" {
     if [ -n "${data.coder_parameter.coder_chat_hook_url.value}" ]; then
       export CODER_CHAT_HOOK_URL="${data.coder_parameter.coder_chat_hook_url.value}"
     fi
-    # GitHub PAT for issue sync - export as env var so controller picks it up automatically
-    export GITHUB_TOKEN="${data.coder_parameter.github_pat.value}"
-    echo "${data.coder_parameter.github_pat.value}" > /tmp/github_token 2>/dev/null || true
 
     cd /home/coder/workspace
 
@@ -232,6 +225,8 @@ resource "docker_volume" "artifacts" {
 resource "docker_container" "workspace" {
   name  = "openflows-nexus-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -262,11 +257,15 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TENANT=${data.coder_parameter.tenant.value}",
     "GITHUB_REPOSITORY=${data.coder_parameter.github_repository.value}",
     "OPENFLOWS_REGISTRY_JSON=${data.coder_parameter.registry_json.value}",
-    "GITHUB_TOKEN=${data.coder_parameter.github_pat.value}",
     "CODER_CHAT_HOOK_SECRET=${data.coder_parameter.coder_chat_hook_secret.value}",
     "CODER_CHAT_HOOK_URL=${data.coder_parameter.coder_chat_hook_url.value}",
     "ROLE=nexus",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
+    # Controller resolves its GitHub token from CODER_EXTERNAL_AUTH_* (the
+    # tenant owner's linked GitHub App token). Export it here: Coder injects the
+    # provider token only for `git` via GIT_ASKPASS, not as a general-purpose
+    # env var, so without this the controller's resolve_token() would find nothing.
+    "CODER_EXTERNAL_AUTH_PRIMARY_GITHUB_ACCESS_TOKEN=${data.coder_external_auth.github.access_token}",
     # Bind the A2A relay on all interfaces so Forge/Sentinel workspaces can
     # reach it over the shared docker network (issue #143). Workspaces address
     # it via the `openflows-nexus` network alias below.

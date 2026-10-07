@@ -55,6 +55,26 @@ data "coder_parameter" "repo_url" {
   type        = "string"
 }
 
+data "coder_parameter" "branch" {
+  name        = "branch"
+  description  = "Remote branch to check out (the PR branch for an existing PR). Empty = create or resume the worker/ticket branch."
+  default     = ""
+  type        = "string"
+}
+
+# The requested branch is interpolated directly into the startup bash script.
+# A branch name containing shell metacharacters (e.g. `$(...)`) would otherwise
+# be evaluated by bash as command substitution, so validate it against a charset
+# that accepts all git-valid, shell-safe characters and fall back to the default
+# branch when it does not match. `+`, `=`, `@`, `.`, `_`, `-`, `/` are all legal
+# in git ref names and safe in the shell; anything else (dollar, backtick,
+# parens, quotes, spaces, `;`, `&`, `|`, `<`, `>`, `!`, `*`, `?`, `[`, `]`,
+# `~`, `\`, `#`) is rejected so a malicious branch cannot inject shell commands.
+locals {
+  requested_branch = data.coder_parameter.branch.value
+  safe_branch      = can(regex("^[A-Za-z0-9._/+@=-]+$", local.requested_branch)) ? local.requested_branch : ""
+}
+
 data "coder_parameter" "tenant" {
   name        = "tenant"
   description  = "OpenFlows tenant identifier"
@@ -62,16 +82,17 @@ data "coder_parameter" "tenant" {
   type        = "string"
 }
 
+data "coder_parameter" "a2a_pair_token" {
+  name        = "a2a_pair_token"
+  description = "Pair-scoped token used by Sentinel/FORGE to authenticate A2A verification RPCs"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "coder_url" {
   name        = "coder_url"
   description  = "Coder server URL for API calls"
-  default     = ""
-  type        = "string"
-}
-
-data "coder_parameter" "github_pat" {
-  name        = "github_pat"
-  description  = "GitHub Personal Access Token for git clone/push in the workspace"
   default     = ""
   type        = "string"
 }
@@ -191,26 +212,100 @@ resource "coder_agent" "main" {
     print(f"wrote {settings_path} with {len(hooks)} hook events", file=sys.stderr)
     PYEOF
 
-    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
-    # (github_pat, e.g. from CODER_GITHUB_TOKEN) because a PAT can be scoped to
-    # the target repo/org and works regardless of GitHub App install scope.
-    # Fall back to the Coder GitHub App external-auth token (surfaces the
-    # "Login with GitHub" button in the workspace UI). A persistent store is a
-    # deliberate fallback over Coder's automatic GIT_ASKPASS auth: agent-executed
-    # git (push) can run in a subprocess environment without GIT_ASKPASS, so we
-    # pin the token once here.
-    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
+    # Inherit the controller-spawner's GitHub identity from Coder external
+    # auth (the tenant's linked GitHub App token). The workspace owner IS the
+    # controller-spawner (see create_workspace_for_user in coder-client), so
+    # this token resolves to the real account the workspace should commit and
+    # open PRs as. This is a REQUIRED, verified identity: startup fails loudly
+    # if it cannot be established — never a silent REST-API fallback.
+    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
     if [ -z "$GIT_TOKEN" ]; then
-      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
+      log "FATAL: no inherited GitHub credential for the controller-spawner (workspace owner external auth is not linked)"
+      exit 1
     fi
-    if [ -n "$GIT_TOKEN" ]; then
-      git config --global credential.helper store
-      echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
-      chmod 600 /home/coder/.git-credentials
-      log "Configured git credentials for GitHub push auth"
+
+    # System-level helper so git works for BOTH the agent user (pushes) and
+    # the sudo'd root clone below (their $HOME differ).
+    sudo git config --system credential.helper store
+    echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
+    chmod 600 /home/coder/.git-credentials
+    sudo mkdir -p /root
+    sudo cp /home/coder/.git-credentials /root/.git-credentials
+    sudo chmod 600 /root/.git-credentials
+    log "Configured git credentials for GitHub push auth"
+
+    # Install the GitHub CLI so the agent can open PRs with `gh pr create`
+    # instead of hand-rolling the REST API. gh is best-effort, NOT a hard
+    # startup dependency: the git credential helper above is the real push
+    # mechanism, so a workspace with a valid repo seed still starts even if gh
+    # cannot be installed (the agent can open the PR via REST/UI instead).
+    if ! command -v gh >/dev/null 2>&1; then
+      # Ubuntu base image (codercom/enterprise-base): prefer the official
+      # GitHub apt repo (always current), fall back to the distro package.
+      sudo mkdir -p -m 0755 /etc/apt/keyrings 2>/dev/null || true
+      sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg 2>/dev/null || true
+      if [ -s /etc/apt/keyrings/githubcli-archive-keyring.gpg ]; then
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+          | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+      fi
+      sudo apt-get update -qq >/dev/null 2>&1 || true
+      sudo apt-get install -y -qq gh >/dev/null 2>&1 || true
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+      # Authenticate gh persistently as the inherited identity for BOTH the
+      # `coder` user and `root` (the sudo'd clone below uses root's $HOME).
+      # --hostname + --git-protocol make the stored credential explicit and
+      # deterministic (non-interactive). The token travels through stdin for
+      # the root login too — never embedded in a command-line argument that
+      # another process could read. Failures are fatal, never swallowed.
+      printf '%s' "$GIT_TOKEN" | gh auth login --hostname github.com --git-protocol https --with-token \
+        || { log "FATAL: gh auth login failed for user coder"; exit 1; }
+      printf '%s' "$GIT_TOKEN" | sudo -H bash -c 'IFS= read -r tok || [ -n "$tok" ] || exit 1; printf "%s" "$tok" | gh auth login --hostname github.com --git-protocol https --with-token' \
+        || { log "FATAL: gh auth login failed for user root"; exit 1; }
     else
-      log "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
+      log "WARNING: GitHub CLI (gh) unavailable — agent should push via git and open the PR through the REST API or GitHub UI"
     fi
+
+    # Resolve the expected account from the inherited token via the GitHub API
+    # (the coder_external_auth data source does not expose the login). Honor
+    # GITHUB_API_BASE so self-hosted setups match the rest of the system.
+    EXPECTED_LOGIN=$(curl -fsSL -H "Authorization: token $GIT_TOKEN" "$${GITHUB_API_BASE:-https://api.github.com}/user" \
+      | python3 -c 'import sys,json;print(json.load(sys.stdin)["login"])') \
+      || { log "FATAL: could not resolve the inherited GitHub identity from the external-auth token"; exit 1; }
+    if [ -z "$EXPECTED_LOGIN" ]; then
+      log "FATAL: resolved an empty inherited GitHub identity from the external-auth token"
+      exit 1
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+      # Verify the authed gh identity actually matches the inherited account, so
+      # gh/git act as the controller-spawner — never a dummy or mismatched login.
+      AUTHED_LOGIN=$(gh api user --jq .login) \
+        || { log "FATAL: could not query the authed gh identity"; exit 1; }
+      if [ "$AUTHED_LOGIN" != "$EXPECTED_LOGIN" ]; then
+        log "FATAL: gh authed as '$AUTHED_LOGIN' but the inherited token resolves to '$EXPECTED_LOGIN' — identity mismatch"
+        exit 1
+      fi
+      log "Inherited GitHub identity verified: $EXPECTED_LOGIN"
+    else
+      log "WARNING: gh unavailable — skipping gh identity check; git push uses the inherited token via the credential helper"
+    fi
+
+    # Set git author identity from the inherited account (the template sets
+    # none today, so commits would fail or use a wrong default identity).
+    # GitHub's noreply email keeps the address private and avoids the
+    # "private email" bot. Apply for coder and root (both push/clone).
+    git config --global user.name "$EXPECTED_LOGIN"
+    git config --global user.email "$EXPECTED_LOGIN@users.noreply.github.com"
+    sudo -H bash -c "git config --global user.name '$EXPECTED_LOGIN'; git config --global user.email '$EXPECTED_LOGIN@users.noreply.github.com'"
+
+    # Record the resolved identity (non-secret) so FORGE knows which account it
+    # is committing/pushing as. Stored in $HOME, NOT the clone destination
+    # (/home/coder/workspace), so it never makes the destination non-empty and
+    # blocks `git clone`/`cp -a` below. Never write the token anywhere.
+    echo "$EXPECTED_LOGIN" > /home/coder/.openflows-gh-identity 2>/dev/null || true
 
     # Acquire the repository. Prefer the golden offline seed from the shared
     # artifacts volume (see docs §3.2): copy -> refresh -> checkout -> work.
@@ -219,10 +314,16 @@ resource "coder_agent" "main" {
     # workspace, because an agent with no repo cannot do useful work and the
     # old silent `2>/dev/null` clone was the root cause of empty workspaces.
     GOLDEN_REPO="/home/coder/.openflows/artifacts/repo"
+    # The target branch: when the controller passes a PR `branch` (rework of an
+    # existing PR), check that out so already-done work is NOT redone. When
+    # empty, create or resume the worker/ticket branch (fresh work).
+    TARGET_BRANCH="${local.safe_branch}"
+    TICKET_ID="${data.coder_parameter.ticket_id.value}"
     # The fresh workspace volume is root-owned initially, so any copy/clone
     # into /home/coder/workspace must run via sudo (then be chowned back).
     if [ -d /home/coder/workspace/.git ]; then
       cd /home/coder/workspace && git pull 2>/dev/null || true
+      git fetch --all --prune 2>/dev/null || true
     elif [ -d "$GOLDEN_REPO/.git" ]; then
       sudo cp -a "$GOLDEN_REPO/." /home/coder/workspace/ 2>/tmp/forge_golden_err.log
       sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
@@ -230,18 +331,93 @@ resource "coder_agent" "main" {
       # Refresh to latest before checkout (design: copy -> refresh -> checkout).
       cd /home/coder/workspace
       git fetch --all --prune 2>/dev/null || true
-      # Checkout the default branch head so work never begins on a stale tree.
-      git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
     elif [ -n "${data.coder_parameter.repo_url.value}" ]; then
       log "WARNING: no golden repo seed at $GOLDEN_REPO — falling back to direct clone"
       if sudo git clone "${data.coder_parameter.repo_url.value}" /home/coder/workspace 2>/tmp/forge_clone_err.log; then
         sudo chown -R coder:coder /home/coder/workspace 2>/dev/null || true
         log "Cloned repository into /home/coder/workspace"
+        cd /home/coder/workspace
+        git fetch --all --prune 2>/dev/null || true
       else
         log "WARNING: git clone failed — $(tail -5 /tmp/forge_clone_err.log 2>/dev/null)"
       fi
     else
       log "WARNING: no repo_url and no golden repo seed — workspace has no repository"
+    fi
+
+    # When we cannot get onto the intended PR branch, record it so the rework
+    # flow does not treat the current branch as the PR branch and push the fix
+    # to the wrong remote branch. The agent stays available, but the mismatch is
+    # made visible via a workspace-root marker plus a prominent startup log.
+    warn_branch_mismatch() {
+      local intended="$1"
+      local current
+      current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+      log "WARNING: workspace is on branch '$current', NOT the intended PR branch '$intended' — rework must NOT push to the current branch"
+      {
+        echo "# REWORK BRANCH MISMATCH"
+        echo ""
+        echo "The startup script could not switch to the intended PR branch \`$intended\`."
+        echo "The workspace is currently on branch \`$current\`, which is NOT the PR branch."
+        echo ""
+        echo "**Do NOT run \`git push\` on the current branch** — it is not the PR branch and"
+        echo "pushing here would update the wrong branch, not the PR."
+        echo "Resolve the local conflict or uncommitted changes and switch to \`$intended\`"
+        echo "before performing any push."
+      # Best-effort marker: if the workspace is not writable by `coder` the write
+      # may fail. It must never abort startup via `set -e` — the log warning above
+      # already carries the message, and FORGE must stay available to resolve the
+      # mismatch.
+      } > /home/coder/workspace/REWORK_BRANCH_MISMATCH.md || true
+    }
+
+    # Checkout the target branch. For rework of an existing PR, this resumes the
+    # branch where the work was already done (never redo completed work).
+    # Fresh assignments get a worker/ticket branch seeded from the default head.
+    if [ -d /home/coder/workspace/.git ]; then
+      cd /home/coder/workspace
+      if [ -n "$TARGET_BRANCH" ]; then
+        # Resume the PR branch on a NAMED local branch (never detached, so the
+        # CI-fix / /address_review flow can push with plain `git push`). Prefer
+        # an already-existing local branch (reused workspace) to avoid discarding
+        # in-flight work, then create a tracking branch from origin. If the PR
+        # branch is not present locally or under origin (e.g. a fork-backed PR
+        # whose head ref is not on this origin), fall back to the default branch
+        # WITHOUT fabricating a branch of the PR's name at origin/HEAD — doing so
+        # would start rework without the PR's commits and could reset existing
+        # local work.
+        if git rev-parse --verify --quiet "refs/heads/$TARGET_BRANCH" >/dev/null; then
+          # The local branch exists but the switch can still fail (uncommitted
+          # work or an unresolved merge blocks it). That must NOT abort startup
+          # via `set -e` — keep the agent available, but flag the mismatch so the
+          # rework flow does not push to the wrong branch.
+          if git checkout "$TARGET_BRANCH" 2>/dev/null; then
+            log "Checked out existing local branch: $TARGET_BRANCH"
+          else
+            warn_branch_mismatch "$TARGET_BRANCH"
+          fi
+        elif git checkout -B "$TARGET_BRANCH" --track "origin/$TARGET_BRANCH" 2>/dev/null; then
+          log "Checked out target branch: $TARGET_BRANCH"
+        else
+          git checkout origin/HEAD 2>/dev/null || git checkout main 2>/dev/null || true
+          warn_branch_mismatch "$TARGET_BRANCH"
+        fi
+      else
+        # Fresh assignments own a named branch. Reuse local work on restart.
+        WORK_BRANCH="$ROLE/$TICKET_ID"
+        if [ -z "$TICKET_ID" ] || ! git check-ref-format --branch "$WORK_BRANCH" >/dev/null 2>&1; then
+          log "ERROR: cannot derive worker/ticket branch"
+          exit 1
+        fi
+        if git show-ref --verify --quiet "refs/heads/$WORK_BRANCH"; then
+          git checkout "$WORK_BRANCH" || { warn_branch_mismatch "$WORK_BRANCH"; exit 1; }
+        elif git show-ref --verify --quiet "refs/remotes/origin/$WORK_BRANCH"; then
+          git checkout --track -b "$WORK_BRANCH" "origin/$WORK_BRANCH"
+        else
+          git checkout --no-track -b "$WORK_BRANCH" origin/HEAD || git checkout --no-track -b "$WORK_BRANCH"
+        fi
+        log "Assignment branch ready: $WORK_BRANCH"
+      fi
     fi
 
     # Start heartbeat daemon (the ONLY Redis client in the workspace).
@@ -253,15 +429,19 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="$ROLE_BASE"
     export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
     log "Heartbeat daemon started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET)"
 
     # Start verify executor daemon (task 5 of issue #143: A2A delegated verification)
-    # Subscribes to verify tasks from nexus relay, executes them in sandbox, returns results.
+    # Executes tasks in temporary checkouts using this workspace's tools and environment.
     # Uses the same environment as heartbeat (REDIS_URL, OPENFLOWS_TENANT, OPENFLOWS_TICKET, OPENFLOWS_ROLE).
-    # This is a long-running process that polls for task assignments via SSE.
-    nohup openflows-harness verify serve >/dev/null 2>&1 &
+    # Supervise startup failures (including Redis/relay races) outside the agent chat.
+    # Keep diagnostics outside the checkout so candidate-head checks stay clean.
+    mkdir -p /home/coder/.local/state/openflows
+    nohup bash -c 'while true; do openflows-harness verify serve; sleep 5; done' \
+      >>/home/coder/.local/state/openflows/verify.log 2>&1 &
     log "Verify executor started (role=$ROLE_BASE ticket=$OPENFLOWS_TICKET) — issue #143 task 5"
 
     # ── Start coding agent ──────────────────────────────────────────────
@@ -306,6 +486,8 @@ resource "docker_volume" "workspace" {
 resource "docker_container" "workspace" {
   name  = "openflows-${data.coder_parameter.role.value}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -337,6 +519,7 @@ resource "docker_container" "workspace" {
     # Base role (forge-1 -> forge): harness Redis keys are namespaced by base role
     "OPENFLOWS_ROLE=${replace(data.coder_parameter.role.value, "/-[0-9]+$/", "")}",
     "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

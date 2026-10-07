@@ -21,12 +21,13 @@ const CONTROLLER_POLL_INTERVAL: Duration = Duration::from_secs(15);
 #[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the Controller orchestration loop (default inside nexus workspace)
+    /// Run the Controller orchestration loop. The per-tenant nexus workspace
+    /// auto-starts this on workspace boot; it is not a general host command.
     Run {
         /// Clear this tenant's runtime SharedStore state before starting
         #[arg(long)]
@@ -78,6 +79,9 @@ enum TenantCommands {
         /// Tenant name (defaults to repo owner)
         #[arg(long)]
         name: Option<String>,
+        /// Number of FORGE-SENTINEL pairs (fleet size) for this tenant
+        #[arg(long)]
+        fleet: u32,
     },
     /// List all tenants (from Redis namespaces)
     List,
@@ -130,6 +134,25 @@ enum StoreCommands {
 
 #[derive(Subcommand)]
 enum GateCommands {
+    /// Record a human decision for the exact testing or PR submission candidate.
+    Decide {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        ticket: String,
+        #[arg(long, value_parser=["testing","submit"])]
+        phase: String,
+        #[arg(long,value_parser=["approve","reject"])]
+        verdict: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        round: u64,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        notes: String,
+    },
     /// Approve a phase transition gate
     Approve {
         /// Tenant name
@@ -201,7 +224,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    match cli.command.unwrap_or(Commands::Run { reset_store: false }) {
+    // No implicit default command: the controller auto-starts inside each
+    // tenant's nexus workspace when the tenant is added, so a bare `openflows`
+    // must not silently start a duplicate host controller. Require an explicit
+    // subcommand (one is already enforced by clap below).
+    match cli.command {
         Commands::Run { reset_store } => run_controller(reset_store).await,
         Commands::Bootstrap => run_bootstrap().await,
         Commands::Tenant { action } => run_tenant(action).await,
@@ -221,19 +248,6 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     let _coder_token = cfg.coder.effective_token();
     let redis_url = cfg.infra.effective_redis_url();
     let tenant = cfg.tenant.effective_tenant().to_string();
-    let github_repo = cfg
-        .github
-        .repository
-        .clone()
-        .context("GITHUB_REPOSITORY is not set. The Controller must run inside an openflows-nexus workspace.")?;
-
-    tracing::info!(
-        coder_url,
-        redis_url,
-        tenant,
-        github_repo,
-        "OpenFlows Controller starting (Coder-only mode)"
-    );
 
     // ── Initialize SharedStore (Redis required — no in-memory fallback) ─
     // Tenant-aware: all keys are prefixed with ns:{tenant}: for isolation
@@ -248,6 +262,31 @@ async fn run_controller(reset_store: bool) -> Result<()> {
             "Reset tenant runtime SharedStore state before controller start"
         );
     }
+
+    // Resolve the target repository: prefer the environment (injected per-tenant
+    // by the nexus template as GITHUB_REPOSITORY), then fall back to the tenant's
+    // Redis `repository` key. Fail fast if neither is available so the controller
+    // never runs silently without a repo to process.
+    let github_repo = match cfg.github.repository.clone() {
+        Some(repo) if !repo.is_empty() => repo,
+        _ => store
+            .get("repository")
+            .await
+            .and_then(|v| v.as_str().map(String::from))
+            .filter(|s| !s.is_empty())
+            .context(
+                "No target repository configured: set GITHUB_REPOSITORY (host/dev run) or add a \
+                 tenant first with `openflows tenant add <owner/repo>`.",
+            )?,
+    };
+
+    tracing::info!(
+        coder_url,
+        redis_url,
+        tenant,
+        github_repo,
+        "OpenFlows Controller starting (Coder-only mode)"
+    );
 
     // The relay runs as a background HTTP server, handling A2A JSON-RPC
     // requests from Sentinel/Forge workspaces (verify requests, streaming
@@ -273,6 +312,20 @@ async fn run_controller(reset_store: bool) -> Result<()> {
     resolver.validate()?;
 
     let registry_path = resolver.registry_path();
+    // Persist a tenant-supplied OPENFLOWS_REGISTRY_JSON onto the file-first registry.
+    if let Ok(env_json) = std::env::var("OPENFLOWS_REGISTRY_JSON") {
+        if !env_json.trim().is_empty() {
+            let validated: config::Registry = serde_json::from_str(&env_json).context(
+                "Invalid OPENFLOWS_REGISTRY_JSON; refusing to discard the requested tenant fleet",
+            )?;
+            let pretty = serde_json::to_string_pretty(&validated)?;
+            std::fs::write(&registry_path, pretty).context(
+                "Cannot persist requested tenant fleet registry; refusing bundled defaults",
+            )?;
+            tracing::info!(path = %registry_path.display(), "Loaded requested tenant fleet registry");
+        }
+    }
+
     let registry = config::Registry::load(&registry_path)?;
     let registry_json = serde_json::to_string_pretty(&registry)?;
     std::env::set_var("OPENFLOWS_REGISTRY_PATH", &registry_path);
@@ -305,6 +358,10 @@ async fn run_controller(reset_store: bool) -> Result<()> {
         Some(agent_nexus::hooks::HookBootstrapContext {
             persona_by_role,
             skills_dir: Some(orch_dir.join("plugin/skills")),
+            skills_by_role: registry
+                .active_agents()
+                .map(|e| (e.id.clone(), e.skills.clone()))
+                .collect(),
             commands_dir: Some(orch_dir.join("plugin/commands")),
         })
     };
@@ -382,9 +439,10 @@ async fn run_controller(reset_store: bool) -> Result<()> {
 
     // ── Build flow graph ────────────────────────────────────────────────
     use openflows::state::{
-        ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_DEPLOYED, ACTION_DEPLOY_FAILED,
-        ACTION_DOCS_COMPLETE, ACTION_FAILED, ACTION_MERGE_PRS, ACTION_NO_WORK,
-        ACTION_PLANNING_GATE, ACTION_PR_OPENED, ACTION_WORK_ASSIGNED,
+        ACTION_ADDRESS_REVIEW_DISPATCHED, ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED,
+        ACTION_DEPLOYED, ACTION_DEPLOY_FAILED, ACTION_DOCS_COMPLETE, ACTION_FAILED,
+        ACTION_MERGE_PRS, ACTION_NO_WORK, ACTION_PLANNING_GATE, ACTION_PR_OPENED,
+        ACTION_REWORK_PROVISION_NEEDED, ACTION_WORK_ASSIGNED,
     };
 
     let review_approve = "review_approve";
@@ -400,6 +458,7 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 (ACTION_MERGE_PRS, "vessel"),
                 ("approve_command", "forge_pair"),
                 ("reject_command", "nexus"),
+                ("rework_assigned", "forge_pair"),
                 ("sentinel_spawned", "sentinel"), // After spawning Sentinel, route to it
             ],
         )
@@ -430,6 +489,8 @@ async fn run_controller(reset_store: bool) -> Result<()> {
                 (ACTION_CI_FIX_NEEDED, "forge_pair"),
                 ("merge_blocked", "nexus"),
                 (ACTION_CONFLICTS_DETECTED, "forge_pair"),
+                (ACTION_ADDRESS_REVIEW_DISPATCHED, "forge_pair"),
+                (ACTION_REWORK_PROVISION_NEEDED, "nexus"),
                 (pocketflow_core::Action::AWAITING_HUMAN, "nexus"),
                 ("no_work", "nexus"),
             ];
@@ -648,21 +709,64 @@ async fn run_tenant(action: TenantCommands) -> Result<()> {
         .context("Bootstrap required before tenant operations")?;
 
     match action {
-        TenantCommands::Add { repo, name } => {
+        TenantCommands::Add { repo, name, fleet } => {
+            if fleet < 1 {
+                anyhow::bail!(
+                    "--fleet must be >= 1 (a fleet of N means N FORGE-SENTINEL pairs); got {}",
+                    fleet
+                );
+            }
             let tenant_name =
                 name.unwrap_or_else(|| repo.split('/').next().unwrap_or(&repo).to_string());
             validate_tenant_name(&tenant_name)?;
 
+            // Derive the tenant fleet registry with pairs applied to forge/sentinel.
+            let resolver = openflows::orchestration::OrchestrationResolver::new()
+                .context("Failed to resolve orchestration registry")?;
+            let registry_path = resolver.registry_path();
+            let base_registry = config::Registry::load(&registry_path).with_context(|| {
+                format!("cannot load base registry at {}", registry_path.display())
+            })?;
+            let tenant_registry = base_registry.with_team_fleet(fleet);
+            let registry_json = serde_json::to_string_pretty(&tenant_registry)?;
+
             println!(
-                "Adding tenant '{}' for repository '{}'...",
-                tenant_name, repo
+                "Adding tenant '{}' for repository '{}' with fleet {} ({} forge + {} sentinel pairs)...",
+                tenant_name, repo, fleet, fleet, fleet
             );
             let workspace_id = bootstrapper
-                .ensure_tenant(&client, &tenant_name, &repo)
+                .ensure_tenant(&client, &tenant_name, &repo, &registry_json)
                 .await
                 .context("Tenant setup failed")?;
 
+            // Persist repo + fleet registry into the tenant store.
+            let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
+            match pocketflow_core::SharedStore::new_redis_with_tenant(
+                &redis_url,
+                Some(tenant_name.clone()),
+            )
+            .await
+            {
+                Ok(store) => {
+                    store.set("repository", serde_json::json!(&repo)).await;
+                    store
+                        .set("registry_json", serde_json::json!(&registry_json))
+                        .await;
+                    println!(
+                        "  ✓ Repository '{}' and fleet registry persisted for tenant '{}'",
+                        repo, tenant_name
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  ⚠ Could not persist repository/registry to Redis for tenant '{}': {}",
+                        tenant_name, e
+                    );
+                }
+            }
+
             println!("\n  ✓ Tenant '{}' added", tenant_name);
+            println!("  ✓ Fleet: {} FORGE-SENTINEL pair(s)", fleet);
             println!("  ✓ Nexus workspace: {}", workspace_id);
             println!("  → Complete the GitHub OAuth link in the Coder dashboard for this tenant");
         }
@@ -993,6 +1097,33 @@ async fn run_gate(action: GateCommands) -> Result<()> {
     let redis_url = config::EnvConfig::from_env()?.infra.effective_redis_url();
 
     match action {
+        GateCommands::Decide {
+            tenant,
+            ticket,
+            phase,
+            verdict,
+            revision,
+            round,
+            head,
+            notes,
+        } => {
+            let store = Harness::new(&redis_url, &tenant).await?;
+            store
+                .gate_decide(
+                    &ticket,
+                    "human",
+                    &phase,
+                    verdict == "approve",
+                    &notes,
+                    openflows_harness::store::ReviewTarget {
+                        revision,
+                        round,
+                        head: Some(head),
+                    },
+                )
+                .await?;
+            println!("Human decision recorded for {ticket}");
+        }
         GateCommands::Approve {
             tenant,
             ticket,

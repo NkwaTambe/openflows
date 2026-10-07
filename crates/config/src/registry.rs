@@ -4,6 +4,7 @@
 // NEXUS reloads this on every poll cycle for zero-downtime team changes.
 
 use anyhow::{Context, Result};
+use envconfig::Envconfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -163,26 +164,17 @@ pub fn default_permission_mode_for_role(role: &str) -> &'static str {
     }
 }
 
-/// A single agent entry from registry.json (schema v2 — Coder-only).
-///
-/// v1 fields (cli, instances, model_backend, routing_key, github_token_env,
-/// allowed_domains, coder_module) are kept as serde-optional for backward
-/// compatibility with existing nexus code. Phase 5 will remove their usage.
+/// Runtime role configuration. Legacy active/instances names are input aliases,
+/// not separate switches. Chat models and plan mode are owned by Coder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryEntry {
     pub id: String,
     /// v2: Whether this role is enabled.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "active")]
     pub enabled: bool,
-    /// v2: Coder model hint (matched against the org-scoped
-    /// GET /api/v2/organizations/{organization}/chats/models).
-    #[serde(default)]
-    pub model: Option<String>,
-    /// v2: Create the chat in plan mode (review-only roles).
-    #[serde(default)]
-    pub plan_mode: bool,
     /// v2: Maximum parallel worker instances for this role.
-    #[serde(default = "default_one_instance")]
+    #[serde(default = "default_one_instance", alias = "instances")]
     pub max_instances: u32,
     /// v2: Skill names to provision into the workspace's .agents/skills/.
     #[serde(default)]
@@ -191,13 +183,9 @@ pub struct RegistryEntry {
     #[serde(default)]
     pub mcp: serde_json::Value,
 
-    // ── v1 fields (deprecated — Phase 5 removes usage) ──────────────────
+    // Optional CLI/identity compatibility settings used by existing consumers.
     #[serde(default)]
     pub cli: String,
-    #[serde(default)]
-    pub active: bool,
-    #[serde(default)]
-    pub instances: u32,
     #[serde(default)]
     pub model_backend: Option<String>,
     #[serde(default)]
@@ -220,6 +208,7 @@ fn default_one_instance() -> u32 {
 
 /// The full registry — a thin wrapper around the team list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registry {
     /// Default CLI backend for agents without explicit cli field
     #[serde(default = "default_cli")]
@@ -310,23 +299,9 @@ impl RegistryEntry {
         }
     }
 
-    /// Effective parallel instance count for this agent.
-    ///
-    /// v2 registries declare `max_instances`; v1 registries declared
-    /// `instances`. The live `orchestration/agent/registry.json` is v2 and
-    /// omits `instances` (which deserializes to `0`), so deriving slot/identity
-    /// counts from `instances` alone silently provisioned **zero** forge
-    /// workers — and the old hard-coded `"forge-1"` assignment operated on a
-    /// phantom worker with no `WorkerSlot`, no workspace, and no chat. Falling
-    /// back to `max_instances` when `instances` is unset restores the intended
-    /// fan-out while staying backward-compatible with v1 entries that set
-    /// `instances` (which remain authoritative when non-zero).
+    /// Canonical worker count, including legacy input normalized at load time.
     pub fn effective_instances(&self) -> u32 {
-        if self.instances > 0 {
-            self.instances
-        } else {
-            self.max_instances
-        }
+        self.max_instances
     }
 }
 
@@ -383,12 +358,12 @@ impl Registry {
 
     /// Active agents only.
     pub fn active_agents(&self) -> impl Iterator<Item = &RegistryEntry> {
-        self.team.iter().filter(|e| e.active)
+        self.team.iter().filter(|e| e.enabled)
     }
 
     /// Look up a specific agent by id. Returns None if not found or inactive.
     pub fn get(&self, id: &str) -> Option<&RegistryEntry> {
-        self.team.iter().find(|e| e.id == id && e.active)
+        self.team.iter().find(|e| e.id == id && e.enabled)
     }
 
     /// Normalize agent ID by stripping instance suffix (e.g., "forge-1" -> "forge").
@@ -422,12 +397,10 @@ impl Registry {
     }
 
     /// All worker slot names including non-forge agents like "lore".
-    /// Returns slots for all active agents with instances > 0.
+    /// Returns slots for all enabled agents with max_instances > 0.
     pub fn all_worker_slots(&self) -> Vec<String> {
         let mut slots = Vec::new();
         for entry in self.active_agents() {
-            // Use effective_instances() so v2 registries that declare only
-            // max_instances still produce slots (instances is 0 when absent).
             let count = entry.effective_instances();
             if count > 0 {
                 if entry.id == "forge" {
@@ -446,12 +419,24 @@ impl Registry {
         slots
     }
 
+    /// Set forge/sentinel max_instances to `pairs` each,
+    /// preserving all other entries, enforcing the FORGE-SENTINEL pair invariant.
+    pub fn with_team_fleet(&self, pairs: u32) -> Registry {
+        let mut clone = self.clone();
+        for entry in clone.team.iter_mut() {
+            if entry.id == "forge" || entry.id == "sentinel" {
+                entry.max_instances = pairs;
+            }
+        }
+        clone
+    }
+
     /// Resolve the workspace provider for a given slot ID.
     ///
-    /// Resolve GitHub token for a given agent./// If the agent has `github_token_env` set, reads from that env var.
-    /// Falls back to `GITHUB_TOKEN` when no per-agent token is configured.
-    /// Handles instance IDs (e.g., "forge-1") by stripping suffix to find base agent.
-    /// Returns an error if the agent exists but is inactive (not in active_agents).
+    /// Resolve the GitHub token for a given agent. Falls back to the Coder
+    /// external-auth token. Handles instance IDs (e.g., "forge-1") by
+    /// stripping suffix to find base agent. Returns an error if the agent exists
+    /// but is inactive (not in active_agents).
     pub fn resolve_github_token(&self, agent_id: &str) -> Result<String> {
         let base_id = self.normalize_agent_id(agent_id);
         // Existence check must also consider inactive agents, including the
@@ -469,9 +454,8 @@ impl Registry {
             Some(entry) => match &entry.github_token_env {
                 Some(env_var) => std::env::var(env_var)
                     .with_context(|| format!("{} not set for agent {}", env_var, agent_id))?,
-                None => std::env::var("GITHUB_TOKEN").context(
-                    "GITHUB_TOKEN not set (fallback for agent without github_token_env)",
-                )?,
+                None => Self::resolve_global_github_token()
+                    .context("no GitHub token available for agent without github_token_env")?,
             },
             None => {
                 if entry_exists {
@@ -485,17 +469,27 @@ impl Registry {
                         base_id
                     };
                     anyhow::bail!(
-                        "Agent '{}' exists but is inactive — set active: true in registry.json or remove agent from flow",
+                        "Agent '{}' exists but is inactive — set enabled: true in registry.json or remove agent from flow",
                         display_id
                     );
                 } else {
-                    // Agent not found at all — fall back to global PAT for backward compat
-                    std::env::var("GITHUB_TOKEN")
-                        .context(format!("Agent '{}' not found in registry", base_id))?
+                    // Agent not found at all — fall back to the global token for backward compat
+                    Self::resolve_global_github_token()
+                        .with_context(|| format!("Agent '{}' not found in registry", base_id))?
                 }
             }
         };
         Ok(token)
+    }
+
+    /// Resolve the global GitHub token from Coder external auth
+    /// (`CODER_EXTERNAL_AUTH_*`); the PAT flow has been removed.
+    fn resolve_global_github_token() -> Result<String> {
+        crate::GithubConfig::init_from_env()
+            .map_err(|e| anyhow::anyhow!("GitHub config: {e}"))?
+            .resolve_token()
+            .filter(|t| !t.is_empty())
+            .context("no GitHub external-auth token available (set CODER_EXTERNAL_AUTH_*_TOKEN)")
     }
 }
 
@@ -504,6 +498,55 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn canonical_registry_controls_enabled_roles_and_slots() {
+        let reg: Registry = serde_json::from_str(
+            r#"{"team":[
+            {"id":"forge","enabled":true,"max_instances":2},
+            {"id":"lore","enabled":false,"max_instances":1}
+        ]}"#,
+        )
+        .unwrap();
+        assert_eq!(reg.forge_slots(), vec!["forge-1", "forge-2"]);
+        assert!(reg.get("lore").is_none());
+    }
+
+    #[test]
+    fn legacy_names_serialize_as_canonical_fields() {
+        let reg: Registry =
+            serde_json::from_str(r#"{"team":[{"id":"forge","active":true,"instances":2}]}"#)
+                .unwrap();
+        let json = serde_json::to_value(reg).unwrap();
+        let entry = &json["team"][0];
+        assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["max_instances"], 2);
+        assert!(entry.get("active").is_none());
+        assert!(entry.get("instances").is_none());
+    }
+
+    #[test]
+    fn checked_in_registry_loads() {
+        let reg: Registry =
+            serde_json::from_str(include_str!("../../../orchestration/agent/registry.json"))
+                .unwrap();
+        assert_eq!(reg.forge_slots(), vec!["forge-1", "forge-2"]);
+        assert!(reg.get("lore").is_none());
+    }
+
+    #[test]
+    fn registry_rejects_conflicting_and_unsupported_settings() {
+        for fields in [
+            r#""enabled":true,"active":false"#,
+            r#""max_instances":2,"instances":1"#,
+            r#""model":"ignored-model""#,
+            r#""plan_mode":true"#,
+            r#""unsupported_field":2"#,
+        ] {
+            let input = format!(r#"{{"team":[{{"id":"forge",{fields}}}]}}"#);
+            assert!(serde_json::from_str::<Registry>(&input).is_err(), "{input}");
+        }
+    }
 
     fn sample_registry_json() -> &'static str {
         r#"{
@@ -550,7 +593,7 @@ mod tests {
         let reg = Registry::load(f.path()).unwrap();
         let active: Vec<_> = reg.active_agents().collect();
         assert_eq!(active.len(), 4); // lore is inactive
-        assert!(active.iter().all(|e| e.active));
+        assert!(active.iter().all(|e| e.enabled));
     }
 
     #[test]
@@ -572,7 +615,7 @@ mod tests {
         let f = write_temp(sample_registry_json());
         let reg = Registry::load(f.path()).unwrap();
         let nexus = reg.get("nexus").unwrap();
-        assert_eq!(nexus.instances, 1);
+        assert_eq!(nexus.max_instances, 1);
     }
 
     #[test]
@@ -750,5 +793,66 @@ mod tests {
         // forge has cli: "codex" in registry
         assert_eq!(reg.resolve_cli_backend("forge-1"), CliBackend::Codex);
         assert_eq!(reg.resolve_cli_backend("forge-2"), CliBackend::Codex);
+    }
+
+    fn fleet_sample() -> Registry {
+        // Worker counts use the canonical max_instances field.
+        let json = r#"{
+          "default_cli": "claude",
+          "team": [
+            { "id": "nexus",    "active": true, "max_instances": 1 },
+            { "id": "forge",    "active": true, "max_instances": 2, "skills": ["x"] },
+            { "id": "sentinel", "active": true, "max_instances": 1, "skills": ["review"] },
+            { "id": "vessel",   "active": true, "max_instances": 1 }
+          ]
+        }"#;
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn test_with_team_fleet_sets_both_roles() {
+        let reg = fleet_sample();
+        let fleet = reg.with_team_fleet(3);
+
+        assert_eq!(fleet.get("forge").unwrap().effective_instances(), 3);
+        assert_eq!(fleet.get("sentinel").unwrap().effective_instances(), 3);
+        // Non-pair roles unchanged.
+        assert_eq!(fleet.get("nexus").unwrap().effective_instances(), 1);
+        assert_eq!(fleet.get("vessel").unwrap().effective_instances(), 1);
+        // Unrelated fields preserved verbatim.
+        assert_eq!(fleet.get("forge").unwrap().skills, vec!["x"]);
+        assert_eq!(fleet.get("sentinel").unwrap().skills, vec!["review"]);
+        // Original is untouched (immutable copy).
+        assert_eq!(reg.get("forge").unwrap().effective_instances(), 2);
+    }
+
+    #[test]
+    fn test_with_team_fleet_fleet3_slots() {
+        let fleet = fleet_sample().with_team_fleet(3);
+        assert_eq!(fleet.forge_slots(), vec!["forge-1", "forge-2", "forge-3"]);
+        let sentinel_slots: Vec<_> = fleet
+            .all_worker_slots()
+            .into_iter()
+            .filter(|s| s.starts_with("sentinel"))
+            .collect();
+        assert_eq!(
+            sentinel_slots,
+            vec!["sentinel-1", "sentinel-2", "sentinel-3"]
+        );
+    }
+
+    #[test]
+    fn test_with_team_fleet_fleet1() {
+        let fleet = fleet_sample().with_team_fleet(1);
+        assert_eq!(fleet.forge_slots(), vec!["forge-1"]);
+        // sentinel with count 1 yields the bare "sentinel" slot
+        let sentinel_slots: Vec<_> = fleet
+            .all_worker_slots()
+            .into_iter()
+            .filter(|s| s.starts_with("sentinel"))
+            .collect();
+        assert_eq!(sentinel_slots, vec!["sentinel"]);
+        assert_eq!(fleet.get("forge").unwrap().max_instances, 1);
+        assert_eq!(fleet.get("sentinel").unwrap().max_instances, 1);
     }
 }

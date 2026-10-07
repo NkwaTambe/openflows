@@ -26,7 +26,7 @@ services:
     restart: unless-stopped
 
   coder:
-    image: ghcr.io/coder/coder:${CODER_IMAGE_TAG:-v2.37.1}
+    image: ghcr.io/coder/coder:${CODER_IMAGE_TAG:-v2.37.3}
     user: "0:0"
     ports:
       - "${CODER_PORT:-7080}:${CODER_INTERNAL_PORT:-7080}"
@@ -36,8 +36,12 @@ services:
       CODER_HTTP_ADDRESS: "0.0.0.0:${CODER_INTERNAL_PORT:-7080}"
       CODER_PROVISIONER_DAEMONS: "1"
       CODER_PROVISIONER_DAEMON_TYPE: "docker"
+      # Shared Terraform provider cache so workspace builds reuse downloaded
+      # providers instead of re-fetching them from GitHub on every build (which
+      # intermittently 504s). Persisted on the tf_plugin_cache volume.
+      TF_PLUGIN_CACHE_DIR: /root/.terraform.d/plugin-cache
       DOCKER_HOST: unix:///var/run/docker.sock
-      REDIS_URL: ${REDIS_URL:-redis://localhost:6379}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
       # GitHub external auth (Git App) — lets agents push/pull against PRIVATE
@@ -73,6 +77,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # TEMPORARY: Mount local openflows binary for testing (remove when using GitHub releases)
       - ./.dev-binaries:/opt/openflows-dev:ro
+      # Persist the Terraform provider cache across restarts.
+      - tf_plugin_cache:/root/.terraform.d/plugin-cache
     depends_on:
       coder-db:
         condition: service_healthy
@@ -86,3 +92,4 @@ services:
 volumes:
   redis_data:
   coder_db_data:
+  tf_plugin_cache:

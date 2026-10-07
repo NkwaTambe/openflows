@@ -20,25 +20,40 @@ body = """
 {%- if not version %}
 ## [unreleased]
 {% else -%}
-## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+## [{{ version | replace(from="openflows-", to="") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% endif -%}
 
 {% macro commit(commit) -%}
-- [{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}) \
-  *({{ commit.scope | default(value = "uncategorized") | lower }})* {{ commit.message | upper_first | trim }}\
-  {% if commit.remote.username %} by @{{ commit.remote.username }}{%- endif -%}\
-  {% if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}]({{ self::remote_url() }}/pull/{{ commit.remote.pr_number }}){%- endif %}\
+- *({{ commit.scope | default(value = "uncategorized") | lower }})* {{ commit.message | upper_first | trim }}\
+  {{ self::mention(commit=commit) }}\
 {%- if commit.breaking %} [**breaking**]{% endif %}
-{%- if commit.body %}\n\n{{ commit.body | indent(prefix="  > ", first=true, blank=true) }}
-{%- endif %}
-{%- for footer in commit.footers %}\n
-{%- if footer.token != "Signed-off-by" and footer.token != "Co-authored-by" %}
-  >
-{{ footer.token | indent(prefix="  > ", first=true, blank=true) }}
-{{- footer.separator }}
-{{- footer.value| indent(prefix="  > ", first=false, blank=true)  }}
-{%- endif %}
-{%- endfor %}
+{% endmacro -%}
+
+{% macro mention(commit) -%}
+{%- if commit.author -%}
+{%- set acct = commit.author -%}
+{%- set email_ok = acct.email is string -%}
+{# `acct.email` can be a non-string (Null) for some commits under release-plz's#}
+{# embedded git-cliff-core (e.g. commits without a resolvable author). Calling #}
+{# `ending_with` on a non-string makes Tera throw "Tester ending_with was      #}
+{# called on a variable that isn't a string", which aborts the whole release-  #}
+{# pr changelog generation. Guard on `email_ok` so the test only runs on a     #}
+{# real string and the templating never crashes.                              #}
+{%- if email_ok and acct.email is ending_with("users.noreply.github.com") -%}
+{# GitHub noreply emails are `NNNNNNN+<login>@users.noreply.github.com`, so the#}
+{# `<login>` is an exact GitHub username that makes a valid mention.          #}
+  by @{{ acct.email | split(pat="+") | last | split(pat="@") | first }}
+{%- elif email_ok and not acct.email is ending_with("users.noreply.github.com") -%}
+{# Non-noreply (e.g. personal) emails have no reliable login: fall back to the#}
+{# commit author's display name, which equals the GitHub login for releases   #}
+{# by name=login authors (NkwaTambe, Ngha-Boris, ...).                         #}
+  by @{{ acct.name }}
+{%- elif acct.name -%}
+{# No usable email (non-string/Null from git-cliff-core): still credit the    #}
+{# author by display name rather than silently dropping the attribution.      #}
+  by @{{ acct.name }}
+{%- endif -%}
+{%- endif -%}
 {% endmacro -%}
 
 {% for group, commits in commits | group_by(attribute="group") %}
@@ -101,6 +116,11 @@ commit_preprocessors = [
 commit_parsers = [
   # release-plz adds 0000000 as a placeholder for release commits
   { field = "id", pattern = "0000000", skip = true },
+  # Suppress internal release-tooling and CI-only commits from the user changelog.
+  # Any conventional-commit type scoped to (release) or (ci) is infrastructure-only
+  # and should not appear as user-facing features/fixes in GitHub Release notes.
+  { message = "^[a-zA-Z]+\\(release\\):", skip = true },
+  { message = "^[a-zA-Z]+\\(ci\\):",      skip = true },
   { message = "^feat", group = "<!-- 00 -->Features" },
   { message = "^[fF]ix", group = "<!-- 01 -->Bug Fixes" },
   { message = "^refactor", group = "<!-- 02 -->Refactor" },
@@ -110,6 +130,7 @@ commit_parsers = [
   { message = "^test", group = "<!-- 06 -->Testing" },
   { message = "^chore\\(release\\): prepare for", skip = true },
   { message = "^chore: release", skip = true },
+  { message = "^chore\\(openflows\\): release", skip = true },
   { message = "^chore\\(pr\\)", skip = true },
   { message = "^chore\\(pull\\)", skip = true },
   { message = "^chore\\(deps\\)", skip = true },
@@ -118,6 +139,7 @@ commit_parsers = [
   { message = "^build\\(deps\\)", skip = true },
   { message = "^build\\(release\\)", skip = true },
   { message = "^build", group = "<!-- 08 -->Build" },
+
   { body = ".*security", group = "<!-- 09 -->Security" },
   { message = "^ci", group = "<!-- 10 -->Continuous Integration" },
   { message = "^revert", group = "<!-- 11 -->Reverted Commits" },

@@ -101,16 +101,17 @@ data "coder_parameter" "tenant" {
   type        = "string"
 }
 
+data "coder_parameter" "a2a_pair_token" {
+  name        = "a2a_pair_token"
+  description = "Pair-scoped token used by Sentinel/FORGE to authenticate A2A verification RPCs"
+  default     = ""
+  type        = "string"
+  mutable     = false
+}
+
 data "coder_parameter" "coder_url" {
   name        = "coder_url"
   description = "Coder server URL for API calls"
-  default     = ""
-  type        = "string"
-}
-
-data "coder_parameter" "github_pat" {
-  name        = "github_pat"
-  description = "GitHub Personal Access Token for git clone/push in the workspace"
   default     = ""
   type        = "string"
 }
@@ -133,24 +134,21 @@ resource "coder_agent" "main" {
     mkdir -p /home/coder/workspace
     sudo chown -R coder:coder /home/coder/workspace
 
-    # Setup git credentials. Prefer an explicit GitHub Personal Access Token
-    # (github_pat) because a PAT can be scoped to the target repo/org and works
-    # regardless of GitHub App install scope. Fall back to the Coder GitHub App
-    # external-auth token (surfaces the "Login with GitHub" button in the UI).
-    # A persistent store is a deliberate fallback over Coder's automatic
-    # GIT_ASKPASS auth: agent-executed git (push) can run in a subprocess
-    # environment without GIT_ASKPASS, so we pin the token once here.
-    GIT_TOKEN="${data.coder_parameter.github_pat.value}"
-    if [ -z "$GIT_TOKEN" ]; then
-      GIT_TOKEN="${data.coder_external_auth.github.access_token}"
-    fi
+    # Setup git credentials from Coder external auth (the tenant's linked
+    # GitHub App token). PAT flow removed — external auth is the sole source.
+    GIT_TOKEN="${data.coder_external_auth.github.access_token}"
     if [ -n "$GIT_TOKEN" ]; then
-      git config --global credential.helper store
+      # System-level helper so git works for BOTH the agent user (pushes) and
+      # the sudo'd root clone below (their $HOME differ).
+      sudo git config --system credential.helper store
       echo "https://x-access-token:$${GIT_TOKEN}@github.com" > /home/coder/.git-credentials
       chmod 600 /home/coder/.git-credentials
+      sudo mkdir -p /root
+      sudo cp /home/coder/.git-credentials /root/.git-credentials
+      sudo chmod 600 /root/.git-credentials
       log "Configured git credentials for GitHub push auth"
     else
-      log "WARNING: No GitHub token available — set CODER_GITHUB_TOKEN (PAT) or open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
+      log "WARNING: No GitHub token available — open this workspace and click 'Login with GitHub' (external auth) to grant repo access"
     fi
 
     # Acquire the repository. Prefer the golden offline seed from the shared
@@ -240,6 +238,7 @@ resource "coder_agent" "main" {
     export OPENFLOWS_TICKET="${data.coder_parameter.ticket_id.value}"
     export OPENFLOWS_ROLE="sentinel"
     export A2A_RELAY_ADDR="${var.a2a_relay_addr}"
+    export A2A_PAIR_TOKEN="${data.coder_parameter.a2a_pair_token.value}"
     export CODER_WORKSPACE_ID="${data.coder_workspace.me.id}"
     nohup openflows-harness heartbeat start >/dev/null 2>&1 &
   EOT
@@ -252,6 +251,8 @@ resource "docker_volume" "workspace" {
 resource "docker_container" "workspace" {
   name  = "openflows-${var.role}-${data.coder_workspace.me.id}"
   image = "codercom/enterprise-base:ubuntu"
+  # Match the Coder agent and dev binaries on Intel and Apple Silicon hosts.
+  platform = "linux/amd64"
 
   volumes {
     container_path = "/home/coder/workspace"
@@ -285,6 +286,7 @@ resource "docker_container" "workspace" {
     "OPENFLOWS_TICKET=${data.coder_parameter.ticket_id.value}",
     "OPENFLOWS_ROLE=sentinel",
     "A2A_RELAY_ADDR=${var.a2a_relay_addr}",
+    "A2A_PAIR_TOKEN=${data.coder_parameter.a2a_pair_token.value}",
     "CODER_WORKSPACE_ID=${data.coder_workspace.me.id}",
     "CODER_AGENT_TOKEN=${coder_agent.main.token}",
   ]

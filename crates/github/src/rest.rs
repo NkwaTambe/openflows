@@ -34,13 +34,18 @@ impl GithubRestClient {
         let api_base = config::GithubConfig::init_from_env()
             .map(|cfg| cfg.api_base)
             .unwrap_or_else(|_| "https://api.github.com".to_string());
+        Self::with_api_base(token, api_base)
+    }
+
+    /// Construct a client for an explicit GitHub or GitHub Enterprise API endpoint.
+    pub fn with_api_base(token: impl Into<String>, api_base: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .user_agent("AgentFlow-VESSEL/0.1")
                 .build()
                 .expect("Failed to build reqwest client"),
             token: token.into(),
-            api_base,
+            api_base: api_base.into(),
         }
     }
 
@@ -187,28 +192,6 @@ impl GithubRestClient {
             .with_context(|| format!("Failed to read GitHub text response from {}", url))
     }
 
-    async fn put_json<T: for<'de> Deserialize<'de>, B: Serialize>(
-        &self,
-        url: &str,
-        body: &B,
-    ) -> Result<T> {
-        debug!(url, "GitHub API PUT");
-        let payload = serde_json::to_vec(body)?;
-        let resp = self
-            .send_with_retry(|| self.build_put(url, &payload))
-            .await?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("GitHub API error {}: {}", status, body);
-        }
-
-        resp.json::<T>()
-            .await
-            .context("Failed to parse GitHub response")
-    }
-
     async fn post_json<T: for<'de> Deserialize<'de>, B: Serialize>(
         &self,
         url: &str,
@@ -314,27 +297,53 @@ impl GithubRestClient {
     /// Get the overall CI status (combines check suites and status API).
     /// Optimized: fetches both status types concurrently using tokio::join!
     pub async fn get_ci_status(&self, owner: &str, repo: &str, ref_sha: &str) -> Result<CiStatus> {
-        // Parallelize CI status checks - reduces latency by ~50%
-        let (combined_result, checks_result) = tokio::join!(
-            self.get_combined_status(owner, repo, ref_sha),
-            self.get_check_suites_status(owner, repo, ref_sha)
+        let status_url = format!(
+            "{}/repos/{}/{}/commits/{}/status",
+            self.api_base, owner, repo, ref_sha
         );
-
-        let combined = combined_result?;
-        if combined.is_terminal() {
-            return Ok(combined);
+        let combined = match self.get_json::<CombinedStatusResponse>(&status_url).await {
+            Ok(response) if response.total_count > 0 => Some(map_status_state(&response.state)),
+            Ok(_) => None,
+            Err(e) if is_status_api_forbidden(&e) => None,
+            Err(e) => return Err(e),
+        };
+        let mut suites = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/commits/{}/check-suites?per_page=100&page={}",
+                self.api_base, owner, repo, ref_sha, page
+            );
+            let response: CheckSuitesResponse = self.get_json(&url).await?;
+            let len = response.check_suites.len();
+            suites.extend(response.check_suites);
+            if len < 100 {
+                break;
+            }
+            page += 1;
         }
-
-        let checks = checks_result?;
-        if checks.is_terminal() {
-            return Ok(checks);
-        }
-
-        if combined == CiStatus::Pending || checks == CiStatus::Pending {
-            Ok(CiStatus::Pending)
+        let checks = if suites.is_empty() {
+            None
         } else {
-            Ok(CiStatus::Success)
-        }
+            let mut status = CiStatus::Success;
+            for suite in suites {
+                let observed = if suite.status != "completed" {
+                    CiStatus::Pending
+                } else {
+                    match suite.conclusion.as_deref() {
+                        Some("success" | "neutral" | "skipped") => CiStatus::Success,
+                        Some(
+                            "failure" | "timed_out" | "cancelled" | "action_required"
+                            | "startup_failure",
+                        ) => CiStatus::Failure,
+                        _ => CiStatus::Pending,
+                    }
+                };
+                status = aggregate_ci_sources(Some(status), Some(observed));
+            }
+            Some(status)
+        };
+        Ok(aggregate_ci_sources(combined, checks))
     }
 
     /// Get detailed information about failed CI checks for a commit ref.
@@ -556,6 +565,30 @@ impl GithubRestClient {
     }
 
     /// Merge a pull request.
+    /// Confirm merge using GitHub's merged flag and actual merge commit SHA.
+    pub async fn confirmed_merge_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<Option<String>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}",
+            self.api_base, owner, repo, number
+        );
+        let value: serde_json::Value = self.get_json(&url).await?;
+        if value["merged"].as_bool() != Some(true) {
+            return Ok(None);
+        }
+        Ok(Some(
+            value["merge_commit_sha"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Merged PR has no merge commit SHA"))?
+                .to_owned(),
+        ))
+    }
+
     pub async fn merge_pull_request(
         &self,
         owner: &str,
@@ -563,6 +596,7 @@ impl GithubRestClient {
         pr_number: u64,
         commit_title: &str,
         merge_method: MergeMethod,
+        expected_sha: &str,
     ) -> Result<MergeResult> {
         let url = format!(
             "{}/repos/{}/{}/pulls/{}/merge",
@@ -570,11 +604,36 @@ impl GithubRestClient {
         );
 
         let body = MergeRequestBody {
+            sha: expected_sha.to_owned(),
             commit_title: Some(commit_title.to_string()),
             merge_method,
         };
 
-        let resp: MergeResponse = self.put_json(&url, &body).await?;
+        // A merge is not safely retryable: after a timeout or server error, a
+        // later rejection cannot prove that the first attempt did not merge.
+        let payload = serde_json::to_vec(&body)?;
+        let response = self.build_put(&url, &payload).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response.text().await.unwrap_or_default();
+            // Only known rejection statuses prove that this attempt did not merge.
+            // Timeout-like gateway statuses (408/499) and unfamiliar responses stay unknown.
+            if matches!(
+                status.as_u16(),
+                400 | 401 | 403 | 404 | 405 | 409 | 422 | 429
+            ) {
+                return Ok(MergeResult {
+                    merged: false,
+                    sha: None,
+                    message: format!("GitHub rejected merge ({status}): {message}"),
+                });
+            }
+            anyhow::bail!("GitHub merge outcome unknown ({status}): {message}");
+        }
+        let resp: MergeResponse = response
+            .json()
+            .await
+            .context("Failed to parse merge response")?;
 
         Ok(MergeResult {
             merged: resp.merged,
@@ -1002,6 +1061,95 @@ impl GithubRestClient {
         Ok(conflicted)
     }
 
+    // ── PR Review & Comment API ──────────────────────────────────────────
+
+    /// List the reviews submitted on a pull request.
+    ///
+    /// GitHub returns *all* reviews for a PR, including superseded ones (a
+    /// reviewer may Approve and later request changes). Use
+    /// [`effective_review_state`] to compute the current state from this list.
+    pub async fn list_pr_reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<PrReview>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews?per_page=100",
+            self.api_base, owner, repo, pr_number
+        );
+        self.get_json(&url).await
+    }
+
+    /// List the inline review comments on a pull request.
+    ///
+    /// Uses the `/pulls/{n}/comments` endpoint (diff/line comments), which is
+    /// distinct from the issue-comments endpoint.
+    pub async fn list_review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+    ) -> Result<Vec<ReviewComment>> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/comments?per_page=100",
+            self.api_base, owner, repo, pr_number
+        );
+        self.get_json(&url).await
+    }
+
+    /// Submit a review on a pull request (approve, request changes, or comment).
+    ///
+    /// `event` must be one of `APPROVE`, `REQUEST_CHANGES`, or `COMMENT`.
+    /// Errors are surfaced to the caller, which is expected to handle them
+    /// non-fatally (e.g. a token without `pull_request` write scope yields a 403).
+    #[allow(clippy::too_many_arguments)] // Mirrors the GitHub review API, including exact commit identity.
+    pub async fn submit_pull_request_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        pr_number: u64,
+        event: &str,
+        body: &str,
+        comments: Vec<ReviewCommentInput>,
+        commit_id: Option<&str>,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/repos/{}/{}/pulls/{}/reviews",
+            self.api_base, owner, repo, pr_number
+        );
+        let payload = serde_json::json!({
+            "event": event,
+            "body": body,
+            "comments": comments,
+            "commit_id": commit_id,
+        });
+        let body_bytes = serde_json::to_vec(&payload)?;
+
+        let resp = self
+            .send_with_retry(|| self.build_post(&url, &body_bytes))
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to submit pull request review on PR #{} (status {}): {}",
+                pr_number,
+                status,
+                text
+            );
+        }
+
+        info!(
+            owner,
+            repo,
+            pr = pr_number,
+            event,
+            "Submitted pull request review"
+        );
+        Ok(())
+    }
+
     // ── Actions Job Log Fetching ──────────────────────────────────────────
 
     /// Fetch job logs for failed workflow runs associated with a commit.
@@ -1084,6 +1232,19 @@ fn map_status_state(state: &str) -> CiStatus {
     }
 }
 
+/// Whether a GitHub API error indicates the legacy combined-status (Statuses)
+/// endpoint is not accessible to the authenticated integration (GitHub App).
+///
+/// The error is surfaced as a plain string of the form
+/// `GitHub API error 403 Forbidden: {"message":"Resource not accessible by integration",...}`.
+/// We detect a 403 that is scoped to a permission/access denial so the CI gate can
+/// fall back to the modern Checks API instead of aborting.
+fn is_status_api_forbidden(err: &anyhow::Error) -> bool {
+    let msg = format!("{err}");
+    msg.contains("GitHub API error 403")
+        && (msg.contains("not accessible") || msg.contains("forbidden"))
+}
+
 fn extract_ticket_id(title: &str, body: &Option<String>, branch: &str) -> Option<String> {
     let patterns = [
         regex::Regex::new(r"T-(\d+)").ok(),
@@ -1125,6 +1286,8 @@ fn tail_log(log: &str, max_lines: usize) -> String {
 #[derive(Deserialize)]
 struct CombinedStatusResponse {
     state: String,
+    #[serde(default)]
+    total_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -1277,6 +1440,7 @@ struct PrBranch {
 
 #[derive(Serialize)]
 struct MergeRequestBody {
+    sha: String,
     #[serde(rename = "commit_title")]
     commit_title: Option<String>,
     merge_method: MergeMethod,
@@ -1339,4 +1503,421 @@ struct WorkflowJob {
     name: Option<String>,
     #[serde(default)]
     conclusion: Option<String>,
+}
+
+// ── PR Review & Comment Types ──────────────────────────────────────────────
+
+/// Deserialize a GitHub `user` payload into an optional login string.
+///
+/// GitHub returns `user` as an object (`{"login": "...", ...}`) on review and
+/// review-comment responses, but some callers and fixtures pass a plain login
+/// string. This accepts both shapes, plus `null`/absent, mapping the result to
+/// the reviewer's login.
+fn deserialize_optional_login<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s)),
+        serde_json::Value::Object(map) => Ok(map
+            .get("login")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)),
+        _ => Err(D::Error::custom("expected a user object or login string")),
+    }
+}
+
+/// A review submitted on a pull request.
+///
+/// GitHub returns every review ever submitted, including superseded ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrReview {
+    /// `APPROVED`, `CHANGES_REQUESTED`, or `COMMENTED`.
+    pub state: String,
+    /// Reviewer's GitHub login (from the nested `user` object).
+    #[serde(default, deserialize_with = "deserialize_optional_login")]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+impl PrReview {
+    pub fn state_enum(&self) -> PrReviewState {
+        PrReviewState::from_api_state(&self.state)
+    }
+}
+
+/// The computed, current review state of a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    None,
+}
+
+impl PrReviewState {
+    /// Parse a raw GitHub review `state` string into the typed state.
+    pub fn from_api_state(state: &str) -> Self {
+        match state {
+            "APPROVED" => PrReviewState::Approved,
+            "CHANGES_REQUESTED" => PrReviewState::ChangesRequested,
+            "COMMENTED" => PrReviewState::Commented,
+            _ => PrReviewState::None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrReviewState::Approved => "approved",
+            PrReviewState::ChangesRequested => "changes_requested",
+            PrReviewState::Commented => "commented",
+            PrReviewState::None => "none",
+        }
+    }
+}
+
+/// An inline review comment on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, deserialize_with = "deserialize_optional_login")]
+    pub user: Option<String>,
+}
+
+/// Input for an inline comment attached to a submitted review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewCommentInput {
+    /// The path of the file to comment on.
+    pub path: String,
+    /// The line of the blob in the pull request diff to comment on.
+    pub line: u64,
+    /// The text of the comment.
+    pub body: String,
+}
+
+/// Compute the effective review state of a PR from the (possibly superseded)
+/// list of reviews returned by `GET /pulls/{n}/reviews`.
+///
+/// Rules:
+/// - Consider only the latest review per reviewer.
+/// - A current `CHANGES_REQUESTED` beats an older `APPROVED` (a reviewer can
+///   approve then re-request changes).
+/// - `APPROVED` only counts if no reviewer currently has `CHANGES_REQUESTED`.
+/// - `COMMENTED` reviews do not carry an approving/rejecting verdict.
+pub fn effective_review_state(reviews: &[PrReview]) -> PrReviewState {
+    // Latest review per reviewer (later `submitted_at` wins).
+    let mut latest: Vec<&PrReview> = Vec::new();
+    for review in reviews {
+        if review.user.as_deref().is_none() || review.user.as_deref() == Some("") {
+            continue;
+        }
+        let user = review.user.as_deref().unwrap_or("");
+        let idx = latest.iter().position(|r| r.user.as_deref() == Some(user));
+        let replace = match idx {
+            Some(i) => {
+                // Prefer the later review; fall back to insertion order when
+                // timestamps are absent.
+                match (&latest[i].submitted_at, &review.submitted_at) {
+                    (Some(a), Some(b)) => b > a,
+                    (None, Some(_)) => true,
+                    (Some(_), None) => false,
+                    (None, None) => true,
+                }
+            }
+            None => false,
+        };
+        match idx {
+            Some(i) if replace => {
+                latest[i] = review;
+            }
+            None => {
+                latest.push(review);
+            }
+            _ => {}
+        }
+    }
+
+    let mut any_approved = false;
+    for review in latest {
+        match review.state_enum() {
+            PrReviewState::ChangesRequested => return PrReviewState::ChangesRequested,
+            PrReviewState::Approved => any_approved = true,
+            _ => {}
+        }
+    }
+
+    if any_approved {
+        PrReviewState::Approved
+    } else {
+        PrReviewState::None
+    }
+}
+
+fn aggregate_ci_sources(status: Option<CiStatus>, checks: Option<CiStatus>) -> CiStatus {
+    let sources = [status, checks];
+    if sources
+        .iter()
+        .any(|s| matches!(s, Some(CiStatus::Failure | CiStatus::Error)))
+    {
+        CiStatus::Failure
+    } else if sources.contains(&Some(CiStatus::Pending)) || sources.iter().all(Option::is_none) {
+        CiStatus::Pending
+    } else {
+        CiStatus::Success
+    }
+}
+
+#[cfg(test)]
+mod pr_review_tests {
+    use super::*;
+
+    fn review(state: &str, user: &str, ts: &str) -> PrReview {
+        PrReview {
+            state: state.to_string(),
+            user: Some(user.to_string()),
+            submitted_at: Some(ts.to_string()),
+            body: None,
+        }
+    }
+
+    #[test]
+    fn test_effective_state_none() {
+        assert_eq!(effective_review_state(&[]), PrReviewState::None);
+    }
+
+    #[test]
+    fn test_effective_state_approved() {
+        let reviews = vec![
+            review("COMMENTED", "alice", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "bob", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_changes_requested_beats_approve() {
+        let reviews = vec![
+            review("APPROVED", "alice", "2026-01-01T00:00:00Z"),
+            review("CHANGES_REQUESTED", "alice", "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn test_effective_state_latest_approve_wins() {
+        let reviews = vec![
+            review("CHANGES_REQUESTED", "alice", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "alice", "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_multi_reviewer_any_changes_wins() {
+        let reviews = vec![
+            review("APPROVED", "bob", "2026-01-02T00:00:00Z"),
+            review("CHANGES_REQUESTED", "carol", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+    }
+
+    #[test]
+    fn test_effective_state_ignores_superseded_approve() {
+        let reviews = vec![
+            review("APPROVED", "alice", "2026-01-01T00:00:00Z"),
+            review("CHANGES_REQUESTED", "alice", "2026-01-02T00:00:00Z"),
+            review("APPROVED", "alice", "2026-01-03T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_state_enum_parsing() {
+        assert_eq!(
+            PrReviewState::from_api_state("APPROVED"),
+            PrReviewState::Approved
+        );
+        assert_eq!(
+            PrReviewState::from_api_state("CHANGES_REQUESTED"),
+            PrReviewState::ChangesRequested
+        );
+        assert_eq!(
+            PrReviewState::from_api_state("COMMENTED"),
+            PrReviewState::Commented
+        );
+        assert_eq!(
+            PrReviewState::from_api_state("DISMISSED"),
+            PrReviewState::None
+        );
+    }
+}
+
+#[cfg(test)]
+mod status_api_tests {
+    use super::*;
+
+    #[test]
+    fn detects_status_api_forbidden() {
+        let body = r#"GitHub API error 403 Forbidden: {"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/commits/statuses#get-the-combined-status-for-a-specific-reference","status":"403"}"#;
+        let err = anyhow::anyhow!("{}", body);
+        assert!(is_status_api_forbidden(&err));
+    }
+
+    #[test]
+    fn rejects_other_errors() {
+        // 404 missing / different non-403 errors must NOT be treated as forbidden.
+        let not_found = anyhow::anyhow!("{}", r#"GitHub API error 404: {"message":"Not Found"}"#);
+        assert!(!is_status_api_forbidden(&not_found));
+
+        let network =
+            anyhow::anyhow!("GitHub API request failed after 3 retries: connection refused");
+        assert!(!is_status_api_forbidden(&network));
+
+        let empty = anyhow::anyhow!("something else");
+        assert!(!is_status_api_forbidden(&empty));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_ci_tests {
+    use super::*;
+    #[tokio::test]
+    async fn ci_api_does_not_mask_failed_checks_with_successful_status() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(r#"{"check_suites":[{"status":"completed","conclusion":"failure"}]}"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Failure
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+    #[tokio::test]
+    async fn rejected_merge_is_definitive_but_timeouts_and_server_errors_are_unknown() {
+        for (status, definitive) in [
+            (400, true),
+            (401, true),
+            (403, true),
+            (404, true),
+            (405, true),
+            (409, true),
+            (422, true),
+            (429, true),
+            (408, false),
+            (499, false),
+            (500, false),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let request = server
+                .mock("PUT", "/repos/org/repo/pulls/1/merge")
+                .with_status(status)
+                .with_body(r#"{"message":"rejected"}"#)
+                .expect(1)
+                .create_async()
+                .await;
+            let client = GithubRestClient {
+                api_base: server.url(),
+                client: reqwest::Client::new(),
+                token: "test".into(),
+            };
+            let result = client
+                .merge_pull_request("org", "repo", 1, "Merge", MergeMethod::Squash, "head")
+                .await;
+            if definitive {
+                assert!(
+                    !result
+                        .unwrap_or_else(|e| panic!("status {status}: {e}"))
+                        .merged
+                );
+            } else {
+                assert!(result.is_err(), "status {status} has an unknown outcome");
+            }
+            request.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_http_request_requires_the_reviewed_sha() {
+        let mut server = mockito::Server::new_async().await;
+        let merge = server
+            .mock("PUT", "/repos/org/repo/pulls/1/merge")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"sha":"reviewed-head"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"merged":true,"sha":"merge-commit","message":"merged"}"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        let result = client
+            .merge_pull_request(
+                "org",
+                "repo",
+                1,
+                "Merge",
+                MergeMethod::Squash,
+                "reviewed-head",
+            )
+            .await
+            .unwrap();
+        assert!(result.merged);
+        assert_eq!(result.sha.as_deref(), Some("merge-commit"));
+        merge.assert_async().await;
+    }
+    #[test]
+    fn success_cannot_mask_failed_pending_or_missing_ci() {
+        assert_eq!(
+            aggregate_ci_sources(Some(CiStatus::Success), Some(CiStatus::Failure)),
+            CiStatus::Failure
+        );
+        assert_eq!(
+            aggregate_ci_sources(Some(CiStatus::Success), Some(CiStatus::Pending)),
+            CiStatus::Pending
+        );
+        assert_eq!(aggregate_ci_sources(None, None), CiStatus::Pending);
+        assert_eq!(
+            aggregate_ci_sources(None, Some(CiStatus::Success)),
+            CiStatus::Success
+        );
+    }
 }
