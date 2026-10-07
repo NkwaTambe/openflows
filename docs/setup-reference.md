@@ -267,8 +267,7 @@ These are optional — the defaults work out of the box. Only touch them if you 
 | `CODER_ADMIN_PASSWORD` | `Op3nFl0ws!` | Must be ≥8 chars with upper, lower, digit, and special char — otherwise bootstrap silently falls back to the default. |
 | `REDIS_URL` | `redis://localhost:6379` | Set only if you host Redis elsewhere. |
 | `CODER_URL` | `http://localhost:7080` | Set only if you host Coder elsewhere. |
-| `CODER_PORT` / `REDIS_PORT` | `7080` / `6379` | Host ports for Coder and Redis. Change if the defaults are taken. |
-| `CODER_MAX_TOKEN_LIFETIME` / `CODER_DEFAULT_TOKEN_LIFETIME` | `8760h` | Coder's own default cap is 7 days, which would expire `CODER_SESSION_TOKEN` weekly. |
+| `CODER_PORT` | `7080` | Host port for Coder. Change if the default is taken. |
 | `OPENFLOWS_LLM_PROVIDER` / `OPENFLOWS_LLM_API_KEY` / `OPENFLOWS_LLM_MODEL` | unset | Read by `./scripts/setup.sh` for non-interactive LLM setup (`anthropic`, `openai`, `openrouter`, `google`). |
 | `OPENFLOWS_TENANT` | `default` | Namespace for Redis keys. |
 | `CODER_CHAT_HOOK_SECRET` | required | Generate 32+ random bytes, for example `openssl rand -hex 32`; hook URL/experiment/bind values are wired automatically. |
@@ -307,6 +306,14 @@ Or via the dashboard: **Admin settings → Organizations → `<your org>` → Me
 ---
 
 ## Troubleshooting
+
+### My `CODER_SESSION_TOKEN` stopped working
+
+Coder API tokens last 7 days by default. Re-run `./scripts/setup.sh` — it detects the expired token and walks you through creating a new one.
+
+### Changed `--fleet` or the repo for an existing tenant
+
+`tenant add` leaves an existing tenant workspace unchanged, so a new `--fleet` (or a different repo under the same tenant name) does not apply until you delete that tenant's nexus workspace and add the tenant again. The default tenant name is `owner-repo`; pass `--name` to choose another.
 
 ### `Failed to run coder templates push` (during bootstrap)
 

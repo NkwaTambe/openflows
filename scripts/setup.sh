@@ -25,6 +25,7 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else
     B=; D=; G=; Y=; R=; C=; N=
 fi
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then FANCY=1; else FANCY=0; fi   # animations / cursor control only when 1
 LOG_FILE="${ROOT}/.setup.log"
 START_TIME=$SECONDS
 RAIL_OPEN=0
@@ -91,7 +92,7 @@ banner() {
 # spin PID "label" — animate while PID runs (plain line when not a terminal)
 spin() {
     local pid=$1 label=$2 frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0 start=$SECONDS
-    if [ -t 1 ]; then
+    if [ "$FANCY" = 1 ]; then
         while kill -0 "$pid" 2>/dev/null; do
             printf '\r%s%s%s %s%s%s %s%ds%s\033[K' "$(rail)" "$C" "${frames:i++%${#frames}:1}" "$N" "$label" "$N" "$D" "$((SECONDS - start))" "$N"
             sleep 0.1
@@ -106,6 +107,14 @@ spin() {
 menu() {
     local title=$1; shift
     local items=("$@") n=$# sel=0 i key rest
+    if [ "$FANCY" != 1 ]; then   # plain mode (NO_COLOR / no TTY): numbered prompt, no escape codes
+        printf '%s?%s %s\n' "$Y" "$N" "$title" >&2
+        for ((i = 0; i < n; i++)); do printf '    %d) %s\n' $((i + 1)) "${items[i]}" >&2; done
+        printf '  Choice [1]: ' >&2
+        read -r key || key=""
+        if [[ "$key" =~ ^[0-9]+$ ]] && [ "$key" -ge 1 ] && [ "$key" -le "$n" ]; then printf '%s' $((key - 1)); else printf '0'; fi
+        return
+    fi
     printf '%s' "$(rail)" >&2; printf '%s?%s %s%s%s\n' "$Y" "$N" "$B" "$title" "$N" >&2
     printf '\033[?25l' >&2
     while true; do
@@ -196,7 +205,9 @@ env_set() { # env_set KEY VALUE — replace the line or append
 is_placeholder() { case "$1" in ""|your_*|replace_with*|*"<"*) return 0 ;; *) return 1 ;; esac; }
 
 coder_port() { local p; p="$(env_get CODER_PORT)"; printf '%s' "${p:-7080}"; }
-redis_port() { local p; p="$(env_get REDIS_PORT)"; printf '%s' "${p:-6379}"; }
+auth_id() { local i; i="$(env_get CODER_EXTERNAL_AUTH_0_ID)"; printf '%s' "${i:-primary-github}"; }
+# URL a browser should use (CODER_ACCESS_URL when set, else the local URL)
+public_url() { local u; u="$(env_get CODER_ACCESS_URL)"; printf '%s' "${u:-$(coder_url)}"; }
 coder_url() { local u; u="$(env_get CODER_URL)"; printf '%s' "${u:-http://localhost:$(coder_port)}"; }
 api() { # api METHOD PATH [JSON] — uses CODER_TOKEN; prints body; on HTTP error prints Coder's message to stderr
     local method="$1" path="$2" body="${3:-}" out code
@@ -230,20 +241,25 @@ stage_preflight() {
         die "Missing requirements:" "${missing[@]/#/- }" "Install them, then:"
     fi
     if ! have coder; then
-        warn "'coder' CLI not found — installing to ~/.local/bin"
-        curl -fsSL https://coder.com/install.sh | sh -s -- --method standalone --prefix "$HOME/.local" >/dev/null 2>&1 \
-            || die "Could not install the coder CLI automatically." "Run: curl -fsSL https://coder.com/install.sh | sh"
-        export PATH="$HOME/.local/bin:$PATH"
-        have coder || die "coder CLI installed but not on PATH." "Add ~/.local/bin to PATH"
+        local cmd='curl -fsSL https://coder.com/install.sh | sh -s -- --method standalone --prefix "$HOME/.local"'
+        warn "The 'coder' CLI is not installed"
+        if is_tty && [[ "$(ask "Install it now? (runs the official installer from coder.com)" "Y")" =~ ^[Yy] ]]; then
+            curl -fsSL https://coder.com/install.sh | sh -s -- --method standalone --prefix "$HOME/.local" >/dev/null 2>&1 \
+                || die "Could not install the coder CLI." "Run it yourself:  ${cmd}"
+            export PATH="$HOME/.local/bin:$PATH"
+            have coder || die "coder CLI installed but not on PATH." "Add ~/.local/bin to PATH"
+        else
+            die "The coder CLI is required." "Install it:  ${cmd}"
+        fi
     fi
     # Ports only matter when our own stack is not already up.
     if [ -z "$(cd "$ROOT" && docker compose ps -q coder 2>/dev/null)" ]; then
         local port
-        for port in "$(coder_port)" "$(redis_port)"; do
+        for port in "$(coder_port)" 6379; do
             if port_busy "$port"; then
                 die "Port $port is already in use by something else." \
                     "Find it:  docker ps --filter publish=$port   (or: ss -ltnp | grep :$port)" \
-                    "Stop it, or set CODER_PORT / REDIS_PORT in .env to a free port."
+                    "Stop it, or (for Coder) set CODER_PORT in .env to a free port."
             fi
         done
     fi
@@ -282,7 +298,7 @@ github_app_via_manifest() { # $1=owner → sets client id/secret/install url in 
     out_file="$(mktemp)"
     port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
     manifest_file="$(mktemp)"
-    NAME="$name" PORT="$port" CB="$(coder_url)/external-auth/primary-github/callback" python3 - >"$manifest_file" <<'PY'
+    NAME="$name" PORT="$port" CB="$(public_url)/external-auth/$(auth_id)/callback" python3 - >"$manifest_file" <<'PY'
 import json, os
 print(json.dumps({
     "name": os.environ["NAME"][:34],
@@ -356,7 +372,7 @@ github_app_manual() {
     [ -n "$owner" ] && new_url="https://github.com/settings/apps/new  (orgs: https://github.com/organizations/${owner}/settings/apps/new)"
     info "Create the app by hand:"
     info "  1. Open  ${new_url}"
-    info "  2. Callback URL:  $(coder_url)/external-auth/primary-github/callback"
+    info "  2. Callback URL:  $(public_url)/external-auth/$(auth_id)/callback"
     info "  3. Permissions → Repository: Contents, Pull requests, Workflows = Read and write"
     info "  4. Create the app, generate a Client secret, then paste below."
     is_tty || die "GitHub App credentials are missing and no terminal is attached." \
@@ -425,9 +441,8 @@ create_admin_account() {
     session="$(api POST /api/v2/users/login "$(python3 -c 'import json,sys;print(json.dumps({"email":sys.argv[1],"password":sys.argv[2]}))' "$email" "$password")" | json session_token)"
     [ -n "$session" ] || die "Could not log in to Coder as the new admin."
     CODER_TOKEN="$session"
-    # 1-year token (Coder expects nanoseconds); fall back to Coder's default lifetime.
-    token="$(api POST /api/v2/users/me/keys/tokens '{"token_name":"openflows-setup","lifetime":31536000000000000}' 2>/dev/null | json key || true)"
-    [ -n "$token" ] || token="$(api POST /api/v2/users/me/keys/tokens '{"token_name":"openflows-setup"}' | json key)"
+    # Coder's default token lifetime (7 days): short-lived on purpose. Re-run setup to refresh it.
+    token="$(api POST /api/v2/users/me/keys/tokens '{"token_name":"openflows-setup"}' | json key)"
     [ -n "$token" ] || die "Could not create a Coder API token."
     CODER_TOKEN="$token"
     env_set CODER_ADMIN_EMAIL "$email"
@@ -469,7 +484,8 @@ stage_coder_token() {
     is_tty || die "Coder has users but .env has no working CODER_SESSION_TOKEN." \
         "Create a token at $(coder_url)/settings/tokens and put it in .env as CODER_SESSION_TOKEN."
     info "Now create an API token so the setup can act as you:"
-    info "  $(coder_url)/settings/tokens   → Create Token → copy it"
+    info "  $(public_url)/settings/tokens   → Create Token → copy it"
+    info "  (tokens last 7 days by default — re-run this script to refresh it)"
     open_url "$(coder_url)/settings/tokens"
     CODER_TOKEN="$(ask_secret 'Paste the token')"
     me="$(api GET /api/v2/users/me 2>/dev/null)" || die "That token was rejected by Coder." "Create a new one at $(coder_url)/settings/tokens"
@@ -501,7 +517,9 @@ fetch_models() {
     local provider="$1" key="$2" out="$3" url resp
     local hdr=()
     case "$provider" in
-        openrouter) url="https://openrouter.ai/api/v1/models" ;;
+        openrouter)
+            curl -fsS -m 20 -H "Authorization: Bearer ${key}" "https://openrouter.ai/api/v1/auth/key" >/dev/null 2>&1 || return 1   # /models is public, so check the key itself
+            url="https://openrouter.ai/api/v1/models" ;;
         openai)     url="https://api.openai.com/v1/models"; hdr=(-H "Authorization: Bearer ${key}") ;;
         anthropic)  url="https://api.anthropic.com/v1/models?limit=1000"; hdr=(-H "x-api-key: ${key}" -H "anthropic-version: 2023-06-01") ;;
         google)     url="https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000"; hdr=(-H "x-goog-api-key: ${key}") ;;
@@ -543,7 +561,7 @@ stage_llm() {
     local org models
     org="$(api GET /api/v2/organizations | json 0.id)"
     [ -n "$org" ] || die "Could not read the Coder organization."
-    models="$(api GET "/api/v2/organizations/${org}/chats/models" | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("models",[])))' 2>/dev/null || echo 0)"
+    models="$(api GET "/api/v2/organizations/${org}/chats/models" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(len(d.get("models") or [m for p in d.get("providers",[]) for m in p.get("models",[])]))' 2>/dev/null || echo 0)"
     if [ "${models:-0}" -gt 0 ]; then
         ok "${models} model(s) already configured"
         return
@@ -600,8 +618,23 @@ stage_llm() {
 }
 
 # ── stage 7: bootstrap (templates) ──────────────────────────────────────────
+# templates_ready — true when all five openflows-* templates exist and the dev binary is built
+templates_ready() {
+    [ -x "${ROOT}/.dev-binaries/openflows" ] || return 1
+    api GET /api/v2/templates 2>/dev/null | python3 -c '
+import sys, json
+names = {t.get("name") for t in json.load(sys.stdin)}
+sys.exit(0 if {"openflows-"+r for r in ("forge","sentinel","nexus","vessel","lore")} <= names else 1)' 2>/dev/null
+}
+
 stage_bootstrap() {
     step "Workspace templates (first run takes ~10 min)"
+    CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
+    if [ "${OPENFLOWS_SETUP_FORCE_BOOTSTRAP:-}" != 1 ] && templates_ready; then
+        ok "binaries and 5 templates already in place"
+        info "Rebuild after code changes with: OPENFLOWS_SETUP_FORCE_BOOTSTRAP=1 ./scripts/setup.sh"
+        return
+    fi
     info "Safe to wait — details are logged to .setup.log"
     run_quiet "Building binaries and pushing templates" "${SCRIPT_DIR}/prod.sh" bootstrap
     ok "binaries built, 5 templates pushed"
@@ -611,17 +644,17 @@ stage_bootstrap() {
 ensure_github_link() {
     local linked me user login url
     CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
-    linked="$(api GET /api/v2/external-auth/primary-github 2>/dev/null | json authenticated || true)"
+    linked="$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)"
     if [ "$linked" = "True" ]; then ok "GitHub already linked"; return; fi
     me="$(api GET /api/v2/users/me 2>/dev/null || true)"
     user="$(printf '%s' "$me" | json username)"; login="$(printf '%s' "$me" | json login_type)"
-    url="$(coder_url)/external-auth/primary-github"
+    url="$(public_url)/external-auth/$(auth_id)"
     if [ "$login" = "password" ]; then
         panel "$Y" "Link GitHub (one time)" \
             "This token belongs to the password account '${user}'." \
             "Open a private window, then:" \
             "  1. Open  ${url}" \
-            "  2. Sign in:  $(env_get CODER_ADMIN_EMAIL)  /  $(env_get CODER_ADMIN_PASSWORD)" \
+            "  2. Sign in as  $(env_get CODER_ADMIN_EMAIL)  (password: CODER_ADMIN_PASSWORD in .env)" \
             "  3. Click the GitHub button and Authorize"
     else
         panel "$C" "Link GitHub (one time)" \
@@ -631,9 +664,12 @@ ensure_github_link() {
             "  3. Install the app on ${REPO} if asked"
         open_url "$url"
     fi
-    is_tty || die "GitHub is not linked and no terminal is attached." "Complete the steps above, then re-run."
+    if ! is_tty; then   # no terminal to wait in: tenant add offers a device-flow code and waits itself
+        warn "No terminal — continuing; the tenant step will ask you to authorize GitHub"
+        return
+    fi
     ( for ((i = 0; i < 300; i++)); do
-        [ "$(api GET /api/v2/external-auth/primary-github 2>/dev/null | json authenticated || true)" = "True" ] && exit 0
+        [ "$(api GET "/api/v2/external-auth/$(auth_id)" 2>/dev/null | json authenticated || true)" = "True" ] && exit 0
         sleep 2
       done; exit 1 ) &
     spin $! "Waiting for you to link GitHub (up to 10 min)" \
@@ -649,7 +685,12 @@ stage_tenant() {
     "${SCRIPT_DIR}/prod.sh" tenant "$REPO" --name "$NAME" --fleet "$FLEET"
     printf '\n'
     ok "tenant '${NAME}' created"
-    if "${SCRIPT_DIR}/prod.sh" doctor >"$LOG_FILE" 2>&1; then ok "health check passed"; else warn "health check reported issues — see ${LOG_FILE}"; fi
+    if "${SCRIPT_DIR}/prod.sh" doctor >"$LOG_FILE" 2>&1; then
+        ok "health check passed"
+    else
+        sed 's/\x1b\[[0-9;]*m//g; s/^/    /' "$LOG_FILE" | tail -n 15 >&2
+        die "Health check failed" "The tenant was created, but ./scripts/prod.sh doctor reports problems." "Full output: ${LOG_FILE}"
+    fi
 }
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -683,7 +724,7 @@ main() {
         REPO="$(ask 'GitHub repo to connect (owner/repo)' "$guess")"
     fi
     [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "Repo must look like owner/repo (got '${REPO}')."
-    NAME="${NAME:-${REPO#*/}}"
+    NAME="${NAME:-${REPO/\//-}}"   # owner-repo, so orgA/backend and orgB/backend do not collide
     NAME="$(printf '%s' "$NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
     FLEET="${FLEET:-1}"
     [[ "$FLEET" =~ ^[1-9][0-9]*$ ]] || die "--fleet must be a whole number >= 1."
