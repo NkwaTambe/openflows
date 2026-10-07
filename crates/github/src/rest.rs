@@ -1637,8 +1637,17 @@ pub struct ReviewCommentInput {
 
 /// Reduce a PR's review history to the latest review per reviewer.
 ///
-/// Later `submitted_at` wins; when timestamps are absent, later insertion
-/// order wins. Reviews without a reviewer login are ignored.
+/// Reduce a PR's review history to the latest review per reviewer.
+///
+/// Rules:
+/// - A review with an approving or change-request verdict (`APPROVED` or
+///   `CHANGES_REQUESTED`) takes precedence over a plain comment (`COMMENTED`).
+/// - Between two reviews that both carry a verdict, the newer one wins
+///   (later `submitted_at`, falling back to insertion order).
+/// - A `COMMENTED` review carries no verdict and never supersedes or withdraws
+///   an existing `APPROVED` or `CHANGES_REQUESTED` review.
+/// - Between reviews without a verdict, the newer one wins.
+/// - Reviews without a reviewer login are ignored.
 pub fn latest_review_per_user(reviews: &[PrReview]) -> Vec<&PrReview> {
     let mut latest: Vec<&PrReview> = Vec::new();
     for review in reviews {
@@ -1649,13 +1658,32 @@ pub fn latest_review_per_user(reviews: &[PrReview]) -> Vec<&PrReview> {
         let idx = latest.iter().position(|r| r.user.as_deref() == Some(user));
         let replace = match idx {
             Some(i) => {
-                // Prefer the later review; fall back to insertion order when
-                // timestamps are absent.
-                match (&latest[i].submitted_at, &review.submitted_at) {
+                let existing = latest[i];
+                let is_newer = match (&existing.submitted_at, &review.submitted_at) {
                     (Some(a), Some(b)) => b > a,
                     (None, Some(_)) => true,
                     (Some(_), None) => false,
                     (None, None) => true,
+                };
+                let existing_has_verdict = matches!(
+                    existing.state_enum(),
+                    PrReviewState::Approved | PrReviewState::ChangesRequested
+                );
+                let new_has_verdict = matches!(
+                    review.state_enum(),
+                    PrReviewState::Approved | PrReviewState::ChangesRequested
+                );
+
+                match (existing_has_verdict, new_has_verdict) {
+                    // Both have verdicts: newer verdict wins.
+                    (true, true) => is_newer,
+                    // New review has a verdict while existing does not: verdict wins.
+                    (false, true) => true,
+                    // Existing has a verdict while new review is a comment:
+                    // comment never overwrites a verdict.
+                    (true, false) => false,
+                    // Neither has a verdict: newer comment wins.
+                    (false, false) => is_newer,
                 }
             }
             None => false,
@@ -1785,6 +1813,45 @@ mod pr_review_tests {
             review("APPROVED", "alice", "2026-01-03T00:00:00Z"),
         ];
         assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_approved_not_superseded_by_later_comment() {
+        let reviews = vec![
+            review("APPROVED", "alice", "2026-01-01T00:00:00Z"),
+            review("COMMENTED", "alice", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+        let latest = latest_review_per_user(&reviews);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state_enum(), PrReviewState::Approved);
+    }
+
+    #[test]
+    fn test_effective_state_changes_requested_not_cleared_by_later_comment() {
+        let reviews = vec![
+            review("CHANGES_REQUESTED", "alice", "2026-01-01T00:00:00Z"),
+            review("COMMENTED", "alice", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(
+            effective_review_state(&reviews),
+            PrReviewState::ChangesRequested
+        );
+        let latest = latest_review_per_user(&reviews);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state_enum(), PrReviewState::ChangesRequested);
+    }
+
+    #[test]
+    fn test_effective_state_comment_followed_by_approval_wins() {
+        let reviews = vec![
+            review("COMMENTED", "alice", "2026-01-01T00:00:00Z"),
+            review("APPROVED", "alice", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(effective_review_state(&reviews), PrReviewState::Approved);
+        let latest = latest_review_per_user(&reviews);
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].state_enum(), PrReviewState::Approved);
     }
 
     #[test]

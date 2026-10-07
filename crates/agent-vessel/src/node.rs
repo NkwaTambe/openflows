@@ -3636,6 +3636,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_github_approval_preserves_approval_when_approver_later_comments() {
+        // alice approved the PR, then later left a comment. The comment must not
+        // hide or invalidate her approval.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z"},
+                {"state":"COMMENTED","user":{"login":"alice"},"author_association":"OWNER","commit_id":"head","submitted_at":"2026-10-05T01:00:00Z","body":"looks good!"}]"#,
+        )
+        .await;
+        assert!(run_reconcile(&node, &store).await);
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_human.as_ref().is_some_and(|d| d.approved));
+        assert!(after.pr_human.as_ref().unwrap().report.contains("alice"));
+    }
+
+    #[tokio::test]
     async fn ticketless_pr_is_reported_for_manual_handling_and_dequeued() {
         let mut server = mockito::Server::new_async().await;
         let _pr = server.mock("GET", "/repos/org/repo/pulls/42")
