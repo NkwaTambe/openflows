@@ -316,7 +316,7 @@ The token is also copied into each tenant's nexus workspace when the tenant is c
 
 ### Changed `--fleet` or the repo for an existing tenant
 
-`tenant add` leaves an existing tenant workspace unchanged, so a new `--fleet` (or a different repo under the same tenant name) does not apply until you delete that tenant's nexus workspace and add the tenant again. The default tenant name is `owner-repo`; pass `--name` to choose another.
+`tenant add` leaves an existing tenant workspace unchanged, so a new `--fleet` does not apply until you delete that tenant's nexus workspace and add the tenant again. `setup.sh` also stops when a tenant name is already bound to a different repo, and prints how to fix it. The default tenant name is `owner-repo`; pass `--name` to choose another.
 
 ### `Failed to run coder templates push` (during bootstrap)
 

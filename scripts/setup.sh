@@ -495,6 +495,11 @@ stage_coder_token() {
             create_admin_account
             return
         fi
+        if [ "$(curl -s -m 10 "$(coder_url)/api/v2/users/authmethods" | json github.enabled || true)" != "True" ]; then
+            warn "This Coder has no GitHub sign-in enabled — using a password admin instead"
+            create_admin_account
+            return
+        fi
         # The first GitHub sign-in becomes the Coder owner — so it is YOUR account that owns the workspaces.
         info "Sign in to Coder with your GitHub account (you become the owner):"
         info "  1. Open   $(coder_url)"
@@ -710,9 +715,30 @@ ensure_github_link() {
     ok "GitHub linked"
 }
 
+# check_existing_tenant — `tenant add` returns an existing workspace unchanged, so a tenant name already bound
+# to a different repo would keep running against the old one. Stop with the fix instead of reporting success.
+check_existing_tenant() {
+    local ws build existing
+    CODER_TOKEN="$(env_get CODER_SESSION_TOKEN)"
+    ws="$(api GET "/api/v2/users/me/workspace/openflows-nexus-${NAME}" 2>/dev/null || true)"
+    build="$(printf '%s' "$ws" | json latest_build.id)"
+    [ -n "$build" ] || return 0   # no workspace yet: nothing to reuse
+    existing="$(api GET "/api/v2/workspacebuilds/${build}/parameters" 2>/dev/null | python3 -c '
+import sys, json
+for p in json.load(sys.stdin):
+    if p.get("name") == "github_repository": print(p.get("value", ""))' 2>/dev/null || true)"
+    if [ -n "$existing" ] && [ "$existing" != "$REPO" ]; then
+        die "Tenant '${NAME}' already exists for ${existing}" \
+            "An existing tenant workspace is reused unchanged, so it would keep working on ${existing}." \
+            "Either pick another name:  ./scripts/setup.sh ${REPO} --name <other-name>" \
+            "or delete the old workspace and re-run:  coder delete openflows-nexus-${NAME} --yes"
+    fi
+}
+
 # ── stage 8: tenant + doctor ────────────────────────────────────────────────
 stage_tenant() {
     step "Connecting ${REPO}"
+    check_existing_tenant
     ensure_github_link
     printf '\n'
     "${SCRIPT_DIR}/prod.sh" tenant "$REPO" --name "$NAME" --fleet "$FLEET"
