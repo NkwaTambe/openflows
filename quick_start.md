@@ -47,7 +47,7 @@ OpenFlows agents authenticate to your GitHub repos (including private ones) thro
    ```
    http://localhost:7080/external-auth/primary-github/callback
    ```
-2. Under **Permissions → Repository permissions**, set **Contents**, **Pull requests**, and **Workflows** to **Read and write**.
+2. Under **Permissions → Repository permissions**, set **Checks**, **Contents**, **Issues**, **Pull requests**, and **Workflows** to **Read and write**.
 3. Create the app, then **Install it** on your org via your install URL (`https://github.com/apps/<your-app-slug>/installations/new`).
 4. Copy three values for [Step 2](#step-2--set-up-env): the **Client ID**, a generated **Client Secret** (shown once), and your **Install URL**.
 
