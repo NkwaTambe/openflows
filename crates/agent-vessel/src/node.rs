@@ -2294,17 +2294,20 @@ impl VesselNode {
                 .await?;
         }
         if cur.pr_decision.is_none() {
-            let sentinel_report = cur
-                .test_decision
-                .as_ref()
-                .map(|_| {
-                    format!(
-                        "Satisfied by verified testing review and GitHub approval by {approver}"
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!("Reconciled GitHub approval by {approver} at {head_sha}")
-                });
+            // Only satisfy pr_decision if Sentinel already verified the candidate in Testing phase.
+            // If the testing gate has not passed, do not reconcile as Sentinel's automated test
+            // verification cannot be bypassed.
+            if !cur.test_decision.as_ref().is_some_and(|t| t.approved) {
+                warn!(
+                    pr_number,
+                    ticket,
+                    "Cannot reconcile GitHub approval into pr_decision: Sentinel test gate has not passed"
+                );
+                return Ok(false);
+            }
+            let sentinel_report = format!(
+                "Satisfied by verified testing review and GitHub approval by {approver}"
+            );
             cur = store
                 .transition(
                     ticket,
@@ -3602,6 +3605,33 @@ mod tests {
             after.merge_ready("head"),
             "reconciled PR must be merge-ready when pr_decision was originally missing"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_github_approval_rejects_when_sentinel_test_gate_not_passed() {
+        // If Sentinel has not verified the candidate in Testing phase,
+        // reconciling a GitHub approval must NOT satisfy pr_decision.
+        let (_server, node, store) = reconcile_fixture(
+            200,
+            r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
+        )
+        .await;
+        // Submit phase status with NO test_decision (Sentinel never approved testing)
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42}),
+            )
+            .await;
+
+        assert!(
+            !run_reconcile(&node, &store).await,
+            "Reconciliation should be rejected when Sentinel test gate has not passed"
+        );
+
+        let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_decision.is_none());
+        assert!(!after.merge_ready("head"));
     }
 
     #[tokio::test]
