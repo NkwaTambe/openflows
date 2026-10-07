@@ -2273,6 +2273,20 @@ impl VesselNode {
         {
             return Ok(false);
         }
+        // Only reconcile if Sentinel already verified the candidate in Testing phase.
+        // If the testing gate has not passed, do not reconcile as Sentinel's automated test
+        // verification cannot be bypassed.
+        if current.pr_decision.is_none()
+            && !current.test_decision.as_ref().is_some_and(|t| t.approved)
+        {
+            warn!(
+                pr_number,
+                ticket,
+                "Cannot reconcile GitHub approval into pr_decision: Sentinel test gate has not passed"
+            );
+            return Ok(false);
+        }
+
         // Record the human approval, satisfy pr_decision if not yet recorded,
         // then complete the review-delivery handshake so `merge_ready()` passes.
         let mut cur = current.clone();
@@ -2294,17 +2308,6 @@ impl VesselNode {
                 .await?;
         }
         if cur.pr_decision.is_none() {
-            // Only satisfy pr_decision if Sentinel already verified the candidate in Testing phase.
-            // If the testing gate has not passed, do not reconcile as Sentinel's automated test
-            // verification cannot be bypassed.
-            if !cur.test_decision.as_ref().is_some_and(|t| t.approved) {
-                warn!(
-                    pr_number,
-                    ticket,
-                    "Cannot reconcile GitHub approval into pr_decision: Sentinel test gate has not passed"
-                );
-                return Ok(false);
-            }
             let sentinel_report =
                 format!("Satisfied by verified testing review and GitHub approval by {approver}");
             cur = store
@@ -3629,6 +3632,7 @@ mod tests {
         );
 
         let after = store.lifecycle("T-42").await.unwrap();
+        assert!(after.pr_human.is_none());
         assert!(after.pr_decision.is_none());
         assert!(!after.merge_ready("head"));
     }
