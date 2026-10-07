@@ -41,7 +41,7 @@ services:
       # intermittently 504s). Persisted on the tf_plugin_cache volume.
       TF_PLUGIN_CACHE_DIR: /root/.terraform.d/plugin-cache
       DOCKER_HOST: unix:///var/run/docker.sock
-      REDIS_URL: ${REDIS_URL:-redis://localhost:6379}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       CODER_URL: ${CODER_URL:-http://localhost:${CODER_PORT:-7080}}
       CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS: ${CODER_OAUTH2_GITHUB_ALLOW_SIGNUPS:-true}
       # GitHub external auth (Git App) — lets agents push/pull against PRIVATE

@@ -719,10 +719,18 @@ impl CoderClient {
             }
         }
 
-        let output = cmd
-            .output()
-            .await
-            .context("Failed to run coder templates push")?;
+        let output = match cmd.output().await {
+            Ok(out) => out,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                anyhow::bail!(
+                    "Failed to run coder templates push: the `coder` CLI is not on your PATH. \
+                     Install it (curl -fsSL https://coder.com/install.sh | sh) and re-run bootstrap."
+                )
+            }
+            Err(e) => {
+                anyhow::bail!("Failed to run coder templates push: {e}")
+            }
+        };
 
         // Clean up even when the CLI rejects the template.
         let _ = std::fs::remove_dir_all(&temp_dir);
