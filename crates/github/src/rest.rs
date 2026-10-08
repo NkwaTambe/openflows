@@ -392,12 +392,20 @@ impl GithubRestClient {
             Ok(r) => r,
             Err(e) => {
                 warn!(error = %e, "check-runs API failed — falling back to check-suites for failure detail");
-                let fallback = self.get_failed_suites_detail(owner, repo, ref_sha).await?;
-                return Ok(CiFailureDetail {
-                    failed_checks: vec![FailedCheck {
-                        name: fallback.clone(),
+                let failed_suites = self
+                    .get_failed_suites(owner, repo, ref_sha)
+                    .await
+                    .unwrap_or_default();
+                let failed_checks = if !failed_suites.is_empty() {
+                    failed_suites
+                } else {
+                    vec![FailedCheck {
+                        name: "CI failed but could not retrieve detailed check names".to_string(),
                         conclusion: "failure".to_string(),
-                    }],
+                    }]
+                };
+                return Ok(CiFailureDetail {
+                    failed_checks,
                     still_running: vec![],
                     job_logs: vec![],
                     annotations: vec![],
@@ -406,8 +414,12 @@ impl GithubRestClient {
         };
 
         if resp.check_runs.is_empty() {
+            let failed_suites = self
+                .get_failed_suites(owner, repo, ref_sha)
+                .await
+                .unwrap_or_default();
             return Ok(CiFailureDetail {
-                failed_checks: vec![],
+                failed_checks: failed_suites,
                 still_running: vec![],
                 job_logs: vec![],
                 annotations: vec![],
@@ -428,7 +440,8 @@ impl GithubRestClient {
                 "completed" => {
                     if let Some(conclusion) = &run.conclusion {
                         match conclusion.as_str() {
-                            "failure" | "timed_out" | "cancelled" | "action_required" => {
+                            "failure" | "timed_out" | "cancelled" | "action_required"
+                            | "startup_failure" => {
                                 failed_checks.push(FailedCheck {
                                     name: name.to_string(),
                                     conclusion: conclusion.clone(),
@@ -442,6 +455,12 @@ impl GithubRestClient {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        if failed_checks.is_empty() {
+            if let Ok(failed_suites) = self.get_failed_suites(owner, repo, ref_sha).await {
+                failed_checks.extend(failed_suites);
             }
         }
 
@@ -509,41 +528,59 @@ impl GithubRestClient {
         Ok(annotations)
     }
 
-    /// Get failure detail from check-suites API as fallback.
-    /// Less detailed than check-runs but works with broader token scopes.
-    async fn get_failed_suites_detail(
+    /// Get structured failure detail from check-suites API.
+    async fn get_failed_suites(
         &self,
         owner: &str,
         repo: &str,
         ref_sha: &str,
-    ) -> Result<String> {
+    ) -> Result<Vec<FailedCheck>> {
         let url = format!(
             "{}/repos/{}/{}/commits/{}/check-suites",
             self.api_base, owner, repo, ref_sha
         );
         let resp: serde_json::Value = self.get_json_raw(&url).await?;
 
-        let mut failed: Vec<String> = Vec::new();
+        let mut failed: Vec<FailedCheck> = Vec::new();
         if let Some(suites) = resp["check_suites"].as_array() {
             for suite in suites {
                 let status = suite["status"].as_str().unwrap_or("unknown");
                 if status == "completed" {
                     let conclusion = suite["conclusion"].as_str().unwrap_or("");
                     match conclusion {
-                        "failure" | "timed_out" | "cancelled" | "action_required" => {
+                        "failure" | "timed_out" | "cancelled" | "action_required"
+                        | "startup_failure" => {
                             let app_name = suite["app"]["name"].as_str().unwrap_or("unknown");
-                            failed.push(format!("{} ({}) — {}", app_name, conclusion, status));
+                            failed.push(FailedCheck {
+                                name: app_name.to_string(),
+                                conclusion: conclusion.to_string(),
+                            });
                         }
                         _ => {}
                     }
                 }
             }
         }
+        Ok(failed)
+    }
 
+    /// Get failure detail from check-suites API as fallback.
+    /// Less detailed than check-runs but works with broader token scopes.
+    pub async fn get_failed_suites_detail(
+        &self,
+        owner: &str,
+        repo: &str,
+        ref_sha: &str,
+    ) -> Result<String> {
+        let failed = self.get_failed_suites(owner, repo, ref_sha).await?;
         if failed.is_empty() {
             Ok("CI failed but could not retrieve detailed check names".to_string())
         } else {
-            Ok(format!("Failed checks suites:\n{}", failed.join("\n")))
+            let lines: Vec<String> = failed
+                .into_iter()
+                .map(|f| format!("{} ({}) — completed", f.name, f.conclusion))
+                .collect();
+            Ok(format!("Failed checks suites:\n{}", lines.join("\n")))
         }
     }
 
@@ -2291,6 +2328,91 @@ mod lifecycle_ci_tests {
         assert_eq!(result.sha.as_deref(), Some("merge-commit"));
         merge.assert_async().await;
     }
+    #[tokio::test]
+    async fn startup_failure_in_check_suites_is_reported_in_failure_details() {
+        let mut server = mockito::Server::new_async().await;
+        let check_runs = server
+            .mock("GET", "/repos/org/repo/commits/head/check-runs")
+            .with_status(200)
+            .with_body(r#"{"check_runs":[]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let check_suites = server
+            .mock("GET", "/repos/org/repo/commits/head/check-suites")
+            .with_status(200)
+            .with_body(r#"{"check_suites":[{"status":"completed","conclusion":"startup_failure","app":{"name":"GitHub Actions"}}]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+
+        let structured = client
+            .get_failed_checks_detail_structured("org", "repo", "head")
+            .await
+            .unwrap();
+        assert_eq!(structured.failed_checks.len(), 1);
+        assert_eq!(structured.failed_checks[0].name, "GitHub Actions");
+        assert_eq!(structured.failed_checks[0].conclusion, "startup_failure");
+
+        let text = client
+            .get_failed_checks_detail("org", "repo", "head")
+            .await
+            .unwrap();
+        assert!(text.contains("GitHub Actions"));
+        assert!(text.contains("startup_failure"));
+
+        check_runs.assert_async().await;
+        check_suites.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn startup_failure_in_check_runs_is_reported_in_failure_details() {
+        let mut server = mockito::Server::new_async().await;
+        let check_runs = server
+            .mock("GET", "/repos/org/repo/commits/head/check-runs")
+            .with_status(200)
+            .with_body(r#"{"check_runs":[{"name":"build-and-test","status":"completed","conclusion":"startup_failure","id":42}]}"#)
+            .create_async()
+            .await;
+        let annotations = server
+            .mock("GET", "/repos/org/repo/check-runs/42/annotations")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let actions_runs = server
+            .mock(
+                "GET",
+                "/repos/org/repo/actions/runs?head_sha=head&status=failure&per_page=10",
+            )
+            .with_status(200)
+            .with_body(r#"{"workflow_runs":[]}"#)
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+
+        let structured = client
+            .get_failed_checks_detail_structured("org", "repo", "head")
+            .await
+            .unwrap();
+        assert_eq!(structured.failed_checks.len(), 1);
+        assert_eq!(structured.failed_checks[0].name, "build-and-test");
+        assert_eq!(structured.failed_checks[0].conclusion, "startup_failure");
+
+        check_runs.assert_async().await;
+        annotations.assert_async().await;
+        actions_runs.assert_async().await;
+    }
+
     #[test]
     fn success_cannot_mask_failed_pending_or_missing_ci() {
         assert_eq!(
