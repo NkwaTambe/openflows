@@ -41,6 +41,7 @@ pub struct VesselNode {
     client: github::GithubRestClient,
     poller: CiPoller,
     merger: PrMerger,
+    slots_lock: tokio::sync::Mutex<()>,
 }
 
 /// Maximum number of conflict resolution attempts before giving up.
@@ -71,6 +72,7 @@ impl VesselNode {
             merger: PrMerger::new(client.clone(), config.merge_method),
             client,
             config,
+            slots_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -232,13 +234,32 @@ impl VesselNode {
             }
         }
 
+        self.clear_slot_workspace(store, worker_id, workspace_id)
+            .await;
+    }
+
+    /// Atomically clears the workspace ID from worker slots in SharedStore.
+    /// Serialized via `slots_lock` so that concurrent cleanup tasks cannot race on
+    /// reading/modifying/writing `worker_slots` and inadvertently restore stale workspace references.
+    async fn clear_slot_workspace(&self, store: &SharedStore, worker_id: &str, workspace_id: &str) {
+        let _guard = self.slots_lock.lock().await;
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut changed = false;
         if let Some(slot) = slots.get_mut(worker_id) {
             if slot.workspace_id.as_deref() == Some(workspace_id) {
                 slot.workspace_id = None;
-                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                changed = true;
             }
+        }
+        for slot in slots.values_mut() {
+            if slot.workspace_id.as_deref() == Some(workspace_id) {
+                slot.workspace_id = None;
+                changed = true;
+            }
+        }
+        if changed {
+            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
         }
     }
 
@@ -290,14 +311,8 @@ impl VesselNode {
         match client.delete_workspace(workspace_id).await {
             Ok(_) => {
                 info!(worker_id, workspace_id, "Destroyed Coder workspace");
-                let mut slots: HashMap<String, WorkerSlot> =
-                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-                if let Some(slot) = slots.get_mut(worker_id) {
-                    if slot.workspace_id.as_deref() == Some(workspace_id) {
-                        slot.workspace_id = None;
-                        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-                    }
-                }
+                self.clear_slot_workspace(store, worker_id, workspace_id)
+                    .await;
                 true
             }
             Err(e) => {
@@ -456,13 +471,16 @@ impl VesselNode {
         }
     }
 
-    /// Scan terminal tickets (Merged, Failed, or Completed) and retry deletion for any
+    /// Scan terminal tickets (Merged, Exhausted, or Completed) and retry deletion for any
     /// workspaces whose previous deletion attempt failed and whose ID is still
     /// retained in `full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role)`.
+    /// Runs all candidate deletions concurrently so slow Coder builds do not stack latency.
     pub async fn cleanup_terminal_ticket_workspaces(&self, store: &SharedStore) {
         let raw_tickets: Vec<Value> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+
+        let mut to_cleanup = Vec::new();
 
         for raw_ticket in &raw_tickets {
             let ticket_id = match raw_ticket["id"].as_str() {
@@ -474,7 +492,7 @@ impl VesselNode {
             let is_terminal =
                 match serde_json::from_value::<TicketStatus>(raw_ticket["status"].clone()) {
                     Ok(status) => status.is_terminal(),
-                    Err(_) => matches!(status_type, "merged" | "failed" | "completed"),
+                    Err(_) => matches!(status_type, "merged" | "exhausted" | "completed"),
                 } || store
                     .lifecycle(ticket_id)
                     .await
@@ -494,24 +512,42 @@ impl VesselNode {
                         .map(|(w, _)| w.as_str())
                         .unwrap_or(role);
 
-                    info!(
-                        ticket_id,
-                        role,
-                        worker_id = target_worker,
-                        workspace_id = %ws_id,
-                        "Retrying deletion of retained workspace for terminal ticket"
-                    );
-
-                    if self
-                        .destroy_coder_workspace(store, target_worker, &ws_id)
-                        .await
-                        && store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id)
-                    {
-                        store.del(&ws_key).await;
-                    }
+                    to_cleanup.push((
+                        ticket_id.to_string(),
+                        role.to_string(),
+                        target_worker.to_string(),
+                        ws_id,
+                        ws_key,
+                    ));
                 }
             }
         }
+
+        if to_cleanup.is_empty() {
+            return;
+        }
+
+        let cleanup_futures = to_cleanup.into_iter().map(
+            |(ticket_id, role, target_worker, ws_id, ws_key)| async move {
+                info!(
+                    ticket_id = %ticket_id,
+                    role = %role,
+                    worker_id = %target_worker,
+                    workspace_id = %ws_id,
+                    "Retrying deletion of retained workspace for terminal ticket"
+                );
+
+                if self
+                    .destroy_coder_workspace(store, &target_worker, &ws_id)
+                    .await
+                    && store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id)
+                {
+                    store.del(&ws_key).await;
+                }
+            },
+        );
+
+        futures::future::join_all(cleanup_futures).await;
     }
 
     #[allow(dead_code)]
@@ -743,9 +779,6 @@ impl Node for VesselNode {
     async fn prep(&self, store: &SharedStore) -> Result<Value> {
         *self.lifecycle_store.lock().unwrap() = Some(store.clone());
         debug!("VESSEL prep: reading pending PRs and CI readiness");
-
-        // Clean up / retry deletion for any retained workspaces from terminal tickets
-        self.cleanup_terminal_ticket_workspaces(store).await;
 
         let repository: Option<String> = store.get_typed("repository").await;
         let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
@@ -1002,6 +1035,7 @@ impl Node for VesselNode {
                 return Ok(Action::new(PAUSE_SIGNAL));
             }
             debug!("No PRs were processed");
+            self.cleanup_terminal_ticket_workspaces(store).await;
             return Ok(Action::new("no_work"));
         }
 
@@ -4781,6 +4815,25 @@ mod tests {
         store.set(&forge_ws_key, json!("ws-forge-30")).await;
         store.set(&sentinel_ws_key, json!("ws-sentinel-30")).await;
 
+        let mut slots = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: config::state::WorkerStatus::Idle,
+                workspace_id: Some("ws-forge-30".to_string()),
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: config::state::WorkerStatus::Idle,
+                workspace_id: Some("ws-sentinel-30".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
         node.cleanup_terminal_ticket_workspaces(&store).await;
 
         assert!(
@@ -4790,6 +4843,17 @@ mod tests {
         assert!(
             store.get_typed::<String>(&sentinel_ws_key).await.is_none(),
             "Sentinel workspace key should be cleaned up after successful deletion"
+        );
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        assert_eq!(
+            updated_slots["forge-1"].workspace_id, None,
+            "forge-1 workspace_id should be cleared"
+        );
+        assert_eq!(
+            updated_slots["sentinel"].workspace_id, None,
+            "sentinel workspace_id should be cleared"
         );
     }
 }

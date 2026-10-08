@@ -3391,6 +3391,13 @@ Use `openflows-harness` for all coordination:
                     for role in ["forge", "sentinel"] {
                         let ws_key = full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role);
                         if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                            // Archive all chats associated with this workspace before deletion
+                            if let Ok(chats) = client.list_chats().await {
+                                for chat in chats.iter().filter(|c| c.workspace_id == ws_id) {
+                                    let _ = client.archive_chat(&chat.id).await;
+                                }
+                            }
+
                             match client.delete_workspace(&ws_id).await {
                                 Ok(_) => {
                                     info!(

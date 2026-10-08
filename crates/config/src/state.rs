@@ -60,10 +60,12 @@ pub enum TicketStatus {
 
 impl TicketStatus {
     /// Return whether this ticket status represents a terminal state
-    /// (e.g. Merged, Failed, or Completed with an outcome other than "pr_opened").
+    /// (e.g. Merged, Exhausted, Failed with attempts >= MAX_ATTEMPTS,
+    /// or Completed with an outcome other than "pr_opened").
     pub fn is_terminal(&self) -> bool {
         match self {
-            Self::Merged { .. } | Self::Failed { .. } => true,
+            Self::Merged { .. } | Self::Exhausted { .. } => true,
+            Self::Failed { attempts, .. } => *attempts >= Ticket::MAX_ATTEMPTS,
             Self::Completed { outcome, .. } => outcome != "pr_opened",
             _ => false,
         }
