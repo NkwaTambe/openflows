@@ -426,17 +426,23 @@ impl VesselNode {
         }
 
         for (worker_id, ws_id) in to_destroy {
+            let role = Self::worker_role(&worker_id);
             if self
                 .destroy_coder_workspace(store, &worker_id, &ws_id)
                 .await
             {
                 if let Some(tid) = target_ticket {
-                    for role in ["forge", "sentinel"] {
-                        let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
-                        if store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id) {
-                            store.del(&ws_key).await;
-                        }
+                    let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                    if store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id) {
+                        store.del(&ws_key).await;
                     }
+                }
+            } else if let Some(tid) = target_ticket {
+                // Deletion failed: ensure the workspace ID is preserved in the ticket key
+                // so the undeleted workspace can be cleaned up later by recovery
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                if store.get_typed::<String>(&ws_key).await.is_none() {
+                    store.set(&ws_key, json!(ws_id)).await;
                 }
             }
         }
@@ -2767,17 +2773,6 @@ impl VesselNode {
             return;
         }
 
-        // Check which workspaces are still recorded for this ticket (i.e. deletion failed or was not performed)
-        let mut active_workspaces: Vec<String> = Vec::new();
-        if let Some(tid) = target_ticket {
-            for role in ["forge", "sentinel"] {
-                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
-                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
-                    active_workspaces.push(ws_id);
-                }
-            }
-        }
-
         // Fetch slots and recycle matching workers to Idle
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
@@ -2791,11 +2786,6 @@ impl VesselNode {
             let matches_ticket =
                 target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
-                let ws_still_active = slot
-                    .workspace_id
-                    .as_ref()
-                    .is_some_and(|w| active_workspaces.contains(w));
-
                 match &slot.status {
                     WorkerStatus::Done { .. }
                     | WorkerStatus::Assigned { .. }
@@ -2806,13 +2796,11 @@ impl VesselNode {
                             "Recycling worker to Idle after merge"
                         );
                         slot.status = WorkerStatus::Idle;
-                        if !ws_still_active {
-                            slot.workspace_id = None;
-                        }
+                        slot.workspace_id = None;
                         changed = true;
                     }
                     _ => {
-                        if !ws_still_active && slot.workspace_id.is_some() {
+                        if slot.workspace_id.is_some() {
                             slot.workspace_id = None;
                             changed = true;
                         }
@@ -4547,7 +4535,10 @@ mod tests {
         store.set(KEY_WORKER_SLOTS, json!(slots)).await;
 
         let ws_key = full_ticket_key("T-010", KEY_TICKET_WORKSPACE, "forge");
-        store.set(&ws_key, json!("ws-forge-10")).await;
+        assert!(
+            store.get_typed::<String>(&ws_key).await.is_none(),
+            "Workspace key should not be set yet"
+        );
 
         let pending_prs = vec![json!({
             "number": 10,
@@ -4559,15 +4550,16 @@ mod tests {
         node.destroy_coder_workspace_for_pr(&store, &pending_prs, 10)
             .await;
 
-        // The ticket-scoped workspace key MUST be preserved
+        // The ticket-scoped workspace key MUST be recorded for recovery
         let stored_ws = store.get_typed::<String>(&ws_key).await;
         assert_eq!(
             stored_ws.as_deref(),
             Some("ws-forge-10"),
-            "Ticket workspace key must not be erased when deletion fails"
+            "Ticket workspace key must be recorded when deletion fails"
         );
 
-        // When recycled, the slot status becomes Idle, but workspace reference is preserved
+        // When recycled, the slot status becomes Idle and slot workspace_id is cleared
+        // so a newly assigned ticket never inherits the old workspace.
         let pr = json!({
             "number": 10,
             "ticket_id": "T-010",
@@ -4583,9 +4575,8 @@ mod tests {
             "Forge slot is set to Idle"
         );
         assert_eq!(
-            forge_slot.workspace_id.as_deref(),
-            Some("ws-forge-10"),
-            "Slot workspace_id must be preserved when deletion fails"
+            forge_slot.workspace_id, None,
+            "Slot workspace_id must be cleared on Idle so it is not reused"
         );
     }
 }

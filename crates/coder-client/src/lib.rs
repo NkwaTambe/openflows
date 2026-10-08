@@ -969,22 +969,26 @@ impl CoderClient {
         }
     }
 
-    /// Delete a workspace.
+    /// Delete a workspace by triggering a delete build.
     pub async fn delete_workspace(&self, id: &str) -> Result<()> {
         let resp = self
             .authenticated_request(
-                reqwest::Method::DELETE,
-                &format!("/api/v2/workspaces/{}", id),
+                reqwest::Method::POST,
+                &format!("/api/v2/workspaces/{}/builds", id),
             )
+            .json(&serde_json::json!({
+                "transition": "delete"
+            }))
             .send()
             .await
             .context("Failed to delete workspace")?;
 
-        if resp.status().is_success() {
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
             info!(workspace_id = id, "Deleted workspace");
             Ok(())
         } else {
-            bail!("Failed to delete workspace: {}", resp.status())
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Failed to delete workspace: {}", body)
         }
     }
 
@@ -2041,6 +2045,10 @@ mod http_mock {
             ("POST", "/api/v2/chats/rejected/messages") => (
                 "403 Forbidden", r#"{"message":"chat access denied"}"#.to_string(),
             ),
+            ("POST", "/api/v2/workspaces/ws-delete-me/builds") => (
+                "201 Created",
+                r#"{"id":"build-1","transition":"delete"}"#.to_string(),
+            ),
             _ => ("404 Not Found", r#"{"message":"not found"}"#.to_string()),
         }
     }
@@ -2271,6 +2279,38 @@ mod tests {
             .expect("organization_id must be present and a string");
         assert!(!org_id.is_empty(), "organization_id must not be empty");
         assert_eq!(org_id, "org-abc");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_workspace_sends_delete_build_transition() {
+        let server = super::http_mock::HttpMock::new().await.unwrap();
+        let client = crate::CoderClient::new(&server.url(), "test-token");
+
+        client
+            .delete_workspace("ws-delete-me")
+            .await
+            .expect("delete_workspace should succeed against mock");
+
+        let requests = server.requests().await;
+        let delete_req = requests
+            .iter()
+            .find(|r| r.method == "POST" && r.path == "/api/v2/workspaces/ws-delete-me/builds")
+            .expect("expected a POST to workspace builds");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&delete_req.body).expect("recorded body should be valid JSON");
+        assert_eq!(
+            body.get("transition").and_then(|v| v.as_str()),
+            Some("delete")
+        );
+
+        // 404 should also be treated as success (already deleted)
+        client
+            .delete_workspace("ws-not-found")
+            .await
+            .expect("404 should succeed");
+
         server.shutdown().await;
     }
 }
