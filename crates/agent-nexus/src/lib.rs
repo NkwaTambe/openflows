@@ -4465,15 +4465,13 @@ impl Node for NexusNode {
                 let is_done = matches!(slot.status, WorkerStatus::Done { .. });
                 let is_terminal = match &slot.status {
                     WorkerStatus::Assigned { ticket_id, .. }
-                    | WorkerStatus::Working { ticket_id, .. } => {
-                        tickets.iter().any(|t| {
-                            t.id == *ticket_id
-                                && matches!(
-                                    t.status,
-                                    TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
-                                )
-                        })
-                    }
+                    | WorkerStatus::Working { ticket_id, .. } => tickets.iter().any(|t| {
+                        t.id == *ticket_id
+                            && matches!(
+                                t.status,
+                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
+                            )
+                    }),
                     _ => false,
                 };
                 if is_done || is_terminal {
@@ -6479,7 +6477,10 @@ mod tests {
                 body: "Body".to_string(),
                 priority: 1,
                 branch: Some("forge-1/T-005".to_string()),
-                status: TicketStatus::Merged { pr_number: 6, worker_id: "forge-1".to_string() },
+                status: TicketStatus::Merged {
+                    pr_number: 6,
+                    worker_id: "forge-1".to_string(),
+                },
                 issue_url: None,
                 attempts: 0,
             },

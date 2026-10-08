@@ -303,9 +303,7 @@ impl VesselNode {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .or_else(|| {
-                Self::derive_worker_id_from_branch(
-                    pr_entry["head_branch"].as_str().unwrap_or(""),
-                )
+                Self::derive_worker_id_from_branch(pr_entry["head_branch"].as_str().unwrap_or(""))
             })
     }
 
@@ -330,7 +328,8 @@ impl VesselNode {
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         for (worker_id, slot) in &slots {
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
-            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_worker || matches_ticket {
                 if let Some(ref ws_id) = slot.workspace_id {
                     self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
@@ -362,7 +361,8 @@ impl VesselNode {
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         for (worker_id, slot) in &slots {
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
-            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_worker || matches_ticket {
                 if let Some(ref ws_id) = slot.workspace_id {
                     self.destroy_coder_workspace(store, worker_id, ws_id).await;
@@ -2703,7 +2703,8 @@ impl VesselNode {
         let mut to_destroy = Vec::new();
         for (worker_id, slot) in &slots {
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
-            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_worker || matches_ticket {
                 if let Some(ref ws_id) = slot.workspace_id {
                     to_destroy.push((worker_id.clone(), ws_id.clone()));
@@ -2721,7 +2722,8 @@ impl VesselNode {
 
         for (worker_id, slot) in slots.iter_mut() {
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
-            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            let matches_ticket =
+                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_worker || matches_ticket {
                 match &slot.status {
                     WorkerStatus::Done { .. }
@@ -4380,4 +4382,3 @@ mod tests {
         assert_eq!(sentinel_slot.workspace_id, None);
     }
 }
-
