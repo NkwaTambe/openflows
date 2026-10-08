@@ -12,6 +12,7 @@ use tokio::{
     net::TcpListener,
     time::{timeout, Duration},
 };
+use tower_http::trace::TraceLayer;
 
 const READINESS_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -281,7 +282,28 @@ pub struct ReadinessReport {
 }
 
 pub fn create_router(state: AppState) -> Router {
-    crate::routes::router().with_state(state)
+    crate::routes::router()
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        status = tracing::field::Empty,
+                        latency_ms = tracing::field::Empty,
+                    )
+                })
+                .on_response(|response: &axum::http::Response<_>, latency: std::time::Duration, span: &tracing::Span| {
+                    span.record("status", response.status().as_u16());
+                    span.record("latency_ms", latency.as_millis() as u64);
+                    tracing::info!(parent: span, "request completed");
+                })
+                .on_failure(|error: tower_http::classify::ServerErrorsFailureClass, latency: std::time::Duration, span: &tracing::Span| {
+                    tracing::warn!(parent: span, %error, latency_ms = latency.as_millis() as u64, "request failed");
+                }),
+        )
+        .with_state(state)
 }
 
 pub async fn serve(

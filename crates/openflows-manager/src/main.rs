@@ -7,11 +7,18 @@ use std::net::SocketAddr;
 async fn main() -> Result<(), ManagerError> {
     // Initialize the default tracing subscriber before any fallible setup so
     // configuration and bind failures are visible to operators.
-    tracing_subscriber::fmt::init();
+    let filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "openflows_manager=info,tower_http=info".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .compact()
+        .init();
 
     // Centralized, typed configuration. Hosted-mode configuration failures are
     // surfaced here rather than silently falling back to local behavior.
     let config = ManagerConfig::from_env().map_err(|e| ManagerError::Config(e.to_string()))?;
+    tracing::info!(mode = %config.mode, addr = %config.http_addr, "starting OpenFlows Manager");
     let addr = config.http_addr.parse::<SocketAddr>().map_err(|error| {
         ManagerError::Config(format!("invalid OPENFLOWS_MANAGER_ADDR: {error}"))
     })?;
