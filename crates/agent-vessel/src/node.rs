@@ -363,7 +363,11 @@ impl VesselNode {
                 let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
                 if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
                     if !to_stop.iter().any(|(_, w)| w == &ws_id) {
-                        let w_id = target_worker.as_deref().unwrap_or(role).to_string();
+                        let w_id = if role == "sentinel" {
+                            "sentinel".to_string()
+                        } else {
+                            target_worker.as_deref().unwrap_or(role).to_string()
+                        };
                         to_stop.push((w_id, ws_id));
                     }
                 }
@@ -396,7 +400,7 @@ impl VesselNode {
 
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let mut to_destroy: Vec<(String, String)> = Vec::new();
+        let mut to_destroy: Vec<(String, String, String)> = Vec::new(); // (worker_id, ws_id, role)
         for (worker_id, slot) in &slots {
             if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
                 continue;
@@ -406,8 +410,9 @@ impl VesselNode {
                 target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
                 if let Some(ref ws_id) = slot.workspace_id {
-                    if !to_destroy.iter().any(|(_, w)| w == ws_id) {
-                        to_destroy.push((worker_id.clone(), ws_id.clone()));
+                    if !to_destroy.iter().any(|(_, w, _)| w == ws_id) {
+                        let role = Self::worker_role(worker_id).to_string();
+                        to_destroy.push((worker_id.clone(), ws_id.clone(), role));
                     }
                 }
             }
@@ -417,22 +422,25 @@ impl VesselNode {
             for role in ["forge", "sentinel"] {
                 let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
                 if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
-                    if !to_destroy.iter().any(|(_, w)| w == &ws_id) {
-                        let w_id = target_worker.as_deref().unwrap_or(role).to_string();
-                        to_destroy.push((w_id, ws_id));
+                    if !to_destroy.iter().any(|(_, w, _)| w == &ws_id) {
+                        let w_id = if role == "sentinel" {
+                            "sentinel".to_string()
+                        } else {
+                            target_worker.as_deref().unwrap_or(role).to_string()
+                        };
+                        to_destroy.push((w_id, ws_id, role.to_string()));
                     }
                 }
             }
         }
 
-        for (worker_id, ws_id) in to_destroy {
-            let role = Self::worker_role(&worker_id);
+        for (worker_id, ws_id, role) in to_destroy {
             if self
                 .destroy_coder_workspace(store, &worker_id, &ws_id)
                 .await
             {
                 if let Some(tid) = target_ticket {
-                    let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                    let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, &role);
                     if store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id) {
                         store.del(&ws_key).await;
                     }
@@ -440,9 +448,67 @@ impl VesselNode {
             } else if let Some(tid) = target_ticket {
                 // Deletion failed: ensure the workspace ID is preserved in the ticket key
                 // so the undeleted workspace can be cleaned up later by recovery
-                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, &role);
                 if store.get_typed::<String>(&ws_key).await.is_none() {
                     store.set(&ws_key, json!(ws_id)).await;
+                }
+            }
+        }
+    }
+
+    /// Scan terminal tickets (Merged, Failed, or Completed) and retry deletion for any
+    /// workspaces whose previous deletion attempt failed and whose ID is still
+    /// retained in `full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role)`.
+    pub async fn cleanup_terminal_ticket_workspaces(&self, store: &SharedStore) {
+        let raw_tickets: Vec<Value> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        let slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+
+        for raw_ticket in &raw_tickets {
+            let ticket_id = match raw_ticket["id"].as_str() {
+                Some(id) => id,
+                None => continue,
+            };
+
+            let status_type = raw_ticket["status"]["type"].as_str().unwrap_or("");
+            let is_terminal =
+                match serde_json::from_value::<TicketStatus>(raw_ticket["status"].clone()) {
+                    Ok(status) => status.is_terminal(),
+                    Err(_) => matches!(status_type, "merged" | "failed" | "completed"),
+                } || store
+                    .lifecycle(ticket_id)
+                    .await
+                    .ok()
+                    .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
+
+            if !is_terminal {
+                continue;
+            }
+
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(ticket_id, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    let target_worker = slots
+                        .iter()
+                        .find(|(_, s)| s.workspace_id.as_deref() == Some(&ws_id))
+                        .map(|(w, _)| w.as_str())
+                        .unwrap_or(role);
+
+                    info!(
+                        ticket_id,
+                        role,
+                        worker_id = target_worker,
+                        workspace_id = %ws_id,
+                        "Retrying deletion of retained workspace for terminal ticket"
+                    );
+
+                    if self
+                        .destroy_coder_workspace(store, target_worker, &ws_id)
+                        .await
+                        && store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id)
+                    {
+                        store.del(&ws_key).await;
+                    }
                 }
             }
         }
@@ -677,6 +743,9 @@ impl Node for VesselNode {
     async fn prep(&self, store: &SharedStore) -> Result<Value> {
         *self.lifecycle_store.lock().unwrap() = Some(store.clone());
         debug!("VESSEL prep: reading pending PRs and CI readiness");
+
+        // Clean up / retry deletion for any retained workspaces from terminal tickets
+        self.cleanup_terminal_ticket_workspaces(store).await;
 
         let repository: Option<String> = store.get_typed("repository").await;
         let pending_prs: Vec<Value> = store.get_typed(KEY_PENDING_PRS).await.unwrap_or_default();
@@ -3399,6 +3468,9 @@ impl VesselNode {
     pub async fn reconcile(&self, store: &SharedStore) -> Result<()> {
         info!("Running VESSEL startup reconciliation");
 
+        // Clean up / retry deletion for any retained workspaces from terminal tickets
+        self.cleanup_terminal_ticket_workspaces(store).await;
+
         let repository: Option<String> = store.get_typed("repository").await;
         let pending_prs: Option<Vec<Value>> = store.get_typed("pending_prs").await;
         let (owner, repo) = parse_repository(repository.as_deref());
@@ -4577,6 +4649,147 @@ mod tests {
         assert_eq!(
             forge_slot.workspace_id, None,
             "Slot workspace_id must be cleared on Idle so it is not reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sentinel_workspace_found_via_ticket_key_preserves_sentinel_role() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-020".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-20".to_string()),
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-020".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: None,
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        let forge_ws_key = full_ticket_key("T-020", KEY_TICKET_WORKSPACE, "forge");
+        let sentinel_ws_key = full_ticket_key("T-020", KEY_TICKET_WORKSPACE, "sentinel");
+        store.set(&forge_ws_key, json!("ws-forge-20")).await;
+        store.set(&sentinel_ws_key, json!("ws-sentinel-20")).await;
+
+        let pending_prs = vec![json!({
+            "number": 20,
+            "ticket_id": "T-020",
+            "head_branch": "forge-1/T-020",
+            "worker_id": "forge-1",
+        })];
+
+        // Destruction fails because Coder client is unavailable
+        node.destroy_coder_workspace_for_pr(&store, &pending_prs, 20)
+            .await;
+
+        // Sentinel workspace MUST NOT overwrite forge workspace or be lost
+        let forge_stored = store.get_typed::<String>(&forge_ws_key).await;
+        let sentinel_stored = store.get_typed::<String>(&sentinel_ws_key).await;
+
+        assert_eq!(
+            forge_stored.as_deref(),
+            Some("ws-forge-20"),
+            "Forge ticket key must retain its forge workspace ID"
+        );
+        assert_eq!(
+            sentinel_stored.as_deref(),
+            Some("ws-sentinel-20"),
+            "Sentinel ticket key must retain its sentinel workspace ID under sentinel role"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_terminal_ticket_workspaces_retries_and_cleans_up() {
+        let mut server = mockito::Server::new_async().await;
+        // Mock list_chats
+        server
+            .mock("GET", "/api/v2/chats")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+        // Mock builds delete for forge workspace
+        server
+            .mock("POST", "/api/v2/workspaces/ws-forge-30/builds")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"b1","transition":"delete"}"#)
+            .create_async()
+            .await;
+        // Mock get_workspace returning 404 (deleted)
+        server
+            .mock("GET", "/api/v2/workspaces/ws-forge-30")
+            .with_status(404)
+            .create_async()
+            .await;
+        // Mock builds delete for sentinel workspace
+        server
+            .mock("POST", "/api/v2/workspaces/ws-sentinel-30/builds")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"b2","transition":"delete"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/v2/workspaces/ws-sentinel-30")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_api_token", json!("token-123")).await;
+
+        let node = VesselNode::new(VesselConfig::default());
+
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-030",
+                    "title": "Clean up test",
+                    "body": "",
+                    "priority": 1,
+                    "status": {
+                        "type": "merged",
+                        "worker_id": "forge-1",
+                        "pr_number": 30
+                    }
+                }]),
+            )
+            .await;
+
+        let forge_ws_key = full_ticket_key("T-030", KEY_TICKET_WORKSPACE, "forge");
+        let sentinel_ws_key = full_ticket_key("T-030", KEY_TICKET_WORKSPACE, "sentinel");
+        store.set(&forge_ws_key, json!("ws-forge-30")).await;
+        store.set(&sentinel_ws_key, json!("ws-sentinel-30")).await;
+
+        node.cleanup_terminal_ticket_workspaces(&store).await;
+
+        assert!(
+            store.get_typed::<String>(&forge_ws_key).await.is_none(),
+            "Forge workspace key should be cleaned up after successful deletion"
+        );
+        assert!(
+            store.get_typed::<String>(&sentinel_ws_key).await.is_none(),
+            "Sentinel workspace key should be cleaned up after successful deletion"
         );
     }
 }

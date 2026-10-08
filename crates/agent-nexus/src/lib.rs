@@ -3378,6 +3378,49 @@ Use `openflows-harness` for all coordination:
                 .await;
         }
 
+        // Retry deleting any lingering workspaces for terminal tickets whose deletion failed
+        if let Some(client) = Self::coder_client_from_store(store).await {
+            for ticket in &tickets {
+                if ticket.status.is_terminal()
+                    || store
+                        .lifecycle(&ticket.id)
+                        .await
+                        .ok()
+                        .is_some_and(|s| s.phase == config::lifecycle::Phase::Done)
+                {
+                    for role in ["forge", "sentinel"] {
+                        let ws_key = full_ticket_key(&ticket.id, KEY_TICKET_WORKSPACE, role);
+                        if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                            match client.delete_workspace(&ws_id).await {
+                                Ok(_) => {
+                                    info!(
+                                        ticket_id = %ticket.id,
+                                        role,
+                                        workspace_id = %ws_id,
+                                        "Recovered and deleted lingering workspace for terminal ticket"
+                                    );
+                                    if store.get_typed::<String>(&ws_key).await.as_deref()
+                                        == Some(&ws_id)
+                                    {
+                                        store.del(&ws_key).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        ticket_id = %ticket.id,
+                                        role,
+                                        workspace_id = %ws_id,
+                                        error = %e,
+                                        "Failed to delete lingering workspace during orphan recovery; will retry"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
