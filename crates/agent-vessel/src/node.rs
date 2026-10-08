@@ -297,7 +297,19 @@ impl VesselNode {
         }
     }
 
-    /// Stop a Coder workspace for the worker associated with a merged PR.
+    fn resolve_worker_id_from_pr(pr_entry: &Value) -> Option<String> {
+        pr_entry["worker_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                Self::derive_worker_id_from_branch(
+                    pr_entry["head_branch"].as_str().unwrap_or(""),
+                )
+            })
+    }
+
+    /// Stop Coder workspace(s) for the workers associated with a merged PR.
     async fn stop_coder_workspace_for_pr(
         &self,
         store: &SharedStore,
@@ -311,21 +323,24 @@ impl VesselNode {
             Some(e) => e,
             None => return,
         };
-        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
-            return;
-        }
+        let target_ticket = pr_entry["ticket_id"].as_str();
+        let target_worker = Self::resolve_worker_id_from_pr(pr_entry);
+
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                    .await;
+        for (worker_id, slot) in &slots {
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_worker || matches_ticket {
+                if let Some(ref ws_id) = slot.workspace_id {
+                    self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
+                        .await;
+                }
             }
         }
     }
 
-    /// Destroy a Coder workspace for the worker associated with a merged PR.
+    /// Destroy Coder workspace(s) for the workers associated with a merged PR.
     /// Archives all chats and deletes the workspace.
     async fn destroy_coder_workspace_for_pr(
         &self,
@@ -340,15 +355,18 @@ impl VesselNode {
             Some(e) => e,
             None => return,
         };
-        let worker_id = pr_entry["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
-            return;
-        }
+        let target_ticket = pr_entry["ticket_id"].as_str();
+        let target_worker = Self::resolve_worker_id_from_pr(pr_entry);
+
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.destroy_coder_workspace(store, worker_id, ws_id).await;
+        for (worker_id, slot) in &slots {
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_worker || matches_ticket {
+                if let Some(ref ws_id) = slot.workspace_id {
+                    self.destroy_coder_workspace(store, worker_id, ws_id).await;
+                }
             }
         }
     }
@@ -932,12 +950,15 @@ impl Node for VesselNode {
                         }
                     );
 
-                    if let Some(pr) = pending_prs
+                    let mut pr_val = pending_prs
                         .iter()
                         .find(|p| p["number"].as_u64() == Some(*pr_number))
-                    {
-                        self.recycle_worker(store, pr).await;
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "number": pr_number }));
+                    if pr_val["ticket_id"].as_str().is_none() {
+                        pr_val["ticket_id"] = json!(ticket_id);
                     }
+                    self.recycle_worker(store, &pr_val).await;
 
                     any_success = true;
                 }
@@ -1328,12 +1349,15 @@ impl Node for VesselNode {
                     self.close_github_issue(store, &tid).await;
                     self.remove_from_pending_prs(store, *pr_number).await;
 
-                    if let Some(pr) = pending_prs
+                    let mut pr_val = pending_prs
                         .iter()
                         .find(|p| p["number"].as_u64() == Some(*pr_number))
-                    {
-                        self.recycle_worker(store, pr).await;
+                        .cloned()
+                        .unwrap_or_else(|| json!({ "number": pr_number }));
+                    if pr_val["ticket_id"].as_str().is_none() {
+                        pr_val["ticket_id"] = json!(tid);
                     }
+                    self.recycle_worker(store, &pr_val).await;
 
                     any_success = true;
                 }
@@ -2663,40 +2687,67 @@ impl VesselNode {
         }
     }
 
-    /// Recycle a worker from Done back to Idle after its PR is merged.
-    /// Also stops the Coder workspace if one was assigned.
+    /// Recycle workers (both FORGE and paired SENTINEL) back to Idle after a PR is merged.
+    /// Also destroys any remaining Coder workspace.
     async fn recycle_worker(&self, store: &SharedStore, pr: &Value) {
-        let worker_id = pr["worker_id"].as_str().unwrap_or("");
-        if worker_id.is_empty() {
+        let target_ticket = pr["ticket_id"].as_str();
+        let target_worker = Self::resolve_worker_id_from_pr(pr);
+
+        if target_worker.is_none() && target_ticket.is_none() {
             return;
         }
 
-        // Stop Coder workspace if this worker was using one
+        // First find and destroy workspaces for matching slots
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get(worker_id) {
-            if let Some(ref ws_id) = slot.workspace_id {
-                self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                    .await;
+        let mut to_destroy = Vec::new();
+        for (worker_id, slot) in &slots {
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_worker || matches_ticket {
+                if let Some(ref ws_id) = slot.workspace_id {
+                    to_destroy.push((worker_id.clone(), ws_id.clone()));
+                }
+            }
+        }
+        for (w_id, ws_id) in to_destroy {
+            self.destroy_coder_workspace(store, &w_id, &ws_id).await;
+        }
+
+        // Re-fetch slots and recycle matching workers to Idle
+        let mut slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut changed = false;
+
+        for (worker_id, slot) in slots.iter_mut() {
+            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
+            let matches_ticket = target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
+            if matches_worker || matches_ticket {
+                match &slot.status {
+                    WorkerStatus::Done { .. }
+                    | WorkerStatus::Assigned { .. }
+                    | WorkerStatus::Working { .. } => {
+                        info!(
+                            worker_id = slot.id,
+                            old_status = ?slot.status,
+                            "Recycling worker to Idle after merge"
+                        );
+                        slot.status = WorkerStatus::Idle;
+                        slot.workspace_id = None;
+                        changed = true;
+                    }
+                    _ => {
+                        if slot.workspace_id.is_some() {
+                            slot.workspace_id = None;
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
 
-        // Re-fetch slots after stop_coder_workspace_for_worker may have modified them
-        let mut slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-
-        if let Some(slot) = slots.get_mut(worker_id) {
-            match &slot.status {
-                WorkerStatus::Done { .. } => {
-                    info!(worker_id, "Recycling worker from Done to Idle after merge");
-                    slot.status = WorkerStatus::Idle;
-                    slot.workspace_id = None;
-                    store.set(KEY_WORKER_SLOTS, json!(slots)).await;
-                }
-                other => {
-                    debug!(worker_id, status = ?other, "Worker not in Done state, skipping recycle");
-                }
-            }
+        if changed {
+            store.set(KEY_WORKER_SLOTS, json!(slots)).await;
         }
     }
 
@@ -4272,4 +4323,61 @@ mod tests {
         assert!(!d.contains("checks:"));
         assert!(!d.contains("annotations:"));
     }
+
+    #[tokio::test]
+    async fn test_recycle_worker_recycles_forge_and_sentinel_pair_to_idle() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-1".to_string()),
+            },
+        );
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: None,
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        let pr = json!({
+            "number": 6,
+            "ticket_id": "T-005",
+            "head_branch": "forge-1/T-005",
+        });
+
+        node.recycle_worker(&store, &pr).await;
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(forge_slot.status, WorkerStatus::Idle),
+            "Forge slot must be recycled to Idle"
+        );
+        assert_eq!(forge_slot.workspace_id, None);
+
+        let sentinel_slot = updated_slots.get("sentinel").unwrap();
+        assert!(
+            matches!(sentinel_slot.status, WorkerStatus::Idle),
+            "Sentinel slot must be recycled to Idle"
+        );
+        assert_eq!(sentinel_slot.workspace_id, None);
+    }
 }
+

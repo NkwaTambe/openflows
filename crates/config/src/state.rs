@@ -89,6 +89,19 @@ pub enum WorkerStatus {
     },
 }
 
+impl WorkerStatus {
+    /// Return the ticket ID associated with this worker status, if any.
+    pub fn ticket_id(&self) -> Option<&str> {
+        match self {
+            Self::Assigned { ticket_id, .. }
+            | Self::Working { ticket_id, .. }
+            | Self::Done { ticket_id, .. }
+            | Self::Suspended { ticket_id, .. } => Some(ticket_id.as_str()),
+            Self::Idle => None,
+        }
+    }
+}
+
 pub const KEY_TICKETS: &str = "tickets";
 pub const KEY_WORKER_SLOTS: &str = "worker_slots";
 pub const KEY_PENDING_PRS: &str = "pending_prs";
