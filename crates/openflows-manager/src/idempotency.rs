@@ -1,34 +1,22 @@
-//! Idempotency-key handling for mutations and durable work creation.
+//! Execute database mutations and their idempotency result in one transaction.
 //!
-//! Per the shared API conventions, mutations that create resources or durable
-//! work require an `Idempotency-Key`. A unique constraint on
-//! `(actor_id, organization_id, route, key)` makes retries idempotent: a
-//! repeated key with an identical body returns the original result reference;
-//! the same key with a different body is rejected with a 409. Records are
-//! retained at least 7 days and can be pruned after expiry.
+//! The callback must use its supplied connection for all writes, and enqueue
+//! external side effects through the outbox. A failure or cancellation rolls
+//! back both the mutation and key, allowing a subsequent request to retry.
 
 use crate::error::ManagerError;
 use crate::id::{OrganizationId, UserId};
-use chrono::{Duration, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
+use std::{future::Future, pin::Pin};
 
-/// Retention window for idempotency records.
-pub const RETENTION: Duration = Duration::days(7);
-
-/// The result of attempting to register an idempotency key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdempotencyOutcome {
-    /// The key was newly created; the caller should perform the mutation.
-    New,
-    /// A prior identical request used this key; `response_reference` holds the
-    /// original result the caller should return.
+    New { response_reference: String },
     Replay { response_reference: String },
 }
 
-/// A prepared idempotency-key record ready to be persisted atomically with the
-/// mutation it guards.
 #[derive(Debug, Clone)]
 pub struct IdempotencyRequest {
     pub actor_id: UserId,
@@ -39,16 +27,14 @@ pub struct IdempotencyRequest {
 }
 
 impl IdempotencyRequest {
-    /// Compute the SHA-256 request hash of the serialized request body.
-    pub fn hash_request<T: Serialize>(body: &T) -> String {
-        let json = serde_json::to_vec(body).unwrap_or_default();
-        let mut hasher = Sha256::new();
-        hasher.update(&json);
-        format!("{:x}", hasher.finalize())
+    pub fn hash_request<T: Serialize>(body: &T) -> Result<String, serde_json::Error> {
+        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(body)?)))
     }
 }
 
-/// Service for creating and reusing idempotency keys.
+pub type MutationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<String, ManagerError>> + Send + 'a>>;
+
 #[derive(Clone)]
 pub struct IdempotencyService {
     pool: PgPool,
@@ -56,133 +42,104 @@ pub struct IdempotencyService {
 
 impl IdempotencyService {
     pub fn new(pool: PgPool) -> Self {
-        IdempotencyService { pool }
+        Self { pool }
     }
 
-    /// Register an idempotency key for a request body.
-    ///
-    /// Returns `New` when the key is new, or `Replay` when an identical prior
-    /// request used the same key. A reused key with a different request body is
-    /// rejected with `Conflict`.
-    pub async fn register(
+    /// Commit a mutation and its nonempty result reference together. Concurrent
+    /// identical requests wait on the unique key and then replay the committed
+    /// result. No unfinished key is committed by this API.
+    pub async fn execute<F>(
         &self,
         req: &IdempotencyRequest,
-        response_reference: Option<&str>,
-    ) -> Result<IdempotencyOutcome, ManagerError> {
-        // Expired rows still participate in the permanent uniqueness
-        // constraint, so prune this key before attempting a new registration.
-        // This makes the documented retention window meaningful while keeping
-        // the operation safe under concurrent callers (the insert below still
-        // arbitrates races).
-        sqlx::query(
-            "DELETE FROM idempotency_keys
-             WHERE actor_id = $1 AND organization_id = $2 AND route = $3 AND key = $4
-               AND expires_at <= now()",
-        )
-        .bind(req.actor_id.0)
-        .bind(req.organization_id.0)
-        .bind(&req.route)
-        .bind(&req.key)
-        .execute(&self.pool)
-        .await
-        .map_err(ManagerError::from)?;
-
-        // Look for an existing, non-expired record first.
-        let existing = sqlx::query_as::<_, (String, String)>(
-            "SELECT request_hash, COALESCE(response_reference, '')
-             FROM idempotency_keys
-             WHERE actor_id = $1 AND organization_id = $2 AND route = $3 AND key = $4
-               AND expires_at > now()",
-        )
-        .bind(req.actor_id.0)
-        .bind(req.organization_id.0)
-        .bind(&req.route)
-        .bind(&req.key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(ManagerError::from)?;
-
-        if let Some((stored_hash, stored_ref)) = existing {
-            if stored_hash != req.request_hash {
-                return Err(ManagerError::Conflict(
-                    "idempotency key reused with a different request body".to_string(),
-                ));
-            }
-            return Ok(IdempotencyOutcome::Replay {
-                response_reference: stored_ref,
-            });
+        mutation: F,
+    ) -> Result<IdempotencyOutcome, ManagerError>
+    where
+        F: for<'a> FnOnce(&'a mut PgConnection) -> MutationFuture<'a> + Send,
+    {
+        if req.key.trim().is_empty() || req.key.len() > 255 {
+            return Err(ManagerError::InvalidInput("invalid idempotency key".into()));
         }
-
-        // Insert a new record. A concurrent identical insert is handled by the
-        // unique constraint; we re-check on conflict.
-        let expires_at = Utc::now() + RETENTION;
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        // Only an expired record can be replaced. The upsert locks conflicts
+        // and re-checks expiry after acquiring the row, including on retries.
+        let id = uuid::Uuid::new_v4();
+        let inserted = sqlx::query(
             "INSERT INTO idempotency_keys
-                (id, actor_id, organization_id, route, key, request_hash, response_reference, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (actor_id, organization_id, route, key) DO NOTHING",
+                (id, actor_id, organization_id, route, key, request_hash, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp() + interval '7 days')
+             ON CONFLICT (actor_id, organization_id, route, key) DO UPDATE
+             SET id = EXCLUDED.id, request_hash = EXCLUDED.request_hash,
+                 response_reference = NULL, created_at = clock_timestamp(),
+                 expires_at = EXCLUDED.expires_at
+             WHERE idempotency_keys.expires_at <= clock_timestamp()",
         )
-        .bind(uuid::Uuid::new_v4())
+        .bind(id)
         .bind(req.actor_id.0)
         .bind(req.organization_id.0)
         .bind(&req.route)
         .bind(&req.key)
         .bind(&req.request_hash)
-        .bind(response_reference)
-        .bind(expires_at)
-        .execute(&self.pool)
-        .await
-        .map_err(ManagerError::from)?;
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
 
-        if result.rows_affected() == 1 {
-            return Ok(IdempotencyOutcome::New);
+        if !inserted {
+            let (stored_hash, reference): (String, Option<String>) = sqlx::query_as(
+                "SELECT request_hash, response_reference FROM idempotency_keys
+                 WHERE actor_id = $1 AND organization_id = $2 AND route = $3 AND key = $4
+                 FOR UPDATE",
+            )
+            .bind(req.actor_id.0)
+            .bind(req.organization_id.0)
+            .bind(&req.route)
+            .bind(&req.key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if stored_hash != req.request_hash {
+                return Err(ManagerError::Conflict(
+                    "idempotency key reused with a different request body".into(),
+                ));
+            }
+            let reference = reference.filter(|r| !r.trim().is_empty()).ok_or_else(|| {
+                ManagerError::Conflict("legacy idempotency request has no completed result".into())
+            })?;
+            tx.commit().await?;
+            return Ok(IdempotencyOutcome::Replay {
+                response_reference: reference,
+            });
         }
 
-        // Lost a race: a concurrent insert won. Re-read and decide.
-        let existing = sqlx::query_as::<_, (String, String)>(
-            "SELECT request_hash, COALESCE(response_reference, '')
-             FROM idempotency_keys
-             WHERE actor_id = $1 AND organization_id = $2 AND route = $3 AND key = $4
-               AND expires_at > now()",
-        )
-        .bind(req.actor_id.0)
-        .bind(req.organization_id.0)
-        .bind(&req.route)
-        .bind(&req.key)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(ManagerError::from)?;
-
-        if existing.0 != req.request_hash {
-            return Err(ManagerError::Conflict(
-                "idempotency key reused with a different request body".to_string(),
+        let reference = mutation(&mut tx).await?;
+        if reference.trim().is_empty() {
+            return Err(ManagerError::InvalidInput(
+                "empty idempotency result reference".into(),
             ));
         }
-        Ok(IdempotencyOutcome::Replay {
-            response_reference: existing.1,
+        sqlx::query("UPDATE idempotency_keys SET response_reference = $1 WHERE id = $2")
+            .bind(&reference)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(IdempotencyOutcome::New {
+            response_reference: reference,
         })
     }
+}
 
-    /// Record the response reference for a newly-created key once the mutation
-    /// it guarded has completed. This is a no-op when the reference is None.
-    pub async fn record_response(
-        &self,
-        req: &IdempotencyRequest,
-        response_reference: &str,
-    ) -> Result<(), ManagerError> {
-        sqlx::query(
-            "UPDATE idempotency_keys
-             SET response_reference = $1
-             WHERE actor_id = $2 AND organization_id = $3 AND route = $4 AND key = $5",
-        )
-        .bind(response_reference)
-        .bind(req.actor_id.0)
-        .bind(req.organization_id.0)
-        .bind(&req.route)
-        .bind(&req.key)
-        .execute(&self.pool)
-        .await
-        .map_err(ManagerError::from)?;
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failing_serializer_cannot_produce_a_request_hash() {
+        struct Invalid;
+        impl Serialize for Invalid {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot serialize"))
+            }
+        }
+        assert!(IdempotencyRequest::hash_request(&Invalid).is_err());
     }
 }

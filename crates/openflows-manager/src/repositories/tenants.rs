@@ -10,7 +10,7 @@ use crate::error::ManagerError;
 use crate::id::{GithubId, OrganizationId, TenantId};
 use crate::pagination::{cursor_for, Cursor, Page, PageLimit};
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 
 /// A row returned by the tenant list query.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -51,6 +51,32 @@ impl TenantsRepository {
         github_repository_id: GithubId,
         fleet_size: i32,
     ) -> Result<TenantId, ManagerError> {
+        let mut tx = self.pool.begin().await?;
+        let id = self
+            .create_in_tx(
+                &mut tx,
+                scope,
+                slug,
+                connection_id,
+                github_repository_id,
+                fleet_size,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Use the caller's transaction so the tenant, operation, audit, outbox,
+    /// and idempotency result commit or roll back together.
+    pub async fn create_in_tx(
+        &self,
+        conn: &mut PgConnection,
+        scope: OrgScope,
+        slug: &str,
+        connection_id: crate::id::ConnectionId,
+        github_repository_id: GithubId,
+        fleet_size: i32,
+    ) -> Result<TenantId, ManagerError> {
         // Verify the connection and repository belong to this organization
         // before inserting, so a foreign repository id cannot be bound here.
         let owned = sqlx::query_as::<_, (i64,)>(
@@ -62,7 +88,7 @@ impl TenantsRepository {
         .bind(connection_id.0)
         .bind(scope.organization_id.0)
         .bind(github_repository_id.0)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(ManagerError::from)?;
 
@@ -82,7 +108,7 @@ impl TenantsRepository {
         .bind(connection_id.0)
         .bind(github_repository_id.0)
         .bind(fleet_size)
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await
         .map_err(|e| translate_tenant_insert(e, slug))?;
 

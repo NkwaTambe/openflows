@@ -9,7 +9,7 @@ use crate::error::ManagerError;
 use crate::id::{OrganizationId, OutboxEventId};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool};
 
 /// Default lease duration for an outbox delivery.
 pub const LEASE_DURATION: Duration = Duration::seconds(30);
@@ -22,13 +22,15 @@ pub struct OutboxClaim {
     pub event_type: String,
     pub payload: Option<Value>,
     pub attempts: i32,
+    owner: String,
+    token: uuid::Uuid,
 }
 
 /// Insert an outbox event inside a transaction so it commits with the state
 /// change that produced it. A failed transaction must leave no orphaned outbox
 /// write.
 pub async fn insert_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut PgConnection,
     organization_id: Option<OrganizationId>,
     event_type: &str,
     payload: Option<&Value>,
@@ -42,7 +44,7 @@ pub async fn insert_in_tx(
     .bind(organization_id.map(|o| o.0))
     .bind(event_type)
     .bind(payload)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await
     .map_err(ManagerError::from)?;
     Ok(id)
@@ -56,12 +58,12 @@ pub async fn claim(
     owner: &str,
     limit: i32,
 ) -> Result<Vec<OutboxClaim>, ManagerError> {
-    let now = Utc::now();
-    let lease_until = now + LEASE_DURATION;
+    let token = uuid::Uuid::new_v4();
     let rows = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>, String, Option<Value>, i32)>(
         "UPDATE outbox_events
             SET lease_owner = $1,
-                lease_expires_at = $2,
+                lease_expires_at = clock_timestamp() + interval '30 seconds',
+                lease_token = $2,
                 attempts = attempts + 1
           WHERE id IN (
                 SELECT id
@@ -75,7 +77,7 @@ pub async fn claim(
           RETURNING id, organization_id, event_type, payload, attempts",
     )
     .bind(owner)
-    .bind(lease_until)
+    .bind(token)
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -89,38 +91,42 @@ pub async fn claim(
             event_type,
             payload,
             attempts,
+            owner: owner.to_string(),
+            token,
         })
         .collect())
 }
 
 /// Mark a claimed event as delivered.
-pub async fn mark_delivered(pool: &PgPool, id: OutboxEventId) -> Result<(), ManagerError> {
-    sqlx::query("UPDATE outbox_events SET delivered_at = now(), lease_owner = NULL, lease_expires_at = NULL WHERE id = $1")
-        .bind(id.0)
+pub async fn mark_delivered(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, ManagerError> {
+    let result = sqlx::query("UPDATE outbox_events SET delivered_at = now(), lease_owner = NULL, lease_expires_at = NULL, lease_token = NULL
+        WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
+          AND lease_expires_at > clock_timestamp() AND delivered_at IS NULL")
+        .bind(claim.id.0)
+        .bind(&claim.owner)
+        .bind(claim.token)
         .execute(pool)
         .await
         .map_err(ManagerError::from)?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Release a lease without delivering (e.g. transient failure), resetting the
 /// lease so the event can be retried by another worker.
-pub async fn release_lease(
-    pool: &PgPool,
-    id: OutboxEventId,
-    owner: &str,
-) -> Result<(), ManagerError> {
-    sqlx::query(
+pub async fn release_lease(pool: &PgPool, claim: &OutboxClaim) -> Result<bool, ManagerError> {
+    let result = sqlx::query(
         "UPDATE outbox_events
-            SET lease_owner = NULL, lease_expires_at = NULL
-          WHERE id = $1 AND lease_owner = $2",
+            SET lease_owner = NULL, lease_expires_at = NULL, lease_token = NULL
+          WHERE id = $1 AND lease_owner = $2 AND lease_token = $3
+            AND lease_expires_at > clock_timestamp() AND delivered_at IS NULL",
     )
-    .bind(id.0)
-    .bind(owner)
+    .bind(claim.id.0)
+    .bind(&claim.owner)
+    .bind(claim.token)
     .execute(pool)
     .await
     .map_err(ManagerError::from)?;
-    Ok(())
+    Ok(result.rows_affected() == 1)
 }
 
 /// Count undelivered events, for diagnostics and readiness probes.

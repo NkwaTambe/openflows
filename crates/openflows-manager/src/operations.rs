@@ -5,13 +5,13 @@
 //! lease owner may heartbeat or complete the operation. When a lease expires it
 //! can be reclaimed by another worker, and a stale worker that lost the lease
 //! cannot complete or overwrite the reclaimed operation because every
-//! completion is guarded by `WHERE lease_owner = $me AND lease_expires_at > now()`.
+//! completion checks the owner, unexpired lease, and unique per-claim token.
 
 use crate::error::ManagerError;
 use crate::id::{OperationId, OrganizationId};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool};
 
 /// Default operation lease and heartbeat intervals.
 pub const LEASE_DURATION: Duration = Duration::seconds(30);
@@ -51,6 +51,7 @@ pub struct LeaseGuard {
     pub operation_id: OperationId,
     pub organization_id: OrganizationId,
     owner: String,
+    token: uuid::Uuid,
     pool: PgPool,
 }
 
@@ -108,7 +109,7 @@ pub async fn create(pool: &PgPool, op: &NewOperation) -> Result<OperationId, Man
 /// Insert a new operation inside an existing transaction (used with
 /// provisioning state changes).
 pub async fn create_in_tx(
-    tx: &mut Transaction<'_, Postgres>,
+    tx: &mut PgConnection,
     op: &NewOperation,
 ) -> Result<OperationId, ManagerError> {
     let id = OperationId::new();
@@ -123,7 +124,7 @@ pub async fn create_in_tx(
     .bind(op.resource_id)
     .bind(&op.kind)
     .bind(&op.idempotency_ref)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await
     .map_err(ManagerError::from)?;
     Ok(id)
@@ -138,11 +139,13 @@ pub async fn create_in_tx(
 /// claim is atomic (`FOR UPDATE SKIP LOCKED`) so concurrent workers never
 /// receive the same operation. Returns `None` when no operation is available.
 pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, ManagerError> {
-    let lease_until = Utc::now() + LEASE_DURATION;
+    let token = uuid::Uuid::new_v4();
     let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
         "UPDATE operations
             SET lease_owner = $1,
-                lease_expires_at = $2,
+                lease_expires_at = clock_timestamp() + interval '30 seconds',
+                lease_token = $2,
+                attempt_count = attempt_count + 1,
                 state = 'running',
                 updated_at = now()
           WHERE id = (
@@ -158,7 +161,7 @@ pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, Man
           RETURNING id, organization_id",
     )
     .bind(owner)
-    .bind(lease_until)
+    .bind(token)
     .fetch_optional(pool)
     .await
     .map_err(ManagerError::from)?;
@@ -167,6 +170,7 @@ pub async fn claim(pool: &PgPool, owner: &str) -> Result<Option<LeaseGuard>, Man
         operation_id: OperationId::from_uuid(id),
         organization_id: OrganizationId::from_uuid(org),
         owner: owner.to_string(),
+        token,
         pool: pool.clone(),
     }))
 }
@@ -179,13 +183,13 @@ impl LeaseGuard {
 
     /// Extend the lease, only if this worker still owns it.
     pub async fn heartbeat(&self) -> Result<bool, ManagerError> {
-        let lease_until = Utc::now() + LEASE_DURATION;
         let affected = sqlx::query(
             "UPDATE operations
-                SET lease_expires_at = $1, updated_at = now()
-              WHERE id = $2 AND lease_owner = $3 AND lease_expires_at > now()",
+                SET lease_expires_at = clock_timestamp() + interval '30 seconds', updated_at = now()
+              WHERE lease_token = $1 AND id = $2 AND lease_owner = $3
+                AND lease_expires_at > clock_timestamp()",
         )
-        .bind(lease_until)
+        .bind(self.token)
         .bind(self.operation_id.0)
         .bind(&self.owner)
         .execute(&self.pool)
@@ -202,15 +206,18 @@ impl LeaseGuard {
             "UPDATE operations
                 SET state = 'succeeded',
                     lease_owner = NULL,
+                    lease_token = NULL,
                     lease_expires_at = NULL,
                     sanitized_result = $1,
                     error_code = NULL,
                     updated_at = now()
-              WHERE id = $2 AND lease_owner = $3 AND lease_expires_at > now()",
+              WHERE id = $2 AND lease_owner = $3 AND lease_expires_at > clock_timestamp()
+                AND lease_token = $4",
         )
         .bind(sanitized_result)
         .bind(self.operation_id.0)
         .bind(&self.owner)
+        .bind(self.token)
         .execute(&self.pool)
         .await
         .map_err(ManagerError::from)?
@@ -239,15 +246,18 @@ impl LeaseGuard {
                     retry_at = $2,
                     error_code = $3,
                     lease_owner = NULL,
+                    lease_token = NULL,
                     lease_expires_at = NULL,
                     updated_at = now()
-              WHERE id = $4 AND lease_owner = $5 AND lease_expires_at > now()",
+              WHERE id = $4 AND lease_owner = $5 AND lease_expires_at > clock_timestamp()
+                AND lease_token = $6",
         )
         .bind(state)
         .bind(retry_at)
         .bind(error_code)
         .bind(self.operation_id.0)
         .bind(&self.owner)
+        .bind(self.token)
         .execute(&self.pool)
         .await
         .map_err(ManagerError::from)?
@@ -260,11 +270,13 @@ impl LeaseGuard {
         let affected = sqlx::query(
             "UPDATE operations
                 SET current_step = $1, updated_at = now()
-              WHERE id = $2 AND lease_owner = $3 AND lease_expires_at > now()",
+              WHERE id = $2 AND lease_owner = $3 AND lease_expires_at > clock_timestamp()
+                AND lease_token = $4",
         )
         .bind(step)
         .bind(self.operation_id.0)
         .bind(&self.owner)
+        .bind(self.token)
         .execute(&self.pool)
         .await
         .map_err(ManagerError::from)?

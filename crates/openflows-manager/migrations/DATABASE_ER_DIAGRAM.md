@@ -2,7 +2,7 @@
 
 > Reference schema for the Openflows control-plane PostgreSQL database
 > (`crates/openflows-manager/migrations/`). Tables are created by four numbered
-> migrations (0001–0004). This document is **documentation only** — it is not a
+> migrations (0001–0004), with constraints and claim tokens added by 0005. This document is **documentation only** — it is not a
 > migration and is not applied by `sqlx::migrate!()`.
 
 ## Mermaid ER Diagram
@@ -265,6 +265,7 @@ erDiagram
         integer attempt_count
         timestamptz retry_at
         text lease_owner
+        uuid lease_token
         timestamptz lease_expires_at
         text error_code
         jsonb sanitized_result
@@ -299,6 +300,7 @@ erDiagram
         jsonb payload
         integer attempts
         text lease_owner
+        uuid lease_token
         timestamptz lease_expires_at
         timestamptz delivered_at
         timestamptz created_at
@@ -354,10 +356,11 @@ erDiagram
 ## Notes
 
 - **`organizations.owner_user_id`** is a direct FK to `users`, but the
-  organization's owner must also be an **active member** of that organization,
+  organization's owner must also have a membership row in that organization,
   enforced by the deferred composite FK
   `organizations_owner_is_member` (migration 0004) referencing
-  `memberships(organization_id, user_id)`.
+  `memberships(organization_id, user_id)`. This FK does not enforce active
+  membership; active-owner policy and concurrency checks belong to WP-02.
 - **Composite / deferred FKs:** `workspaces` references `tenants` via a composite
   `(organization_id, tenant_id)` FK so a workspace can never cross organization
   boundaries. `memberships` uses a composite PK `(organization_id, user_id)`.
@@ -374,9 +377,16 @@ erDiagram
   durable side-effect queue written in the same transaction as the triggering
   state change. `idempotency_keys` makes retries idempotent via
   `UNIQUE (actor_id, organization_id, route, key)`.
-- **Leasing:** `operations`, `operation_steps`, `webhook_deliveries`,
-  `outbox_events`, and `credential_leases` use `lease_owner` + `lease_expires_at`
-  for exclusive worker claiming.
+- **Leasing:** `operations`, `webhook_deliveries`, and `outbox_events` have
+  `lease_owner` and `lease_expires_at`. Operations and outbox claims additionally
+  use a fresh `lease_token` per claim to reject stale writes, including when
+  the worker name is reused. Operation steps run under their parent operation's
+  lease; credential leases track token expiry/revocation, not worker ownership.
+- **Migration 0005:** composite FKs enforce repository-to-connection,
+  tenant-to-repository, and runtime-identity-to-tenant organization consistency.
+  Tenant repository/slug and workspace role/slot uniqueness exclude only rows
+  whose desired and observed states are both `deleted`. A NULL workspace slot
+  represents a singleton and compares equal to another NULL slot.
 
 ## Migration index
 

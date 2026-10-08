@@ -26,21 +26,49 @@ fn test_db_url() -> String {
     std::env::var(TEST_DB_URL_ENV).unwrap_or_else(|_| DEFAULT_TEST_DB_URL.to_string())
 }
 
-/// Derive an admin connection URL on the same server. We connect to the
-/// `postgres` maintenance database to create/drop databases.
-fn admin_url(db_url: &str) -> String {
-    if let Some((head, _)) = db_url.rsplit_once('/') {
-        format!("{head}/postgres")
-    } else {
-        db_url.to_string()
+fn options_for_database(options: &PgConnectOptions, name: &str) -> PgConnectOptions {
+    options.clone().database(name)
+}
+
+#[test]
+fn database_selection_preserves_connection_options() {
+    use sqlx::postgres::PgSslMode;
+    let options: PgConnectOptions =
+        "postgres://test:password@localhost/original?sslmode=require&application_name=review%2Ftests"
+            .parse().unwrap();
+    for name in ["postgres", "isolated"] {
+        let selected = options_for_database(&options, name);
+        assert_eq!(selected.get_database(), Some(name));
+        assert!(matches!(selected.get_ssl_mode(), PgSslMode::Require));
+        assert_eq!(selected.get_application_name(), Some("review/tests"));
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn teardown_finishes_before_returning() {
+    let db = TestDb::new().await.unwrap();
+    let name = db.db_name.clone();
+    let mut admin = PgConnection::connect_with(&db.admin_options).await.unwrap();
+    drop(db);
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(name)
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+    assert!(
+        !exists,
+        "database cleanup must finish before the test process exits"
+    );
+    admin.close().await.unwrap();
 }
 
 /// An isolated test database with migrations applied.
 pub struct TestDb {
     pool: PgPool,
     db_name: String,
-    admin_url: String,
+    admin_options: PgConnectOptions,
 }
 
 impl TestDb {
@@ -48,11 +76,14 @@ impl TestDb {
     /// it. The database is dropped on teardown.
     pub async fn new() -> Result<Self, ManagerError> {
         let db_url = test_db_url();
-        let admin = admin_url(&db_url);
+        let options: PgConnectOptions = db_url
+            .parse()
+            .map_err(|e| ManagerError::Config(format!("invalid test db url: {e}")))?;
+        let admin = options_for_database(&options, "postgres");
         let db_name = format!("of_test_{:x}", uuid::Uuid::new_v4().as_u128());
 
         // Create the database on the server (the role must have CREATEDB).
-        let mut conn = PgConnection::connect(&admin)
+        let mut conn = PgConnection::connect_with(&admin)
             .await
             .map_err(|e| ManagerError::Service(anyhow::anyhow!("admin connect failed: {e}")))?;
         sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
@@ -63,24 +94,15 @@ impl TestDb {
 
         // Build a pool connected to the new database (migrations and queries
         // run in its default `public` schema — no search_path juggling needed).
-        let (head, _) = db_url
-            .rsplit_once('/')
-            .ok_or_else(|| ManagerError::Config("invalid test db url".into()))?;
-        let db_url_for_pool = format!("{head}/{db_name}");
-        let options: PgConnectOptions = db_url_for_pool
-            .parse()
-            .map_err(|e| ManagerError::Config(format!("invalid test db url: {e}")))?;
         let pool = PgPoolOptions::new()
             .max_connections(10)
             .acquire_timeout(Duration::from_secs(5))
-            .connect_with(options)
-            .await
-            .map_err(|e| ManagerError::Service(anyhow::anyhow!("test pool connect failed: {e}")))?;
+            .connect_lazy_with(options_for_database(&options, &db_name));
 
         Ok(TestDb {
             pool,
             db_name,
-            admin_url: admin,
+            admin_options: admin,
         })
     }
 
@@ -114,26 +136,30 @@ impl Drop for TestDb {
         // because the test runs on a single-threaded tokio runtime, where
         // blocking inside a destructor panics. `DROP DATABASE ... WITH (FORCE)`
         // terminates any lingering pool connections (Postgres 13+).
-        let admin_url = self.admin_url.clone();
+        let admin_options = self.admin_options.clone();
         let db_name = self.db_name.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(async move {
-                let mut conn = match PgConnection::connect(&admin_url).await {
-                    Ok(conn) => conn,
-                    Err(_) => return,
-                };
-                let _ = sqlx::query(&format!(
-                    "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
-                ))
-                .execute(&mut conn)
-                .await;
-                let _ = conn.close().await;
-            });
-        });
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async move {
+                    let mut conn = PgConnection::connect_with(&admin_options).await?;
+                    sqlx::query(&format!(
+                        "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                    ))
+                    .execute(&mut conn)
+                    .await?;
+                    conn.close().await
+                })
+                .await
+            })
+        })
+        .join()
+        .expect("database cleanup thread panicked")
+        .expect("database cleanup timed out")
+        .expect("database cleanup failed");
     }
 }
 

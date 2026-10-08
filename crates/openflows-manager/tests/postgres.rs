@@ -29,6 +29,303 @@ use openflows_manager::repositories::{OrganizationsRepository, TenantsRepository
 use openflows_manager::{audit, outbox};
 use serde_json::json;
 
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn outbox_claims_reject_stale_acknowledgments_and_releases() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let mut tx = pool.begin().await.unwrap();
+    let id = outbox::insert_in_tx(&mut tx, None, "test", None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let a = outbox::claim(pool, "same-worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(outbox::claim(pool, "other-worker", 1)
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query(
+        "UPDATE outbox_events SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(id.0)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert!(!outbox::mark_delivered(pool, &a).await.unwrap());
+    assert!(!outbox::release_lease(pool, &a).await.unwrap());
+    let b = outbox::claim(pool, "same-worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(b.attempts, 2);
+    assert!(!outbox::mark_delivered(pool, &a).await.unwrap());
+    assert!(!outbox::release_lease(pool, &a).await.unwrap());
+    assert!(outbox::release_lease(pool, &b).await.unwrap());
+    let c = outbox::claim(pool, "same-worker", 1)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(!outbox::mark_delivered(pool, &b).await.unwrap());
+    assert!(outbox::mark_delivered(pool, &c).await.unwrap());
+    assert!(!outbox::mark_delivered(pool, &c).await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn idempotency_rolls_back_failed_mutations_and_serializes_retries() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let user = insert_user(pool).await.unwrap();
+    let org = insert_organization_with_owner(pool, "atomic-idem", user)
+        .await
+        .unwrap();
+    let conn = insert_connection(pool, org, 42).await.unwrap();
+    insert_repository(pool, org, conn, 43, "atomic/repo")
+        .await
+        .unwrap();
+    let service = IdempotencyService::new(pool.clone());
+    let req = IdempotencyRequest {
+        actor_id: UserId::from_uuid(user),
+        organization_id: OrganizationId::from_uuid(org),
+        route: "tenant.create".into(),
+        key: "retry".into(),
+        request_hash: IdempotencyRequest::hash_request(&json!({"slug":"atomic"})).unwrap(),
+    };
+    let tenants = TenantsRepository::new(pool.clone());
+    let fail = service
+        .execute(&req, move |db_conn| {
+            Box::pin(async move {
+                let tenant = tenants
+                    .create_in_tx(
+                        db_conn,
+                        OrgScope::new(OrganizationId::from_uuid(org)),
+                        "atomic",
+                        ConnectionId::from_uuid(conn),
+                        GithubId(43),
+                        1,
+                    )
+                    .await?;
+                operations::create_in_tx(
+                    db_conn,
+                    &operations::NewOperation {
+                        organization_id: OrganizationId::from_uuid(org),
+                        resource_type: "tenant".into(),
+                        resource_id: Some(tenant.0),
+                        kind: "provision".into(),
+                        idempotency_ref: None,
+                    },
+                )
+                .await?;
+                audit::insert(
+                    &mut *db_conn,
+                    &audit::AuditEvent::new("tenant.create")
+                        .organization(OrganizationId::from_uuid(org)),
+                )
+                .await?;
+                outbox::insert_in_tx(
+                    db_conn,
+                    Some(OrganizationId::from_uuid(org)),
+                    "tenant.created",
+                    None,
+                )
+                .await?;
+                Err(ManagerError::Conflict("forced rollback".into()))
+            })
+        })
+        .await;
+    assert!(fail.is_err());
+    for table in [
+        "tenants",
+        "operations",
+        "idempotency_keys",
+        "audit_events",
+        "outbox_events",
+    ] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} must roll back");
+    }
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let service = service.clone();
+        let req = req.clone();
+        let tenants = TenantsRepository::new(pool.clone());
+        tasks.push(tokio::spawn(async move {
+            service
+                .execute(&req, move |db_conn| {
+                    Box::pin(async move {
+                        let id = tenants
+                            .create_in_tx(
+                                db_conn,
+                                OrgScope::new(OrganizationId::from_uuid(org)),
+                                "atomic",
+                                ConnectionId::from_uuid(conn),
+                                GithubId(43),
+                                1,
+                            )
+                            .await?;
+                        Ok(id.to_string())
+                    })
+                })
+                .await
+                .unwrap()
+        }));
+    }
+    let mut new_count = 0;
+    let mut references = std::collections::HashSet::new();
+    for task in tasks {
+        match task.await.unwrap() {
+            IdempotencyOutcome::New { response_reference } => {
+                new_count += 1;
+                references.insert(response_reference);
+            }
+            IdempotencyOutcome::Replay { response_reference } => {
+                references.insert(response_reference);
+            }
+        }
+    }
+    assert_eq!(new_count, 1);
+    assert_eq!(references.len(), 1);
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM tenants")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+
+    // Expiry allows a new logical request without an out-of-band prune job.
+    sqlx::query("UPDATE idempotency_keys SET expires_at = now() - interval '1 second'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service
+            .execute(&req, |_| Box::pin(async { Ok("replacement".into()) }))
+            .await
+            .unwrap(),
+        IdempotencyOutcome::New { .. }
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn database_rejects_cross_organization_relationships() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let user = insert_user(pool).await.unwrap();
+    let a = insert_organization_with_owner(pool, "a", user)
+        .await
+        .unwrap();
+    let b = insert_organization_with_owner(pool, "b", user)
+        .await
+        .unwrap();
+    let conn = insert_connection(pool, b, 100).await.unwrap();
+    assert!(insert_repository(pool, a, conn, 101, "b/repo")
+        .await
+        .is_err());
+    insert_repository(pool, b, conn, 101, "b/repo")
+        .await
+        .unwrap();
+    let invalid = sqlx::query("INSERT INTO tenants (id, organization_id, slug, connection_id, github_repository_id, fleet_size) VALUES ($1, $2, 'wrong', $3, 101, 1)")
+        .bind(uuid::Uuid::new_v4()).bind(a).bind(conn).execute(pool).await;
+    assert!(invalid.is_err());
+    let tenant = TenantsRepository::new(pool.clone())
+        .create(
+            OrgScope::new(OrganizationId::from_uuid(b)),
+            "correct",
+            ConnectionId::from_uuid(conn),
+            GithubId(101),
+            1,
+        )
+        .await
+        .unwrap();
+    let invalid = sqlx::query("INSERT INTO runtime_identities (id, tenant_id, organization_id, coder_owner_id) VALUES ($1, $2, $3, 'owner')")
+        .bind(uuid::Uuid::new_v4()).bind(tenant.0).bind(a).execute(pool).await;
+    assert!(invalid.is_err());
+    sqlx::query("INSERT INTO runtime_identities (id, tenant_id, organization_id, coder_owner_id) VALUES ($1, $2, $3, 'owner')")
+        .bind(uuid::Uuid::new_v4()).bind(tenant.0).bind(b).execute(pool).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn completed_deletion_releases_tenant_names_and_workspace_slots() {
+    let db = TestDb::new().await.unwrap();
+    db.migrate().await.unwrap();
+    let pool = db.pool();
+    let user = insert_user(pool).await.unwrap();
+    let org = insert_organization_with_owner(pool, "reuse", user)
+        .await
+        .unwrap();
+    let conn = insert_connection(pool, org, 101).await.unwrap();
+    insert_repository(pool, org, conn, 102, "reuse/repo")
+        .await
+        .unwrap();
+    let tenants = TenantsRepository::new(pool.clone());
+    let scope = OrgScope::new(OrganizationId::from_uuid(org));
+    let old = tenants
+        .create(
+            scope,
+            "reuse",
+            ConnectionId::from_uuid(conn),
+            GithubId(102),
+            1,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE tenants SET desired_state = 'deleted', observed_state = 'deleting' WHERE id = $1",
+    )
+    .bind(old.0)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert!(tenants
+        .create(
+            scope,
+            "reuse",
+            ConnectionId::from_uuid(conn),
+            GithubId(102),
+            1
+        )
+        .await
+        .is_err());
+    sqlx::query("UPDATE tenants SET observed_state = 'deleted' WHERE id = $1")
+        .bind(old.0)
+        .execute(pool)
+        .await
+        .unwrap();
+    let new = tenants
+        .create(
+            scope,
+            "reuse",
+            ConnectionId::from_uuid(conn),
+            GithubId(102),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_ne!(old, new);
+    for slot in [None, Some(0)] {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO workspaces (id, organization_id, tenant_id, role, slot) VALUES ($1, $2, $3, 'nexus', $4)")
+            .bind(id).bind(org).bind(new.0).bind(slot).execute(pool).await.unwrap();
+        let duplicate = sqlx::query("INSERT INTO workspaces (id, organization_id, tenant_id, role, slot) VALUES ($1, $2, $3, 'nexus', $4)")
+            .bind(uuid::Uuid::new_v4()).bind(org).bind(new.0).bind(slot).execute(pool).await;
+        assert!(duplicate.is_err(), "duplicate slot {slot:?}");
+        sqlx::query("UPDATE workspaces SET desired_state = 'deleted', observed_state = 'deleted' WHERE id = $1")
+            .bind(id).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO workspaces (id, organization_id, tenant_id, role, slot) VALUES ($1, $2, $3, 'nexus', $4)")
+            .bind(uuid::Uuid::new_v4()).bind(org).bind(new.0).bind(slot).execute(pool).await.unwrap();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Migrations
 // ---------------------------------------------------------------------------
@@ -150,15 +447,19 @@ async fn constraints_enforce_uniqueness_and_relationships() {
         organization_id: OrganizationId::from_uuid(org),
         route: "/api/v1/organizations/acme/tenants".to_string(),
         key: "key-1".to_string(),
-        request_hash: IdempotencyRequest::hash_request(&json!({"a": 1})),
+        request_hash: IdempotencyRequest::hash_request(&json!({"a": 1})).unwrap(),
     };
     assert!(matches!(
-        idem.register(&req, None).await.expect("first register"),
-        IdempotencyOutcome::New
+        idem.execute(&req, |_| Box::pin(async { Ok("result:1".into()) }))
+            .await
+            .expect("first request"),
+        IdempotencyOutcome::New { .. }
     ));
     // Replay with identical body returns Replay, not a duplicate.
     assert!(matches!(
-        idem.register(&req, None).await.expect("second register"),
+        idem.execute(&req, |_| Box::pin(async { panic!("must replay") }))
+            .await
+            .expect("second request"),
         IdempotencyOutcome::Replay { .. }
     ));
 }
@@ -457,12 +758,12 @@ async fn expired_leases_are_recoverable_and_stale_worker_cannot_complete_reclaim
         .expect("expire lease");
 
     // Worker B can now reclaim the expired lease.
-    let guard_b = operations::claim(pool, "worker-b")
+    let guard_b = operations::claim(pool, "worker-a")
         .await
         .expect("claim B")
         .unwrap();
     assert_eq!(guard_b.operation_id, op_id);
-    assert!(operations::is_leased_to(pool, op_id, "worker-b")
+    assert!(operations::is_leased_to(pool, op_id, "worker-a")
         .await
         .expect("B owns lease"));
 
@@ -476,6 +777,7 @@ async fn expired_leases_are_recoverable_and_stale_worker_cannot_complete_reclaim
         !guard_a.complete(None).await.expect("stale complete"),
         "stale worker must not complete a reclaimed operation"
     );
+    assert!(!guard_a.fail(true, Some("stale")).await.unwrap());
     assert!(
         !guard_a
             .set_step("reclaimed-step")
@@ -484,13 +786,24 @@ async fn expired_leases_are_recoverable_and_stale_worker_cannot_complete_reclaim
         "stale worker must not advance a reclaimed operation"
     );
 
-    // Worker B completes successfully; the operation is not overwritten.
-    assert!(guard_b.complete(None).await.expect("B completes"));
+    // Reusing a worker name must not revive the old guard. Retry once more
+    // and check that each claim contributes to the attempt counter.
+    assert!(guard_b.fail(true, Some("retry")).await.unwrap());
+    sqlx::query("UPDATE operations SET retry_at = now() - interval '1 second' WHERE id = $1")
+        .bind(op_id.0)
+        .execute(pool)
+        .await
+        .unwrap();
+    let guard_c = operations::claim(pool, "worker-a").await.unwrap().unwrap();
+    assert!(!guard_b.complete(None).await.unwrap());
+    // The newest claimant completes successfully.
+    assert!(guard_c.complete(None).await.expect("C completes"));
     let rec = operations::get_scoped(pool, org_id, op_id)
         .await
         .expect("get op")
         .unwrap();
     assert_eq!(rec.state, "succeeded");
+    assert_eq!(rec.attempt_count, 3);
     assert!(rec.current_step.is_none(), "stale step write was rejected");
 }
 
@@ -516,23 +829,23 @@ async fn idempotent_retries_do_not_duplicate_and_conflict_reuse_is_rejected() {
         organization_id: OrganizationId::from_uuid(org),
         route: "/api/v1/organizations/idem-org/tenants".to_string(),
         key: "idem-key-1".to_string(),
-        request_hash: IdempotencyRequest::hash_request(&json!({"name": "x"})),
+        request_hash: IdempotencyRequest::hash_request(&json!({"name": "x"})).unwrap(),
     };
 
     // First attempt is new; the caller performs the mutation once.
     assert!(matches!(
-        idem.register(&req, None).await.expect("first"),
-        IdempotencyOutcome::New
+        idem.execute(&req, |_| Box::pin(async { Ok("tenant:123".into()) }))
+            .await
+            .expect("first"),
+        IdempotencyOutcome::New { .. }
     ));
-
-    // Record the response reference (simulating the mutation completing).
-    idem.record_response(&req, "tenant:123")
-        .await
-        .expect("record response");
 
     // A retry with the identical body returns the original result, not a
     // duplicate.
-    let retry = idem.register(&req, None).await.expect("retry");
+    let retry = idem
+        .execute(&req, |_| Box::pin(async { panic!("must replay") }))
+        .await
+        .expect("retry");
     match retry {
         IdempotencyOutcome::Replay { response_reference } => {
             assert_eq!(response_reference, "tenant:123");
@@ -542,12 +855,15 @@ async fn idempotent_retries_do_not_duplicate_and_conflict_reuse_is_rejected() {
 
     // A conflicting reuse (same key, different body) is rejected with a 409.
     let conflicting = IdempotencyRequest {
-        request_hash: IdempotencyRequest::hash_request(&json!({"name": "y"})),
+        request_hash: IdempotencyRequest::hash_request(&json!({"name": "y"})).unwrap(),
         ..req.clone()
     };
     assert!(
         matches!(
-            idem.register(&conflicting, None).await,
+            idem.execute(&conflicting, |_| Box::pin(async {
+                panic!("must conflict")
+            }))
+            .await,
             Err(ManagerError::Conflict(_))
         ),
         "same key with different body must be rejected"

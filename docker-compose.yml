@@ -38,7 +38,7 @@ services:
       POSTGRES_PASSWORD: ${OPENFLOWS_PG_PASSWORD:-openflows}
       POSTGRES_DB: openflows_control_plane
     ports:
-      - "${OPENFLOWS_PG_PORT:-5544}:5432"
+      - "${OPENFLOWS_PG_BIND_ADDRESS:-127.0.0.1}:${OPENFLOWS_PG_PORT:-5544}:5432"
     volumes:
       - openflows_db_data:/var/lib/postgresql/data
     healthcheck:
