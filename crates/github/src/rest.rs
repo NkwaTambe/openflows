@@ -268,12 +268,19 @@ impl GithubRestClient {
         );
         let resp: CheckSuitesResponse = self.get_json(&url).await?;
 
-        if resp.check_suites.is_empty() {
+        // Ignore ghost check suites from installed apps that have 0 check runs.
+        let active_suites: Vec<&CheckSuite> = resp
+            .check_suites
+            .iter()
+            .filter(|s| s.latest_check_runs_count != Some(0))
+            .collect();
+
+        if active_suites.is_empty() {
             return Ok(CiStatus::Success);
         }
 
         let mut has_pending = false;
-        for suite in &resp.check_suites {
+        for suite in active_suites {
             match suite.status.as_str() {
                 "queued" | "in_progress" | "pending" => has_pending = true,
                 "completed"
@@ -322,11 +329,17 @@ impl GithubRestClient {
             }
             page += 1;
         }
-        let checks = if suites.is_empty() {
+        // Ignore ghost check suites from installed apps that have 0 check runs.
+        let active_suites: Vec<CheckSuite> = suites
+            .into_iter()
+            .filter(|s| s.latest_check_runs_count != Some(0))
+            .collect();
+
+        let checks = if active_suites.is_empty() {
             None
         } else {
             let mut status = CiStatus::Success;
-            for suite in suites {
+            for suite in active_suites {
                 let observed = if suite.status != "completed" {
                     CiStatus::Pending
                 } else {
@@ -1312,6 +1325,8 @@ struct CheckSuitesResponse {
 struct CheckSuite {
     status: String,
     conclusion: Option<String>,
+    #[serde(default)]
+    latest_check_runs_count: Option<u32>,
 }
 
 /// A structured representation of a failed CI check.
@@ -1965,6 +1980,41 @@ mod lifecycle_ci_tests {
         assert_eq!(
             client.get_ci_status("org", "repo", "head").await.unwrap(),
             CiStatus::Failure
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+    #[tokio::test]
+    async fn ghost_check_suites_with_zero_runs_are_ignored_by_ci_status() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0},
+                {"status":"completed","conclusion":"success","latest_check_runs_count":1}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Success
         );
         status.assert_async().await;
         checks.assert_async().await;
