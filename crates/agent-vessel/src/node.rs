@@ -995,15 +995,24 @@ impl Node for VesselNode {
                     false
                 };
                 if !ready {
+                    let needs_rework = self.check_pr_needs_rework(owner, repo, &pr_info).await;
+                    if !needs_rework {
+                        info!(
+                            pr_number,
+                            ticket,
+                            review_approved =
+                                state.pr_decision.as_ref().is_some_and(|d| d.approved),
+                            human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
+                            delivery_pending = state.pr_delivery.is_some(),
+                            "Deferring PR: waiting for lifecycle approvals or review delivery"
+                        );
+                        continue;
+                    }
                     info!(
                         pr_number,
                         ticket,
-                        review_approved = state.pr_decision.as_ref().is_some_and(|d| d.approved),
-                        human_approved = state.pr_human.as_ref().is_some_and(|d| d.approved),
-                        delivery_pending = state.pr_delivery.is_some(),
-                        "Deferring PR: waiting for lifecycle approvals or review delivery"
+                        "PR is not merge_ready but requires rework (reviews/CI/conflicts); proceeding to process"
                     );
-                    continue;
                 }
             }
 
@@ -1940,6 +1949,29 @@ impl VesselNode {
                     });
                 }
 
+                // Verify lifecycle merge readiness before attempting merge.
+                // A PR might be approved on GitHub but not yet merge_ready in
+                // the lifecycle store. Keep it pending rather than failing with MergeBlocked.
+                let store = self.lifecycle_store.lock().unwrap().clone();
+                if let Some(store) = store {
+                    if let Some(ref tid) = ticket_id {
+                        if let Ok(state) = store.lifecycle(tid).await {
+                            if !state.merge_ready(&pr_info.head_sha) {
+                                info!(
+                                    pr_number,
+                                    ticket = %tid,
+                                    "PR approved on GitHub but waiting for lifecycle approvals; keeping pending"
+                                );
+                                return Ok(VesselOutcome::Reviews {
+                                    ticket_id: ticket_id.clone(),
+                                    pr_number,
+                                    state: PrMonitorState::NeedsReview.as_str().to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+
                 match self.merge_reviewed(owner, repo, &pr_info).await {
                     Ok(result) if result.merged => Ok(VesselOutcome::Merged {
                         ticket_id: ticket_id.unwrap_or_else(|| format!("T-{}", pr_number)),
@@ -2404,6 +2436,51 @@ impl VesselNode {
             info!(path = %path.display(), "Wrote CONFLICT_RESOLUTION.md for forge conflict rework");
             true
         }
+    }
+
+    /// Checks whether an unapproved PR requires rework (merge conflicts, failing CI,
+    /// changes requested, or unaddressed review comments) before gating on `merge_ready`.
+    async fn check_pr_needs_rework(&self, owner: &str, repo: &str, pr_info: &PrInfo) -> bool {
+        // 1. Merge conflicts
+        if pr_info.has_conflicts() || pr_info.mergeable == Some(false) {
+            return true;
+        }
+
+        // 2. Failing CI
+        if let Ok(ci_status) = self
+            .client
+            .get_ci_status(owner, repo, &pr_info.head_sha)
+            .await
+        {
+            if matches!(ci_status, CiStatus::Failure | CiStatus::Error) {
+                return true;
+            }
+        }
+
+        // 3. Reviews: changes requested
+        let reviews = self
+            .client
+            .list_pr_reviews(owner, repo, pr_info.number)
+            .await
+            .unwrap_or_default();
+        let review_state = github::effective_review_state(&reviews);
+        if review_state == github::PrReviewState::ChangesRequested {
+            return true;
+        }
+
+        // 4. Inline review comments (only considered rework if PR is not approved)
+        if review_state != github::PrReviewState::Approved {
+            let comments = self
+                .client
+                .list_review_comments(owner, repo, pr_info.number)
+                .await
+                .unwrap_or_default();
+            if !comments.is_empty() {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Reconcile a human's GitHub approval into the lifecycle `pr_human` record.
@@ -4228,6 +4305,177 @@ mod tests {
             pr.assert_async().await;
             merge.assert_async().await;
         }
+    }
+
+    #[tokio::test]
+    async fn unapproved_pr_with_changes_requested_dispatches_rework_instead_of_deferring() {
+        let mut server = mockito::Server::new_async().await;
+        let pr = server
+            .mock("GET", "/repos/org/repo/pulls/42")
+            .with_status(200)
+            .with_body(r#"{"number":42,"title":"Feature","body":null,"head":{"sha":"head","ref":"feature"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":true,"merged":false}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"alice","id":100},"body":"Please address this bug","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"head","author_association":"MEMBER"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(r#"{"check_suites":[]}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut config = VesselConfig::default();
+        config.ci_poll.interval_secs = 1;
+        let mut node = VesselNode::new(config);
+        node.client = client.clone();
+        node.poller = CiPoller::new(node.config.ci_poll.clone(), client);
+
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let pending = json!([{"number":42,"ticket_id":"T-42"}]);
+        store.set(KEY_PENDING_PRS, pending.clone()).await;
+        // Ticket is in Submit phase but NOT merge_ready (no pr_decision or pr_human approval).
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42}),
+            )
+            .await;
+
+        let result = node
+            .exec(json!({"owner":"org","repo":"repo","pending_prs":pending}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["has_work"], true);
+        assert_eq!(result["outcomes"][0]["type"], "reviews");
+        assert_eq!(result["outcomes"][0]["state"], "changes_requested");
+
+        let action = node.post(&store, result).await.unwrap();
+        assert!(
+            action.as_str() == ACTION_ADDRESS_REVIEW_DISPATCHED
+                || action.as_str() == ACTION_REWORK_PROVISION_NEEDED
+        );
+        let lifecycle = store.lifecycle("T-42").await.unwrap();
+        assert_eq!(lifecycle.phase, config::lifecycle::Phase::Building);
+
+        pr.assert_async().await;
+        reviews.assert_async().await;
+        comments.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unapproved_pr_with_inline_comments_dispatches_rework_instead_of_deferring() {
+        let mut server = mockito::Server::new_async().await;
+        let pr = server
+            .mock("GET", "/repos/org/repo/pulls/42")
+            .with_status(200)
+            .with_body(r#"{"number":42,"title":"Feature","body":null,"head":{"sha":"head","ref":"feature"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":true,"merged":false}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let reviews = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/reviews?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body(
+                r#"[{"id":10,"body":"Please fix error handling","path":"src/main.rs","line":50}]"#,
+            )
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(r#"{"check_suites":[]}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut config = VesselConfig::default();
+        config.ci_poll.interval_secs = 1;
+        let mut node = VesselNode::new(config);
+        node.client = client.clone();
+        node.poller = CiPoller::new(node.config.ci_poll.clone(), client);
+
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let pending = json!([{"number":42,"ticket_id":"T-42"}]);
+        store.set(KEY_PENDING_PRS, pending.clone()).await;
+        // Ticket is in Submit phase but NOT merge_ready.
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42}),
+            )
+            .await;
+
+        let result = node
+            .exec(json!({"owner":"org","repo":"repo","pending_prs":pending}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["has_work"], true);
+        assert_eq!(result["outcomes"][0]["type"], "reviews");
+        assert_eq!(result["outcomes"][0]["state"], "comments");
+
+        let action = node.post(&store, result).await.unwrap();
+        assert!(
+            action.as_str() == ACTION_ADDRESS_REVIEW_DISPATCHED
+                || action.as_str() == ACTION_REWORK_PROVISION_NEEDED
+        );
+        let lifecycle = store.lifecycle("T-42").await.unwrap();
+        assert_eq!(lifecycle.phase, config::lifecycle::Phase::Building);
+
+        pr.assert_async().await;
+        reviews.assert_async().await;
+        comments.assert_async().await;
     }
 
     #[tokio::test]
