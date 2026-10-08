@@ -138,12 +138,14 @@ impl Drop for TestDb {
         // terminates any lingering pool connections (Postgres 13+).
         let admin_options = self.admin_options.clone();
         let db_name = self.db_name.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+        let cleanup = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
+                .build();
+            let Ok(runtime) = runtime else {
+                return Err("could not create cleanup runtime".to_string());
+            };
+            runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_secs(10), async move {
                     let mut conn = PgConnection::connect_with(&admin_options).await?;
                     sqlx::query(&format!(
@@ -154,12 +156,15 @@ impl Drop for TestDb {
                     conn.close().await
                 })
                 .await
+                .map_err(|_| "cleanup timed out".to_string())?
+                .map_err(|e| e.to_string())
             })
-        })
-        .join()
-        .expect("database cleanup thread panicked")
-        .expect("database cleanup timed out")
-        .expect("database cleanup failed");
+        });
+        match cleanup.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("OpenFlows test database cleanup failed: {error}"),
+            Err(_) => eprintln!("OpenFlows test database cleanup thread panicked"),
+        }
     }
 }
 
