@@ -244,55 +244,70 @@ impl VesselNode {
 
     /// Destroy a Coder workspace and archive all associated chats.
     /// Called during merge/cleanup to tear down ephemeral workspaces.
+    /// Returns `true` if the workspace was successfully deleted.
     async fn destroy_coder_workspace(
         &self,
         store: &SharedStore,
         worker_id: &str,
         workspace_id: &str,
-    ) {
-        if let Some(client) = Self::coder_client_from_store(store).await {
-            // Archive all chats associated with this workspace
-            let chats = client.list_chats().await.unwrap_or_default();
-            let ws_chats: Vec<_> = chats
-                .iter()
-                .filter(|c| c.workspace_id == workspace_id)
-                .collect();
-
-            let mut archived = 0;
-            for chat in &ws_chats {
-                if client.archive_chat(&chat.id).await.is_ok() {
-                    archived += 1;
-                }
-            }
-
-            if !ws_chats.is_empty() {
-                info!(
+    ) -> bool {
+        let client = match Self::coder_client_from_store(store).await {
+            Some(c) => c,
+            None => {
+                warn!(
+                    worker_id,
                     workspace_id,
-                    archived,
-                    total = ws_chats.len(),
-                    "Archived chats before workspace destruction"
+                    "Coder client unavailable — retaining workspace reference for later cleanup"
                 );
+                return false;
             }
+        };
 
-            // Delete the workspace
-            if let Err(e) = client.delete_workspace(workspace_id).await {
+        // Archive all chats associated with this workspace
+        let chats = client.list_chats().await.unwrap_or_default();
+        let ws_chats: Vec<_> = chats
+            .iter()
+            .filter(|c| c.workspace_id == workspace_id)
+            .collect();
+
+        let mut archived = 0;
+        for chat in &ws_chats {
+            if client.archive_chat(&chat.id).await.is_ok() {
+                archived += 1;
+            }
+        }
+
+        if !ws_chats.is_empty() {
+            info!(
+                workspace_id,
+                archived,
+                total = ws_chats.len(),
+                "Archived chats before workspace destruction"
+            );
+        }
+
+        // Delete the workspace
+        match client.delete_workspace(workspace_id).await {
+            Ok(_) => {
+                info!(worker_id, workspace_id, "Destroyed Coder workspace");
+                let mut slots: HashMap<String, WorkerSlot> =
+                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+                if let Some(slot) = slots.get_mut(worker_id) {
+                    if slot.workspace_id.as_deref() == Some(workspace_id) {
+                        slot.workspace_id = None;
+                        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                    }
+                }
+                true
+            }
+            Err(e) => {
                 warn!(
                     worker_id,
                     workspace_id,
                     error = %e,
-                    "Failed to delete Coder workspace"
+                    "Failed to delete Coder workspace — retaining workspace reference for later cleanup"
                 );
-            } else {
-                info!(worker_id, workspace_id, "Destroyed Coder workspace");
-            }
-        }
-
-        let mut slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        if let Some(slot) = slots.get_mut(worker_id) {
-            if slot.workspace_id.as_deref() == Some(workspace_id) {
-                slot.workspace_id = None;
-                store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+                false
             }
         }
     }
@@ -411,14 +426,18 @@ impl VesselNode {
         }
 
         for (worker_id, ws_id) in to_destroy {
-            self.destroy_coder_workspace(store, &worker_id, &ws_id)
-                .await;
-        }
-
-        if let Some(tid) = target_ticket {
-            for role in ["forge", "sentinel"] {
-                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
-                store.del(&ws_key).await;
+            if self
+                .destroy_coder_workspace(store, &worker_id, &ws_id)
+                .await
+            {
+                if let Some(tid) = target_ticket {
+                    for role in ["forge", "sentinel"] {
+                        let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                        if store.get_typed::<String>(&ws_key).await.as_deref() == Some(&ws_id) {
+                            store.del(&ws_key).await;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2748,6 +2767,17 @@ impl VesselNode {
             return;
         }
 
+        // Check which workspaces are still recorded for this ticket (i.e. deletion failed or was not performed)
+        let mut active_workspaces: Vec<String> = Vec::new();
+        if let Some(tid) = target_ticket {
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    active_workspaces.push(ws_id);
+                }
+            }
+        }
+
         // Fetch slots and recycle matching workers to Idle
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
@@ -2761,6 +2791,11 @@ impl VesselNode {
             let matches_ticket =
                 target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
             if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
+                let ws_still_active = slot
+                    .workspace_id
+                    .as_ref()
+                    .is_some_and(|w| active_workspaces.contains(w));
+
                 match &slot.status {
                     WorkerStatus::Done { .. }
                     | WorkerStatus::Assigned { .. }
@@ -2771,11 +2806,13 @@ impl VesselNode {
                             "Recycling worker to Idle after merge"
                         );
                         slot.status = WorkerStatus::Idle;
-                        slot.workspace_id = None;
+                        if !ws_still_active {
+                            slot.workspace_id = None;
+                        }
                         changed = true;
                     }
                     _ => {
-                        if slot.workspace_id.is_some() {
+                        if !ws_still_active && slot.workspace_id.is_some() {
                             slot.workspace_id = None;
                             changed = true;
                         }
@@ -4488,5 +4525,67 @@ mod tests {
             "Sentinel slot must be recycled to Idle"
         );
         assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_failed_workspace_destruction_preserves_references() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-010".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-10".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        let ws_key = full_ticket_key("T-010", KEY_TICKET_WORKSPACE, "forge");
+        store.set(&ws_key, json!("ws-forge-10")).await;
+
+        let pending_prs = vec![json!({
+            "number": 10,
+            "ticket_id": "T-010",
+            "head_branch": "forge-1/T-010",
+        })];
+
+        // Attempt destruction when Coder client is unavailable
+        node.destroy_coder_workspace_for_pr(&store, &pending_prs, 10)
+            .await;
+
+        // The ticket-scoped workspace key MUST be preserved
+        let stored_ws = store.get_typed::<String>(&ws_key).await;
+        assert_eq!(
+            stored_ws.as_deref(),
+            Some("ws-forge-10"),
+            "Ticket workspace key must not be erased when deletion fails"
+        );
+
+        // When recycled, the slot status becomes Idle, but workspace reference is preserved
+        let pr = json!({
+            "number": 10,
+            "ticket_id": "T-010",
+            "head_branch": "forge-1/T-010",
+        });
+        node.recycle_worker(&store, &pr).await;
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(forge_slot.status, WorkerStatus::Idle),
+            "Forge slot is set to Idle"
+        );
+        assert_eq!(
+            forge_slot.workspace_id.as_deref(),
+            Some("ws-forge-10"),
+            "Slot workspace_id must be preserved when deletion fails"
+        );
     }
 }
