@@ -268,11 +268,11 @@ impl GithubRestClient {
         );
         let resp: CheckSuitesResponse = self.get_json(&url).await?;
 
-        // Ignore ghost check suites from installed apps that have 0 check runs.
+        // Ignore ghost check suites from unconfigured/non-CI apps that have 0 check runs.
         let active_suites: Vec<&CheckSuite> = resp
             .check_suites
             .iter()
-            .filter(|s| s.latest_check_runs_count != Some(0))
+            .filter(|s| !is_ghost_check_suite(s))
             .collect();
 
         if active_suites.is_empty() {
@@ -286,7 +286,9 @@ impl GithubRestClient {
                 "completed"
                     if suite.conclusion.as_deref() == Some("failure")
                         || suite.conclusion.as_deref() == Some("timed_out")
-                        || suite.conclusion.as_deref() == Some("cancelled") =>
+                        || suite.conclusion.as_deref() == Some("cancelled")
+                        || suite.conclusion.as_deref() == Some("action_required")
+                        || suite.conclusion.as_deref() == Some("startup_failure") =>
                 {
                     return Ok(CiStatus::Failure);
                 }
@@ -329,10 +331,10 @@ impl GithubRestClient {
             }
             page += 1;
         }
-        // Ignore ghost check suites from installed apps that have 0 check runs.
+        // Ignore ghost check suites from unconfigured/non-CI apps that have 0 check runs.
         let active_suites: Vec<CheckSuite> = suites
             .into_iter()
-            .filter(|s| s.latest_check_runs_count != Some(0))
+            .filter(|s| !is_ghost_check_suite(s))
             .collect();
 
         let checks = if active_suites.is_empty() {
@@ -1327,6 +1329,16 @@ struct CheckSuite {
     conclusion: Option<String>,
     #[serde(default)]
     latest_check_runs_count: Option<u32>,
+    #[serde(default)]
+    app: Option<CheckSuiteApp>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct CheckSuiteApp {
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// A structured representation of a failed CI check.
@@ -1758,6 +1770,81 @@ fn aggregate_ci_sources(status: Option<CiStatus>, checks: Option<CiStatus>) -> C
     }
 }
 
+/// Determines if a check suite is an unconfigured ghost suite from an installed app that should be ignored.
+///
+/// GitHub automatically creates a `queued` check suite for every installed GitHub App
+/// with checks write permissions on every commit. If the app is not a CI provider (e.g. OpenFlows itself,
+/// Devin) or is not configured for the repository (e.g. SonarQube Cloud), it never creates check runs
+/// and remains in `queued` status with 0 runs indefinitely.
+///
+/// A suite is ONLY treated as a ghost suite if:
+/// 1. Its status is `queued` (or incomplete with no check runs started).
+/// 2. It has explicitly 0 check runs (`latest_check_runs_count == Some(0)`).
+/// 3. It belongs to a known non-CI app or unconfigured app (e.g. OpenFlows, Devin, SonarCloud,
+///    or any app slug configured in `GITHUB_IGNORED_CHECK_APPS`).
+///
+/// Active suites from real CI providers (like GitHub Actions, CircleCI, etc.) and completed
+/// suites (including failed zero-run suites) are NEVER ignored.
+fn is_ghost_check_suite(suite: &CheckSuite) -> bool {
+    // Completed suites must ALWAYS be evaluated — never ignore a completed suite
+    // (even if it has 0 runs, e.g. a startup failure).
+    if suite.status == "completed" {
+        return false;
+    }
+
+    // If the suite has created check runs or is actively in progress, it is not a ghost.
+    if suite.latest_check_runs_count.unwrap_or(0) > 0 || suite.status == "in_progress" {
+        return false;
+    }
+
+    // Only suites with explicitly 0 runs can be ghost suites.
+    if suite.latest_check_runs_count != Some(0) {
+        return false;
+    }
+
+    // Check the app slug / name against known non-CI or ghost app patterns.
+    let app = match &suite.app {
+        Some(a) => a,
+        None => return false,
+    };
+
+    let slug = app.slug.as_deref().unwrap_or("").to_lowercase();
+    let name = app.name.as_deref().unwrap_or("").to_lowercase();
+
+    // GitHub Actions is the official GitHub workflow runner — never ignore it.
+    if slug == "github-actions" || name == "github actions" {
+        return false;
+    }
+
+    // Known non-CI or idle apps that spawn ghost suites with 0 runs:
+    // - OpenFlows's own GitHub App (orchestrator, not a CI runner)
+    // - Devin AI integration (coding assistant, not a CI runner)
+    // - SonarQube Cloud / SonarCloud (when unconfigured on the repo, sits idle in queued)
+    let is_known_ghost = slug.contains("openflows")
+        || name.contains("openflows")
+        || slug.contains("devin")
+        || name.contains("devin")
+        || slug.contains("sonarqubecloud")
+        || slug.contains("sonarcloud")
+        || name.contains("sonar");
+
+    if is_known_ghost {
+        return true;
+    }
+
+    // Allow user-configured ignored apps via environment variable (comma-separated slugs)
+    if let Ok(ignored_env) = std::env::var("GITHUB_IGNORED_CHECK_APPS") {
+        for pattern in ignored_env.split(',') {
+            let p = pattern.trim().to_lowercase();
+            if !p.is_empty() && (slug.contains(&p) || name.contains(&p)) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod pr_review_tests {
     use super::*;
@@ -2001,7 +2088,7 @@ mod lifecycle_ci_tests {
             .with_status(200)
             .with_body(
                 r#"{"check_suites":[
-                {"status":"queued","conclusion":null,"latest_check_runs_count":0},
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0,"app":{"slug":"my-openflows-app"}},
                 {"status":"completed","conclusion":"success","latest_check_runs_count":1}
             ]}"#,
             )
@@ -2015,6 +2102,115 @@ mod lifecycle_ci_tests {
         assert_eq!(
             client.get_ci_status("org", "repo", "head").await.unwrap(),
             CiStatus::Success
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn real_ci_queued_suite_with_zero_runs_is_not_ignored() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0,"app":{"slug":"github-actions"}},
+                {"status":"completed","conclusion":"success","latest_check_runs_count":1}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        // GitHub Actions queued suite with 0 runs must stay Pending, not be ignored
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Pending
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn generic_queued_suite_with_zero_runs_is_not_ignored() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"queued","conclusion":null,"latest_check_runs_count":0},
+                {"status":"completed","conclusion":"success","latest_check_runs_count":1}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        // Unscoped / generic queued suite with 0 runs must stay Pending
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Pending
+        );
+        status.assert_async().await;
+        checks.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn completed_suite_with_zero_runs_and_failure_is_not_ignored() {
+        let mut server = mockito::Server::new_async().await;
+        let status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .create_async()
+            .await;
+        let checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"check_suites":[
+                {"status":"completed","conclusion":"failure","latest_check_runs_count":0}
+            ]}"#,
+            )
+            .create_async()
+            .await;
+        let client = GithubRestClient {
+            api_base: server.url(),
+            client: reqwest::Client::new(),
+            token: "test".into(),
+        };
+        assert_eq!(
+            client.get_ci_status("org", "repo", "head").await.unwrap(),
+            CiStatus::Failure
         );
         status.assert_async().await;
         checks.assert_async().await;
