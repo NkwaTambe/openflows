@@ -3310,13 +3310,14 @@ Use `openflows-harness` for all coordination:
         for slot in slots.values_mut() {
             match &slot.status {
                 WorkerStatus::Suspended { ticket_id, .. } => {
-                    let ticket_done = tickets.iter().any(|t| {
-                        t.id == *ticket_id
-                            && matches!(
-                                t.status,
-                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
-                            )
-                    });
+                    let ticket_done = tickets
+                        .iter()
+                        .any(|t| t.id == *ticket_id && t.status.is_terminal())
+                        || store
+                            .lifecycle(ticket_id)
+                            .await
+                            .ok()
+                            .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
                     if ticket_done {
                         info!(
                             worker_id = slot.id,
@@ -3330,17 +3331,14 @@ Use `openflows-harness` for all coordination:
                 WorkerStatus::Assigned { ticket_id, .. }
                 | WorkerStatus::Working { ticket_id, .. } => {
                     // Release workers whose assigned ticket is terminal (Completed / Merged / Done)
-                    let complete = tickets.iter().any(|t| {
-                        t.id == *ticket_id
-                            && matches!(
-                                t.status,
-                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
-                            )
-                    }) || store
-                        .lifecycle(ticket_id)
-                        .await
-                        .ok()
-                        .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
+                    let complete = tickets
+                        .iter()
+                        .any(|t| t.id == *ticket_id && t.status.is_terminal())
+                        || store
+                            .lifecycle(ticket_id)
+                            .await
+                            .ok()
+                            .is_some_and(|s| s.phase == config::lifecycle::Phase::Done);
 
                     if complete {
                         info!(
@@ -3446,10 +3444,7 @@ Use `openflows-harness` for all coordination:
                             reason: "ticket no longer exists".to_string(),
                         });
                     } else if let Some(t) = ticket {
-                        if matches!(
-                            t.status,
-                            TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
-                        ) {
+                        if t.status.is_terminal() {
                             recovery.stale_workers.push(StaleWorker {
                                 worker_id: slot.id.clone(),
                                 ticket_id: ticket_id.clone(),
@@ -3460,13 +3455,9 @@ Use `openflows-harness` for all coordination:
                     }
                 }
                 WorkerStatus::Suspended { ticket_id, .. } => {
-                    let ticket_completed = tickets.iter().any(|t| {
-                        t.id == *ticket_id
-                            && matches!(
-                                t.status,
-                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
-                            )
-                    });
+                    let ticket_completed = tickets
+                        .iter()
+                        .any(|t| t.id == *ticket_id && t.status.is_terminal());
                     if ticket_completed {
                         recovery.stale_workers.push(StaleWorker {
                             worker_id: slot.id.clone(),
@@ -4465,13 +4456,9 @@ impl Node for NexusNode {
                 let is_done = matches!(slot.status, WorkerStatus::Done { .. });
                 let is_terminal = match &slot.status {
                     WorkerStatus::Assigned { ticket_id, .. }
-                    | WorkerStatus::Working { ticket_id, .. } => tickets.iter().any(|t| {
-                        t.id == *ticket_id
-                            && matches!(
-                                t.status,
-                                TicketStatus::Completed { .. } | TicketStatus::Merged { .. }
-                            )
-                    }),
+                    | WorkerStatus::Working { ticket_id, .. } => tickets
+                        .iter()
+                        .any(|t| t.id == *ticket_id && t.status.is_terminal()),
                     _ => false,
                 };
                 if is_done || is_terminal {
@@ -6540,5 +6527,51 @@ mod tests {
             "Sentinel slot must be recycled to Idle when ticket is Merged"
         );
         assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_recover_orphans_does_not_recycle_worker_for_pr_opened_ticket() {
+        let store = SharedStore::new_in_memory();
+
+        let tickets = vec![Ticket {
+            id: "T-005".to_string(),
+            title: "Task 5".to_string(),
+            body: "Body".to_string(),
+            priority: 1,
+            branch: Some("forge-1/T-005".to_string()),
+            status: TicketStatus::Completed {
+                outcome: "pr_opened".to_string(),
+                worker_id: "forge-1".to_string(),
+            },
+            issue_url: None,
+            attempts: 0,
+        }];
+        store.set(KEY_TICKETS, json!(tickets)).await;
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        NexusNode::recover_orphans(&store).await.unwrap();
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(forge_slot.status, WorkerStatus::Assigned { .. }),
+            "Forge slot must NOT be recycled to Idle when ticket outcome is pr_opened"
+        );
+        assert_eq!(forge_slot.workspace_id.as_deref(), Some("ws-forge"));
     }
 }

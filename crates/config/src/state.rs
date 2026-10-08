@@ -58,6 +58,18 @@ pub enum TicketStatus {
     },
 }
 
+impl TicketStatus {
+    /// Return whether this ticket status represents a terminal state
+    /// (e.g. Merged or Completed with an outcome other than "pr_opened").
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            Self::Merged { .. } => true,
+            Self::Completed { outcome, .. } => outcome != "pr_opened",
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerSlot {
     pub id: String,

@@ -10,7 +10,7 @@ use config::{
     state::{
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
         full_ticket_key_flat, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
-        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_WORKER_SLOTS,
+        KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
     },
     Envconfig, Ticket, TicketStatus, WorkerSlot, WorkerStatus, ACTION_ADDRESS_REVIEW_DISPATCHED,
     ACTION_CI_FIX_NEEDED, ACTION_CONFLICTS_DETECTED, ACTION_REWORK_PROVISION_NEEDED,
@@ -326,16 +326,38 @@ impl VesselNode {
 
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut to_stop: Vec<(String, String)> = Vec::new();
         for (worker_id, slot) in &slots {
+            if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
+                continue;
+            }
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
             let matches_ticket =
                 target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
-            if matches_worker || matches_ticket {
+            if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
                 if let Some(ref ws_id) = slot.workspace_id {
-                    self.stop_coder_workspace_for_worker(store, worker_id, ws_id)
-                        .await;
+                    if !to_stop.iter().any(|(_, w)| w == ws_id) {
+                        to_stop.push((worker_id.clone(), ws_id.clone()));
+                    }
                 }
             }
+        }
+
+        if let Some(tid) = target_ticket {
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    if !to_stop.iter().any(|(_, w)| w == &ws_id) {
+                        let w_id = target_worker.as_deref().unwrap_or(role).to_string();
+                        to_stop.push((w_id, ws_id));
+                    }
+                }
+            }
+        }
+
+        for (worker_id, ws_id) in to_stop {
+            self.stop_coder_workspace_for_worker(store, &worker_id, &ws_id)
+                .await;
         }
     }
 
@@ -359,14 +381,44 @@ impl VesselNode {
 
         let slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
+        let mut to_destroy: Vec<(String, String)> = Vec::new();
         for (worker_id, slot) in &slots {
+            if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
+                continue;
+            }
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
             let matches_ticket =
                 target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
-            if matches_worker || matches_ticket {
+            if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
                 if let Some(ref ws_id) = slot.workspace_id {
-                    self.destroy_coder_workspace(store, worker_id, ws_id).await;
+                    if !to_destroy.iter().any(|(_, w)| w == ws_id) {
+                        to_destroy.push((worker_id.clone(), ws_id.clone()));
+                    }
                 }
+            }
+        }
+
+        if let Some(tid) = target_ticket {
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                if let Some(ws_id) = store.get_typed::<String>(&ws_key).await {
+                    if !to_destroy.iter().any(|(_, w)| w == &ws_id) {
+                        let w_id = target_worker.as_deref().unwrap_or(role).to_string();
+                        to_destroy.push((w_id, ws_id));
+                    }
+                }
+            }
+        }
+
+        for (worker_id, ws_id) in to_destroy {
+            self.destroy_coder_workspace(store, &worker_id, &ws_id)
+                .await;
+        }
+
+        if let Some(tid) = target_ticket {
+            for role in ["forge", "sentinel"] {
+                let ws_key = full_ticket_key(tid, KEY_TICKET_WORKSPACE, role);
+                store.del(&ws_key).await;
             }
         }
     }
@@ -2688,7 +2740,6 @@ impl VesselNode {
     }
 
     /// Recycle workers (both FORGE and paired SENTINEL) back to Idle after a PR is merged.
-    /// Also destroys any remaining Coder workspace.
     async fn recycle_worker(&self, store: &SharedStore, pr: &Value) {
         let target_ticket = pr["ticket_id"].as_str();
         let target_worker = Self::resolve_worker_id_from_pr(pr);
@@ -2697,34 +2748,19 @@ impl VesselNode {
             return;
         }
 
-        // First find and destroy workspaces for matching slots
-        let slots: HashMap<String, WorkerSlot> =
-            store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
-        let mut to_destroy = Vec::new();
-        for (worker_id, slot) in &slots {
-            let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
-            let matches_ticket =
-                target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
-            if matches_worker || matches_ticket {
-                if let Some(ref ws_id) = slot.workspace_id {
-                    to_destroy.push((worker_id.clone(), ws_id.clone()));
-                }
-            }
-        }
-        for (w_id, ws_id) in to_destroy {
-            self.destroy_coder_workspace(store, &w_id, &ws_id).await;
-        }
-
-        // Re-fetch slots and recycle matching workers to Idle
+        // Fetch slots and recycle matching workers to Idle
         let mut slots: HashMap<String, WorkerSlot> =
             store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
         let mut changed = false;
 
         for (worker_id, slot) in slots.iter_mut() {
+            if slot.status.ticket_id().is_some() && slot.status.ticket_id() != target_ticket {
+                continue;
+            }
             let matches_worker = target_worker.as_deref() == Some(worker_id.as_str());
             let matches_ticket =
                 target_ticket.is_some() && slot.status.ticket_id() == target_ticket;
-            if matches_worker || matches_ticket {
+            if matches_ticket || (matches_worker && slot.status.ticket_id().is_none()) {
                 match &slot.status {
                     WorkerStatus::Done { .. }
                     | WorkerStatus::Assigned { .. }
@@ -4374,6 +4410,78 @@ mod tests {
         );
         assert_eq!(forge_slot.workspace_id, None);
 
+        let sentinel_slot = updated_slots.get("sentinel").unwrap();
+        assert!(
+            matches!(sentinel_slot.status, WorkerStatus::Idle),
+            "Sentinel slot must be recycled to Idle"
+        );
+        assert_eq!(sentinel_slot.workspace_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_recycle_worker_does_not_affect_reassigned_worker() {
+        let store = SharedStore::new_in_memory();
+        let node = VesselNode::new(VesselConfig::default());
+
+        let mut slots: HashMap<String, WorkerSlot> = HashMap::new();
+        // forge-1 was reassigned to T-006 with a new workspace
+        slots.insert(
+            "forge-1".to_string(),
+            WorkerSlot {
+                id: "forge-1".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-006".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-forge-1-new".to_string()),
+            },
+        );
+        // sentinel is still on T-005
+        slots.insert(
+            "sentinel".to_string(),
+            WorkerSlot {
+                id: "sentinel".to_string(),
+                status: WorkerStatus::Assigned {
+                    ticket_id: "T-005".to_string(),
+                    issue_url: None,
+                },
+                workspace_id: Some("ws-sentinel".to_string()),
+            },
+        );
+        store.set(KEY_WORKER_SLOTS, json!(slots)).await;
+
+        // T-005 has an old workspace recorded
+        store
+            .set(
+                &full_ticket_key("T-005", KEY_TICKET_WORKSPACE, "forge"),
+                json!("ws-forge-1-old"),
+            )
+            .await;
+
+        let pr = json!({
+            "number": 6,
+            "ticket_id": "T-005",
+            "head_branch": "forge-1/T-005",
+        });
+
+        node.recycle_worker(&store, &pr).await;
+
+        let updated_slots: HashMap<String, WorkerSlot> =
+            store.get_typed(KEY_WORKER_SLOTS).await.unwrap();
+
+        // forge-1 MUST NOT be touched because it is working on T-006
+        let forge_slot = updated_slots.get("forge-1").unwrap();
+        assert!(
+            matches!(&forge_slot.status, WorkerStatus::Assigned { ticket_id, .. } if ticket_id == "T-006"),
+            "Forge slot working on T-006 must not be disturbed"
+        );
+        assert_eq!(
+            forge_slot.workspace_id.as_deref(),
+            Some("ws-forge-1-new"),
+            "Forge slot workspace for new ticket must be preserved"
+        );
+
+        // sentinel was on T-005 so it is recycled
         let sentinel_slot = updated_slots.get("sentinel").unwrap();
         assert!(
             matches!(sentinel_slot.status, WorkerStatus::Idle),
