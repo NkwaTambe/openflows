@@ -1914,7 +1914,19 @@ impl VesselNode {
                 let monitor_state =
                     classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
                         .await
-                        .unwrap_or(PrMonitorState::NeedsReview);
+                        .unwrap_or(if pr_info.has_conflicts() {
+                            PrMonitorState::Conflicts
+                        } else {
+                            PrMonitorState::NeedsReview
+                        });
+
+                if monitor_state == PrMonitorState::Conflicts || pr_info.has_conflicts() {
+                    warn!(
+                        pr_number,
+                        "PR has conflicts after CI success — routing to conflict handler"
+                    );
+                    return self.handle_conflicts(owner, repo, pr_info).await;
+                }
 
                 // SENTINEL has not yet approved the PR on GitHub. Do not merge
                 // and do not ask FORGE to rework — keep the PR pending so the
@@ -4470,6 +4482,94 @@ mod tests {
             action.as_str() == ACTION_ADDRESS_REVIEW_DISPATCHED
                 || action.as_str() == ACTION_REWORK_PROVISION_NEEDED
         );
+        let lifecycle = store.lifecycle("T-42").await.unwrap();
+        assert_eq!(lifecycle.phase, config::lifecycle::Phase::Building);
+
+        pr.assert_async().await;
+        reviews.assert_async().await;
+        comments.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unapproved_pr_with_conflicts_and_successful_ci_dispatches_conflict_rework() {
+        let mut server = mockito::Server::new_async().await;
+        let pr = server
+            .mock("GET", "/repos/org/repo/pulls/42")
+            .with_status(200)
+            .with_body(r#"{"number":42,"title":"Feature","body":null,"head":{"sha":"head","ref":"feature"},"base":{"ref":"main","sha":"base"},"state":"open","mergeable":false,"merged":false}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let reviews = server
+            .mock(
+                "GET",
+                "/repos/org/repo/pulls/42/reviews?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _status = server
+            .mock("GET", "/repos/org/repo/commits/head/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success","total_count":1}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _checks = server
+            .mock(
+                "GET",
+                "/repos/org/repo/commits/head/check-suites?per_page=100&page=1",
+            )
+            .with_status(200)
+            .with_body(r#"{"check_suites":[]}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _files = server
+            .mock("GET", "/repos/org/repo/pulls/42/files")
+            .with_status(200)
+            .with_body(r#"[{"filename":"src/lib.rs","status":"modified"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let mut config = VesselConfig::default();
+        config.ci_poll.interval_secs = 1;
+        let mut node = VesselNode::new(config);
+        node.client = client.clone();
+        node.poller = CiPoller::new(node.config.ci_poll.clone(), client);
+
+        let store = SharedStore::new_in_memory();
+        *node.lifecycle_store.lock().unwrap() = Some(store.clone());
+        let pending = json!([{"number":42,"ticket_id":"T-42"}]);
+        store.set(KEY_PENDING_PRS, pending.clone()).await;
+        // Ticket is in Submit phase with missing lifecycle approvals (not merge_ready).
+        store
+            .set(
+                "ticket:T-42:status",
+                json!({"version":1,"phase":"submit","head":"head","pr_number":42}),
+            )
+            .await;
+
+        let result = node
+            .exec(json!({"owner":"org","repo":"repo","pending_prs":pending}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["has_work"], true);
+        assert_eq!(result["outcomes"][0]["type"], "conflicts");
+        assert_eq!(result["outcomes"][0]["pr_number"], 42);
+
         let lifecycle = store.lifecycle("T-42").await.unwrap();
         assert_eq!(lifecycle.phase, config::lifecycle::Phase::Building);
 
