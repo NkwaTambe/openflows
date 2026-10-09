@@ -1802,15 +1802,49 @@ impl Node for VesselNode {
                             store.get_typed(KEY_TICKETS).await.unwrap_or_default();
                         if let Some(ticket) = tickets.iter_mut().find(|t| t.id == tid) {
                             if !matches!(ticket.status, TicketStatus::InProgress { .. }) {
+                                let slots: HashMap<String, WorkerSlot> =
+                                    store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                                 let worker_id = match &ticket.status {
                                     TicketStatus::Assigned { worker_id }
                                     | TicketStatus::InProgress { worker_id }
                                     | TicketStatus::Completed { worker_id, .. }
-                                        if worker_id != "nexus-reconciliation" =>
+                                        if worker_id != "nexus-reconciliation"
+                                            && slots.contains_key(worker_id) =>
                                     {
                                         worker_id.clone()
                                     }
-                                    _ => "forge".to_string(),
+                                    _ => slots
+                                        .iter()
+                                        .find(|(id, slot)| {
+                                            Self::worker_role(id) == "forge"
+                                                && matches!(
+                                                    &slot.status,
+                                                    WorkerStatus::Assigned { ticket_id: t, .. }
+                                                        | WorkerStatus::Working { ticket_id: t, .. }
+                                                        if t == &tid
+                                                )
+                                        })
+                                        .map(|(id, _)| id.clone())
+                                        .or_else(|| {
+                                            pending_prs
+                                                .iter()
+                                                .find(|p| p["number"].as_u64() == Some(*pr_number))
+                                                .and_then(|pr| {
+                                                    let wid =
+                                                        pr["worker_id"].as_str().unwrap_or("");
+                                                    if !wid.is_empty() && slots.contains_key(wid) {
+                                                        return Some(wid.to_string());
+                                                    }
+                                                    Self::derive_worker_id_from_branch(
+                                                        pr["head_branch"].as_str().unwrap_or(""),
+                                                    )
+                                                    .filter(|wid| slots.contains_key(wid))
+                                                })
+                                        })
+                                        .or_else(|| {
+                                            slots.keys().find(|k| k.starts_with("forge")).cloned()
+                                        })
+                                        .unwrap_or_else(|| "forge-1".to_string()),
                                 };
                                 ticket.status = TicketStatus::InProgress { worker_id };
                                 store.set(KEY_TICKETS, json!(tickets)).await;
@@ -4987,6 +5021,96 @@ mod tests {
 
         let dispatched_sha: Option<String> = store.get_typed("_address_review_dispatched_42").await;
         assert_eq!(dispatched_sha.as_deref(), Some("sha-new"));
+    }
+
+    #[tokio::test]
+    async fn test_post_reviews_resolves_real_forge_slot_for_nexus_reconciliation_ticket() {
+        let mut server = mockito::Server::new_async().await;
+        let _chat_mock = server
+            .mock("POST", "/api/v2/chats/chat-42/messages")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"msg-1","chat_id":"chat-42","role":"user","content":[]}"#)
+            .create_async()
+            .await;
+        let _user_mock = server
+            .mock("GET", "/api/v2/users/me")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"user-1","username":"coder","email":"coder@example.com","roles":["member"]}"#)
+            .create_async()
+            .await;
+
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_api_token", json!("test-token")).await;
+
+        store
+            .set(
+                "pending_prs",
+                json!([{
+                    "number": 42,
+                    "ticket_id": "T-42",
+                    "worker_id": "forge-1",
+                    "head_branch": "forge-1/T-42",
+                    "head_sha": "sha-new",
+                }]),
+            )
+            .await;
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({
+                    "forge-1": {
+                        "id": "forge-1",
+                        "status": { "type": "assigned", "ticket_id": "T-42" },
+                        "workspace_id": "ws-1"
+                    }
+                }),
+            )
+            .await;
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-42",
+                    "title": "Test",
+                    "body": "",
+                    "priority": 1,
+                    "status": {
+                        "type": "completed",
+                        "outcome": "pr_opened",
+                        "worker_id": "nexus-reconciliation"
+                    }
+                }]),
+            )
+            .await;
+        store.set("ticket:T-42:chat:forge", json!("chat-42")).await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let exec_result = json!({
+            "outcomes": [VesselOutcome::Reviews {
+                ticket_id: Some("T-42".to_string()),
+                pr_number: 42,
+                state: "changes_requested".to_string(),
+                head_sha: Some("sha-new".to_string()),
+            }],
+            "has_work": true,
+        });
+
+        let action = node.post(&store, exec_result).await.unwrap();
+        assert_eq!(action.as_str(), ACTION_ADDRESS_REVIEW_DISPATCHED);
+
+        let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
+        let ticket = tickets.iter().find(|t| t.id == "T-42").unwrap();
+        assert_eq!(
+            ticket.status,
+            TicketStatus::InProgress {
+                worker_id: "forge-1".to_string()
+            }
+        );
     }
 
     #[tokio::test]
