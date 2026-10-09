@@ -5023,94 +5023,107 @@ mod tests {
         assert_eq!(dispatched_sha.as_deref(), Some("sha-new"));
     }
 
-    #[tokio::test]
-    async fn test_post_reviews_resolves_real_forge_slot_for_nexus_reconciliation_ticket() {
-        let mut server = mockito::Server::new_async().await;
-        let _chat_mock = server
-            .mock("POST", "/api/v2/chats/chat-42/messages")
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"msg-1","chat_id":"chat-42","role":"user","content":[]}"#)
-            .create_async()
-            .await;
-        let _user_mock = server
-            .mock("GET", "/api/v2/users/me")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"user-1","username":"coder","email":"coder@example.com","roles":["member"]}"#)
-            .create_async()
-            .await;
+    #[test]
+    fn test_post_reviews_resolves_real_forge_slot_for_nexus_reconciliation_ticket() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Runtime::new().unwrap().block_on(async {
+                    let mut server = mockito::Server::new_async().await;
+                    let _chat_mock = server
+                        .mock("POST", "/api/v2/chats/chat-42/messages")
+                        .with_status(201)
+                        .with_header("content-type", "application/json")
+                        .with_body(
+                            r#"{"id":"msg-1","chat_id":"chat-42","role":"user","content":[]}"#,
+                        )
+                        .create_async()
+                        .await;
+                    let _user_mock = server
+                        .mock("GET", "/api/v2/users/me")
+                        .with_status(200)
+                        .with_header("content-type", "application/json")
+                        .with_body(
+                            r#"{"id":"user-1","username":"coder","email":"coder@example.com","roles":["member"]}"#,
+                        )
+                        .create_async()
+                        .await;
 
-        let store = SharedStore::new_in_memory();
-        store.set("coder_url", json!(server.url())).await;
-        store.set("coder_api_token", json!("test-token")).await;
+                    let store = SharedStore::new_in_memory();
+                    store.set("coder_url", json!(server.url())).await;
+                    store.set("coder_api_token", json!("test-token")).await;
 
-        store
-            .set(
-                "pending_prs",
-                json!([{
-                    "number": 42,
-                    "ticket_id": "T-42",
-                    "worker_id": "forge-1",
-                    "head_branch": "forge-1/T-42",
-                    "head_sha": "sha-new",
-                }]),
-            )
-            .await;
-        store
-            .set(
-                KEY_WORKER_SLOTS,
-                json!({
-                    "forge-1": {
-                        "id": "forge-1",
-                        "status": { "type": "assigned", "ticket_id": "T-42" },
-                        "workspace_id": "ws-1"
-                    }
-                }),
-            )
-            .await;
-        store
-            .set(
-                KEY_TICKETS,
-                json!([{
-                    "id": "T-42",
-                    "title": "Test",
-                    "body": "",
-                    "priority": 1,
-                    "status": {
-                        "type": "completed",
-                        "outcome": "pr_opened",
-                        "worker_id": "nexus-reconciliation"
-                    }
-                }]),
-            )
-            .await;
-        store.set("ticket:T-42:chat:forge", json!("chat-42")).await;
+                    store
+                        .set(
+                            "pending_prs",
+                            json!([{
+                                "number": 42,
+                                "ticket_id": "T-42",
+                                "worker_id": "forge-1",
+                                "head_branch": "forge-1/T-42",
+                                "head_sha": "sha-new",
+                            }]),
+                        )
+                        .await;
+                    store
+                        .set(
+                            KEY_WORKER_SLOTS,
+                            json!({
+                                "forge-1": {
+                                    "id": "forge-1",
+                                    "status": { "type": "assigned", "ticket_id": "T-42" },
+                                    "workspace_id": "ws-1"
+                                }
+                            }),
+                        )
+                        .await;
+                    store
+                        .set(
+                            KEY_TICKETS,
+                            json!([{
+                                "id": "T-42",
+                                "title": "Test",
+                                "body": "",
+                                "priority": 1,
+                                "status": {
+                                    "type": "completed",
+                                    "outcome": "pr_opened",
+                                    "worker_id": "nexus-reconciliation"
+                                }
+                            }]),
+                        )
+                        .await;
+                    store.set("ticket:T-42:chat:forge", json!("chat-42")).await;
 
-        let config = VesselConfig::default();
-        let node = VesselNode::new(config);
+                    let config = VesselConfig::default();
+                    let node = VesselNode::new(config);
 
-        let exec_result = json!({
-            "outcomes": [VesselOutcome::Reviews {
-                ticket_id: Some("T-42".to_string()),
-                pr_number: 42,
-                state: "changes_requested".to_string(),
-                head_sha: Some("sha-new".to_string()),
-            }],
-            "has_work": true,
-        });
+                    let exec_result = json!({
+                        "outcomes": [VesselOutcome::Reviews {
+                            ticket_id: Some("T-42".to_string()),
+                            pr_number: 42,
+                            state: "changes_requested".to_string(),
+                            head_sha: Some("sha-new".to_string()),
+                        }],
+                        "has_work": true,
+                    });
 
-        let action = node.post(&store, exec_result).await.unwrap();
-        assert_eq!(action.as_str(), ACTION_ADDRESS_REVIEW_DISPATCHED);
+                    let action = node.post(&store, exec_result).await.unwrap();
+                    assert_eq!(action.as_str(), ACTION_ADDRESS_REVIEW_DISPATCHED);
 
-        let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
-        let ticket = tickets.iter().find(|t| t.id == "T-42").unwrap();
-        assert_eq!(
-            ticket.status,
-            TicketStatus::InProgress {
-                worker_id: "forge-1".to_string()
-            }
-        );
+                    let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
+                    let ticket = tickets.iter().find(|t| t.id == "T-42").unwrap();
+                    assert_eq!(
+                        ticket.status,
+                        TicketStatus::InProgress {
+                            worker_id: "forge-1".to_string()
+                        }
+                    );
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[tokio::test]

@@ -285,6 +285,14 @@ pub async fn collect_rework(
     repo: &str,
     pr_number: u64,
 ) -> ReworkDirective {
+    if owner.is_empty() || repo.is_empty() {
+        return ReworkDirective {
+            state: PrMonitorState::Comments,
+            pr_number,
+            reason: None,
+        };
+    }
+
     let reason = client
         .list_pr_reviews(owner, repo, pr_number)
         .await
