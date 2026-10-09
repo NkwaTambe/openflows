@@ -495,7 +495,7 @@ impl OrganizationRepository {
     /// Single consumption is enforced by a conditional `UPDATE ... WHERE
     /// accepted_at IS NULL AND revoked_at IS NULL`. This UPDATE is deliberately
     /// the first statement to touch the row and is the atomic gate: concurrent
-    /// UPDATEs on the same row serialize in PostgreSQL, and every loser
+    /// Updates on the same row serialize in PostgreSQL, and every loser
     /// re-evaluates the WHERE against the committed row and affects zero rows.
     pub async fn accept_invitation(
         &self,

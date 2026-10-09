@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn ct_eq_rejects_different_lengths() {
         assert!(ct_eq(b"abc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"xyz"));
         assert!(!ct_eq(b"abc", b"ab"));
     }
 
