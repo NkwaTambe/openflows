@@ -307,6 +307,27 @@ pub async fn get_scoped(
     Ok(row)
 }
 
+/// Fetch an operation by id without an org scope, so the caller can resolve
+/// which organization it belongs to before authorizing access to it. Returns
+/// `None` when the operation does not exist.
+pub async fn get_scoped_any(
+    pool: &PgPool,
+    id: OperationId,
+) -> Result<Option<OperationRecord>, ManagerError> {
+    let row = sqlx::query_as::<_, OperationRecord>(
+        "SELECT id, organization_id, resource_type, resource_id, kind, idempotency_ref,
+                state, current_step, attempt_count, retry_at, lease_owner, lease_expires_at,
+                error_code, sanitized_result, created_at, updated_at
+           FROM operations
+          WHERE id = $1",
+    )
+    .bind(id.0)
+    .fetch_optional(pool)
+    .await
+    .map_err(ManagerError::from)?;
+    Ok(row)
+}
+
 /// Whether an operation is still leased to `owner`.
 pub async fn is_leased_to(
     pool: &PgPool,
