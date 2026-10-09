@@ -182,7 +182,9 @@ pub async fn refresh(
     Ok(Json(RefreshResponse {
         access_token: creds.access_token,
         refresh_token: creds.refresh_token,
-        expires_in: 15 * 60,
+        expires_in: (creds.access_expires_at - chrono::Utc::now())
+            .num_seconds()
+            .max(0),
         refresh_expires_in: (refresh_expires - chrono::Utc::now()).num_seconds(),
     }))
 }
@@ -271,7 +273,7 @@ pub async fn github_start(
     let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
-        .allow(&bucket, LimitScope::Start, START_LIMIT)
+        .allow(&bucket, LimitScope::GithubStart, START_LIMIT)
         .await?
     {
         return Err(ManagerError::api("RATE_LIMITED", "too many login attempts").retryable(true));

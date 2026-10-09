@@ -11,8 +11,10 @@ use sqlx::PgPool;
 /// Rate-limit scopes, each bounded independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitScope {
-    /// `POST /auth/github/start` and `POST /auth/cli/start`.
-    Start,
+    /// `POST /auth/github/start`.
+    GithubStart,
+    /// `POST /auth/cli/start`.
+    DeviceStart,
     /// `POST /auth/cli/approve` (code verification).
     Verify,
     /// `POST /auth/cli/token` (polling).
@@ -25,7 +27,8 @@ pub enum LimitScope {
 impl LimitScope {
     fn as_str(&self) -> &'static str {
         match self {
-            LimitScope::Start => "start",
+            LimitScope::GithubStart => "start",
+            LimitScope::DeviceStart => "device_start",
             LimitScope::Verify => "verify",
             LimitScope::Poll => "poll",
             LimitScope::Invitation => "invitation",
@@ -61,7 +64,7 @@ impl RateLimiter {
             "INSERT INTO rate_limit_ledger (bucket_key, scope, window_start, count)
              VALUES ($1, $2, date_trunc('minute', clock_timestamp()), 1)
              ON CONFLICT (bucket_key, scope, window_start) DO UPDATE
-               SET count = LEAST(rate_limit_ledger.count + 1, $3),
+               SET count = GREATEST(rate_limit_ledger.count, LEAST(rate_limit_ledger.count::bigint + 1, $3::integer)),
                    updated_at = now()
              RETURNING count",
         )

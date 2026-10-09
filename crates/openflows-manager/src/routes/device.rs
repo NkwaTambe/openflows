@@ -41,7 +41,7 @@ pub async fn device_start(
     let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
-        .allow(&bucket, LimitScope::Start, START_LIMIT)
+        .allow(&bucket, LimitScope::DeviceStart, START_LIMIT)
         .await?
     {
         return Err(

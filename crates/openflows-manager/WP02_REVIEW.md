@@ -168,3 +168,15 @@ edge/proxy behavior, and production secret storage have not been verified here.
 There is no platform user-suspension API in WP-02. Existing suspended users are
 denied; any future suspension workflow must handle organization succession or
 suspend affected organizations in the same administrative workflow.
+
+### Local development secret loading
+
+When using `OPENFLOWS_SECRET_PROVIDER=in-memory`, set
+`OPENFLOWS_DEV_SECRETS_FILE` to a private JSON file outside the repository.
+The file maps the configured secret reference names to UTF-8 secret values,
+for example `{"local/github":"your OAuth client secret"}` with
+`OPENFLOWS_GITHUB_CLIENT_SECRET_REF=local/github`. Startup loads this file
+before resolving references. If a master-key reference is configured, its
+value must encode exactly 32 bytes. Missing references and invalid files fail
+startup; parser errors do not echo credentials. Restrict file permissions to
+the local user. This ephemeral provider remains unsuitable for hosted mode.

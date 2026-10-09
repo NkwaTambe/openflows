@@ -430,6 +430,12 @@ async fn invitation_retries_disclose_url_once_and_delete_retries_converge() {
         )
         .await
         .unwrap();
+    let unavailable = FixtureGithubAuth::new(FixtureUser {
+        id: 1,
+        login: "alice".into(),
+        display_name: "Alice".into(),
+    });
+    unavailable.users_by_login.lock().unwrap().clear();
     let b = s
         .orgs_service
         .create_invitation_idempotent(
@@ -437,7 +443,7 @@ async fn invitation_retries_disclose_url_once_and_delete_retries_converge() {
             oid,
             "bob",
             Role::Viewer,
-            s.github.as_ref(),
+            &unavailable,
             "invite-key",
             "r",
         )
@@ -459,6 +465,33 @@ async fn invitation_retries_disclose_url_once_and_delete_retries_converge() {
         )
         .await
         .is_err());
+    sqlx::query(
+        "UPDATE memberships SET status='suspended' WHERE organization_id=$1 AND user_id=$2",
+    )
+    .bind(oid.0)
+    .bind(alice.0)
+    .execute(s.db.pool())
+    .await
+    .unwrap();
+    assert!(s
+        .orgs_service
+        .create_invitation_idempotent(
+            alice,
+            oid,
+            "bob",
+            Role::Viewer,
+            &unavailable,
+            "invite-key",
+            "r",
+        )
+        .await
+        .is_err());
+    sqlx::query("UPDATE memberships SET status='active' WHERE organization_id=$1 AND user_id=$2")
+        .bind(oid.0)
+        .bind(alice.0)
+        .execute(s.db.pool())
+        .await
+        .unwrap();
     let a = s
         .orgs_service
         .request_deletion_idempotent(alice, oid, true, "delete-key", "r")
@@ -675,4 +708,120 @@ fn public_origin_and_secret_debug_output_are_safe() {
     let debug = format!("{token:?}");
     assert!(!debug.contains("private-"));
     assert!(!format!("{:?}", openflows_manager::config::MasterKey([42; 32])).contains("42"));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn start_limits_are_independent_and_counts_never_decrease() {
+    let (_db, s, _) = context().await;
+    let bucket = "limit-regression";
+    let hashed = openflows_manager::auth::crypto::hash_token(bucket);
+    // Seed every nearby minute so crossing a window cannot make this flaky.
+    sqlx::query(
+        "INSERT INTO rate_limit_ledger (bucket_key,scope,window_start,count)
+        SELECT $1,'start',date_trunc('minute',clock_timestamp()) + n * interval '1 minute',30
+        FROM generate_series(-1,1) n",
+    )
+    .bind(&hashed)
+    .execute(s.db.pool())
+    .await
+    .unwrap();
+    assert!(s
+        .rate_limiter
+        .allow(bucket, LimitScope::DeviceStart, 20)
+        .await
+        .unwrap());
+    assert!(!s
+        .rate_limiter
+        .allow(bucket, LimitScope::GithubStart, 20)
+        .await
+        .unwrap());
+    assert!(!s
+        .rate_limiter
+        .allow(bucket, LimitScope::GithubStart, 30)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn refresh_response_reports_the_remaining_family_lifetime() {
+    let (_db, s, router) = context().await;
+    let u = user(&s, 1).await;
+    let creds = s.sessions.create_cli_session(u).await.unwrap();
+    sqlx::query(
+        "UPDATE sessions SET created_at=now()-interval '30 days'+interval '1 minute' WHERE id=$1",
+    )
+    .bind(creds.session_id.0)
+    .execute(s.db.pool())
+    .await
+    .unwrap();
+    let response = router
+        .oneshot(
+            Request::post("/api/v1/auth/refresh")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"refresh_token":creds.refresh_token}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!((1..=60).contains(&body["expires_in"].as_i64().unwrap()));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL"]
+async fn organization_requests_with_different_keys_do_not_deadlock() {
+    let (_db, s, _) = context().await;
+    let owner = user(&s, 1).await;
+    let oid = org(&s, owner).await;
+    // Delay after the foreign-key check so the old insert-before-lock order
+    // reliably lets both requests acquire KEY SHARE before upgrading locks.
+    sqlx::query(
+        "CREATE FUNCTION delay_idempotency_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_sleep(0.1); RETURN NEW; END $$",
+    )
+    .execute(s.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER zz_delay_idempotency AFTER INSERT ON idempotency_keys
+        FOR EACH ROW EXECUTE FUNCTION delay_idempotency_insert()",
+    )
+    .execute(s.db.pool())
+    .await
+    .unwrap();
+    let (a, b) = tokio::join!(
+        s.orgs_service.create_invitation_idempotent(
+            owner,
+            oid,
+            "bob",
+            Role::Viewer,
+            s.github.as_ref(),
+            "a",
+            "r"
+        ),
+        s.orgs_service.create_invitation_idempotent(
+            owner,
+            oid,
+            "alice",
+            Role::Viewer,
+            s.github.as_ref(),
+            "b",
+            "r"
+        ),
+    );
+    assert!(a.is_ok(), "{a:?}");
+    assert!(b.is_ok(), "{b:?}");
+    let (a, b) = tokio::join!(
+        s.orgs_service
+            .request_deletion_idempotent(owner, oid, true, "a", "r"),
+        s.orgs_service
+            .request_deletion_idempotent(owner, oid, true, "b", "r"),
+    );
+    assert_eq!(a.unwrap(), b.unwrap());
 }

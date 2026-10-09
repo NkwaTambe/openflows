@@ -85,6 +85,23 @@ pub fn resolve_secret_provider(
     }
 }
 
+/// Load a local JSON object mapping secret references to UTF-8 values.
+/// Parse errors deliberately exclude file contents, which contain credentials.
+async fn populate_development_secrets(
+    provider: &dyn crate::secrets::SecretProvider,
+    contents: &[u8],
+) -> Result<(), ManagerError> {
+    let values: std::collections::HashMap<String, String> = serde_json::from_slice(contents)
+        .map_err(|_| ManagerError::Config("invalid development secrets file".into()))?;
+    for (name, value) in values {
+        provider
+            .put(&name, value.as_bytes())
+            .await
+            .map_err(|_| ManagerError::Config("cannot populate development secrets".into()))?;
+    }
+    Ok(())
+}
+
 /// Resolve the 32-byte envelope master key from the secret provider, or use the
 /// explicit dev key when no ref is configured (local/tests only).
 async fn resolve_master_key(
@@ -293,6 +310,14 @@ impl AppState {
             Some(url) => {
                 let db = Db::connect(url).await?;
                 let provider = resolve_secret_provider(&config.secret_provider)?;
+                if config.secret_provider == IN_MEMORY_SECRET_PROVIDER {
+                    if let Some(path) = std::env::var_os("OPENFLOWS_DEV_SECRETS_FILE") {
+                        let contents = std::fs::read(path).map_err(|_| {
+                            ManagerError::Config("cannot read development secrets file".into())
+                        })?;
+                        populate_development_secrets(provider.as_ref(), &contents).await?;
+                    }
+                }
                 let services =
                     ManagerServices::from_db_with_config(db, &config, provider.as_ref()).await?;
                 Some(Arc::new(services))
@@ -566,4 +591,30 @@ async fn request_context(
         .insert("x-content-type-options", "nosniff".parse().unwrap());
     response.headers_mut().insert("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
     response
+}
+
+#[cfg(test)]
+mod development_secret_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn development_file_populates_oauth_and_master_key_references() {
+        let provider = resolve_secret_provider(IN_MEMORY_SECRET_PROVIDER).unwrap();
+        populate_development_secrets(
+            provider.as_ref(),
+            br#"{"oauth":"client-secret","master":"01234567890123456789012345678901"}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.get("oauth").await.unwrap(), b"client-secret");
+        let key = resolve_master_key(provider.as_ref(), &Some("master".into()))
+            .await
+            .unwrap();
+        assert_eq!(key.0, *b"01234567890123456789012345678901");
+        assert!(provider.get("missing").await.is_err());
+        let error = populate_development_secrets(provider.as_ref(), b"private-credential")
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("private-credential"));
+    }
 }

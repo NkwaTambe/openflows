@@ -481,7 +481,6 @@ impl OrganizationService {
     ) -> Result<(InvitationId, Option<String>), ManagerError> {
         let (member, org) = self.repo.membership_and_org(org_id, caller).await?;
         Policy::require_admin(member.as_ref(), org.as_ref())?;
-        let lookup = github.resolve_login(github_login).await?;
         let req = crate::idempotency::IdempotencyRequest {
             actor_id: caller,
             organization_id: org_id,
@@ -491,6 +490,14 @@ impl OrganizationService {
                 &json!({"login":github_login.to_ascii_lowercase(),"role":role}),
             )?,
         };
+        if let Some(reference) = self.idempotency.replay(&req).await? {
+            let id = reference.parse().map_err(|_| {
+                ManagerError::Service(anyhow::anyhow!("invalid invitation reference"))
+            })?;
+            return Ok((id, None));
+        }
+        // No transaction or database lock is held during the GitHub request.
+        let lookup = github.resolve_login(github_login).await?;
         let token = crate::auth::crypto::Secret::generate();
         let hash = token.hash();
         let repo = self.repo.clone();

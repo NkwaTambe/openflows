@@ -56,6 +56,29 @@ impl IdempotencyService {
         Self { pool }
     }
 
+    /// Read a completed, unexpired result before doing external work.
+    /// Callers must check current authorization before replaying it.
+    pub async fn replay(&self, req: &IdempotencyRequest) -> Result<Option<String>, ManagerError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT request_hash, response_reference FROM idempotency_keys
+             WHERE actor_id=$1 AND organization_id=$2 AND route=$3 AND key=$4
+               AND expires_at > clock_timestamp()",
+        )
+        .bind(req.actor_id.0)
+        .bind(req.organization_id.0)
+        .bind(&req.route)
+        .bind(&req.key)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((hash, _)) if hash != req.request_hash => Err(ManagerError::Conflict(
+                "idempotency key reused with a different request body".into(),
+            )),
+            Some((_, reference)) => Ok(reference.filter(|r| !r.trim().is_empty())),
+            None => Ok(None),
+        }
+    }
+
     /// Commit an org-scoped mutation and its nonempty result reference
     /// together. Concurrent identical requests wait on the unique key and then
     /// replay the committed result. No unfinished key is committed.
@@ -115,6 +138,14 @@ impl IdempotencyService {
             return Err(ManagerError::InvalidInput("invalid idempotency key".into()));
         }
         let mut tx = self.pool.begin().await?;
+        // Lock before the foreign-key insert takes KEY SHARE. Otherwise two
+        // different keys can deadlock when their mutations request FOR UPDATE.
+        if let Some(org_id) = organization_id {
+            sqlx::query("SELECT id FROM organizations WHERE id = $1 FOR UPDATE")
+                .bind(org_id.0)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
         // Only an expired record can be replaced. The upsert locks conflicts
         // and re-checks expiry after acquiring the row, including on retries.
         let id = uuid::Uuid::new_v4();
