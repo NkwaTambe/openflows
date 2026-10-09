@@ -1071,22 +1071,40 @@ impl Node for VesselNode {
                 VesselOutcome::CiFailed { .. }
                     | VesselOutcome::CiTimeout { .. }
                     | VesselOutcome::Conflicts { .. }
-            ) || matches!(&outcome,VesselOutcome::Reviews{state,..} if state!="needs_review");
+            ) || matches!(&outcome, VesselOutcome::Reviews { state, .. } if state != "needs_review");
             if rework {
                 if let Some(ticket) = outcome.ticket_id() {
-                    let current = store.lifecycle(ticket).await?;
-                    if current.phase == config::lifecycle::Phase::Submit && !current.merge_pending {
-                        store
-                            .transition(
-                                ticket,
-                                current.version,
-                                "vessel",
-                                config::lifecycle::Event::Move {
-                                    phase: config::lifecycle::Phase::Building,
-                                    head: None,
-                                },
-                            )
-                            .await?;
+                    let pr_num = outcome.pr_number();
+                    let is_already_dispatched = match &outcome {
+                        VesselOutcome::Reviews { head_sha, .. } => {
+                            let curr = head_sha
+                                .clone()
+                                .or(self.pending_pr_head_sha(store, pr_num).await);
+                            let last = self.get_address_review_dispatched_sha(store, pr_num).await;
+                            match curr {
+                                Some(ref sha) => last.as_deref() == Some(sha.as_str()),
+                                None => false,
+                            }
+                        }
+                        _ => false,
+                    };
+                    if !is_already_dispatched {
+                        let current = store.lifecycle(ticket).await?;
+                        if current.phase == config::lifecycle::Phase::Submit
+                            && !current.merge_pending
+                        {
+                            store
+                                .transition(
+                                    ticket,
+                                    current.version,
+                                    "vessel",
+                                    config::lifecycle::Event::Move {
+                                        phase: config::lifecycle::Phase::Building,
+                                        head: None,
+                                    },
+                                )
+                                .await?;
+                        }
                     }
                 }
             }
@@ -1684,11 +1702,14 @@ impl Node for VesselNode {
                     ticket_id,
                     pr_number,
                     state,
+                    head_sha,
                 } => {
                     let tid = ticket_id
                         .clone()
                         .unwrap_or_else(|| format!("T-{}", pr_number));
-                    let current_head_sha = self.pending_pr_head_sha(store, *pr_number).await;
+                    let current_head_sha = head_sha
+                        .clone()
+                        .or(self.pending_pr_head_sha(store, *pr_number).await);
                     let last_dispatched_sha = self
                         .get_address_review_dispatched_sha(store, *pr_number)
                         .await;
@@ -1985,6 +2006,7 @@ impl VesselNode {
                         ticket_id,
                         pr_number,
                         state: PrMonitorState::NeedsReview.as_str().to_string(),
+                        head_sha: Some(pr_info.head_sha.clone()),
                     });
                 }
 
@@ -2003,6 +2025,7 @@ impl VesselNode {
                         ticket_id,
                         pr_number,
                         state: monitor_state.as_str().to_string(),
+                        head_sha: Some(pr_info.head_sha.clone()),
                     });
                 }
 
@@ -2023,6 +2046,7 @@ impl VesselNode {
                                     ticket_id: ticket_id.clone(),
                                     pr_number,
                                     state: PrMonitorState::NeedsReview.as_str().to_string(),
+                                    head_sha: Some(pr_info.head_sha.clone()),
                                 });
                             }
                         }
@@ -4835,6 +4859,7 @@ mod tests {
                 ticket_id: Some("T-42".to_string()),
                 pr_number: 42,
                 state: "changes_requested".to_string(),
+                head_sha: None,
             }],
             "has_work": true,
         });
@@ -4893,6 +4918,7 @@ mod tests {
                 ticket_id: Some("T-42".to_string()),
                 pr_number: 42,
                 state: "changes_requested".to_string(),
+                head_sha: Some("sha-abc".to_string()),
             }],
             "has_work": true,
         });
@@ -4911,6 +4937,56 @@ mod tests {
         // PR still removed from pending_prs (FORGE is handling it).
         let pending: Vec<Value> = store.get_typed("pending_prs").await.unwrap_or_default();
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_post_reviews_fresh_head_overrides_stale_pending_prs_and_redispatches() {
+        let store = SharedStore::new_in_memory();
+        store
+            .set(
+                "pending_prs",
+                json!([{
+                    "number": 42,
+                    "ticket_id": "T-42",
+                    "worker_id": "forge-1",
+                    "head_sha": "sha-old",
+                }]),
+            )
+            .await;
+        store
+            .set(
+                "tickets",
+                json!([{"id": "T-42", "status": {"type": "in_progress"}}]),
+            )
+            .await;
+        store
+            .set("_address_review_dispatched_42", json!("sha-old"))
+            .await;
+
+        let config = VesselConfig::default();
+        let node = VesselNode::new(config);
+
+        let exec_result = json!({
+            "outcomes": [VesselOutcome::Reviews {
+                ticket_id: Some("T-42".to_string()),
+                pr_number: 42,
+                state: "changes_requested".to_string(),
+                head_sha: Some("sha-new".to_string()),
+            }],
+            "has_work": true,
+        });
+
+        let action = node.post(&store, exec_result).await.unwrap();
+        assert_eq!(action.as_str(), ACTION_REWORK_PROVISION_NEEDED);
+
+        let attempts: u32 = store
+            .get_typed("_address_review_attempts_42")
+            .await
+            .unwrap_or(0);
+        assert_eq!(attempts, 1);
+
+        let dispatched_sha: Option<String> = store.get_typed("_address_review_dispatched_42").await;
+        assert_eq!(dispatched_sha.as_deref(), Some("sha-new"));
     }
 
     #[tokio::test]
