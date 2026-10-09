@@ -7,6 +7,7 @@ use coder_client::{
 };
 use config::{
     state::{
+        address_review_attempts_key, address_review_dispatched_at_key,
         address_review_dispatched_key, full_ticket_key, full_ticket_key_flat, heartbeat_key,
         pr_review_namespace, review_action_key, review_chat_key, review_verdict_key,
         HeartbeatRecord, KEY_COMMAND_GATE, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS,
@@ -507,22 +508,31 @@ Before significant work, read the relevant skill file to understand the workflow
                     let ticket = tickets.iter().find(|t| t.id == *tid);
                     if let Some(ticket) = ticket {
                         if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
-                            // Check if a human has intervened on GitHub:
-                            // 1. An authorized approval was submitted on GitHub, OR
+                            // Check if an authorized human has intervened on GitHub:
+                            // 1. An authorized approval on the candidate head commit was submitted on GitHub, OR
                             // 2. A new commit was pushed to the PR branch.
                             let reviews = client
                                 .list_pr_reviews(owner, repo_name, pr.number)
                                 .await
                                 .unwrap_or_default();
-                            let is_approved = github::effective_review_state(&reviews)
-                                == github::PrReviewState::Approved;
+                            let is_authorized_head_approval =
+                                github::effective_review_state(&reviews)
+                                    == github::PrReviewState::Approved
+                                    && github::latest_review_per_user(&reviews).into_iter().any(
+                                        |r| {
+                                            r.state_enum() == github::PrReviewState::Approved
+                                                && r.is_authorized_reviewer()
+                                                && (r.commit_id.as_deref() == Some(&pr.head_sha)
+                                                    || r.commit_id.is_none())
+                                        },
+                                    );
                             let last_sha = store
                                 .get_typed::<String>(&address_review_dispatched_key(pr.number))
                                 .await;
                             let head_changed =
                                 last_sha.as_deref().is_some_and(|sha| sha != pr.head_sha);
 
-                            if !is_approved && !head_changed {
+                            if !is_authorized_head_approval && !head_changed {
                                 info!(
                                     pr_number = pr.number,
                                     ticket_id = %tid,
@@ -534,10 +544,21 @@ Before significant work, read the relevant skill file to understand the workflow
                             info!(
                                 pr_number = pr.number,
                                 ticket_id = %tid,
-                                is_approved,
+                                is_authorized_head_approval,
                                 head_changed,
                                 "Human intervention detected on PR for ticket previously awaiting human — resuming PR"
                             );
+
+                            // Reset the /address_review attempts counter now that a human has intervened
+                            store
+                                .set(&address_review_attempts_key(pr.number), json!(0))
+                                .await;
+                            if is_authorized_head_approval {
+                                store.del(&address_review_dispatched_key(pr.number)).await;
+                                store
+                                    .del(&address_review_dispatched_at_key(pr.number))
+                                    .await;
+                            }
 
                             // Unblock ticket status in KEY_TICKETS so NEXUS active ticket polling and SENTINEL resume
                             let mut tickets_copy: Vec<Ticket> =

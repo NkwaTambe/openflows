@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use coder_client::CoderClient;
 use config::{
     state::{
+        address_review_attempts_key, address_review_dispatched_at_key,
         address_review_dispatched_key, address_review_rearmed_key, full_ticket_key,
         full_ticket_key_flat, KEY_MERGE_READY_PRS, KEY_PENDING_PRS, KEY_TICKETS, KEY_TICKET_CHAT,
         KEY_TICKET_DEPLOYMENT, KEY_TICKET_REWORK_DIRECTIVE, KEY_TICKET_WORKSPACE, KEY_WORKER_SLOTS,
@@ -25,7 +26,10 @@ use tracing::{debug, info, warn};
 
 use crate::ci_poller::CiPollResult;
 use crate::conflict_resolver::ConflictResolver;
-use crate::pr_monitor::{build_directive, classify, collect_rework, PrMonitorState};
+use crate::pr_monitor::{
+    build_directive, classify, collect_rework, PrMonitorState, ReworkEvidence,
+};
+
 use crate::types::{VesselConfig, VesselOutcome};
 use crate::{CiPoller, PrMerger, VesselNotifier};
 
@@ -1016,7 +1020,10 @@ impl Node for VesselNode {
                 }
             }
 
-            let outcome = self.process_single_pr(owner, repo, pr_info).await?;
+            let evidence = Self::get_rework_evidence(&store, pr_number).await;
+            let outcome = self
+                .process_single_pr(owner, repo, pr_info, evidence.as_ref())
+                .await?;
             outcomes.push(outcome);
         }
 
@@ -1686,21 +1693,10 @@ impl Node for VesselNode {
                         .get_address_review_dispatched_sha(store, *pr_number)
                         .await;
 
-                    // If FORGE pushed a new commit since the last /address_review dispatch,
-                    // previous feedback was addressed by the new commit. Reset the attempt counter.
-                    let head_changed = match (&current_head_sha, &last_dispatched_sha) {
-                        (Some(curr), Some(last)) => curr != last,
-                        _ => false,
-                    };
-                    if head_changed {
-                        info!(
-                            pr_number,
-                            ticket_id = %tid,
-                            "PR head changed since last review dispatch — resetting review attempt counter"
-                        );
-                        self.reset_address_review_attempts(store, *pr_number).await;
-                    }
-
+                    // Note: Attempts counter is preserved across automated rework commits
+                    // so an unresolvable automated review loop halts at MAX_ADDRESS_REVIEW_ATTEMPTS
+                    // instead of looping indefinitely. The counter is reset only upon approval
+                    // or explicit human intervention.
                     let current_attempts =
                         self.get_address_review_attempts(store, *pr_number).await;
 
@@ -1781,10 +1777,13 @@ impl Node for VesselNode {
                             state,
                             "Dispatched /address_review to forge chat"
                         );
-                        if let Some(sha) = current_head_sha {
-                            self.set_address_review_dispatched_sha(store, *pr_number, &sha)
+                        if let Some(sha) = &current_head_sha {
+                            self.set_address_review_dispatched_sha(store, *pr_number, sha)
                                 .await;
                         }
+                        let now = chrono::Utc::now().to_rfc3339();
+                        self.set_address_review_dispatched_at(store, *pr_number, &now)
+                            .await;
                         self.increment_address_review_attempts(store, *pr_number)
                             .await;
                         any_address_review = true;
@@ -1809,6 +1808,13 @@ impl Node for VesselNode {
                         let directive =
                             build_directive(monitor_state, *pr_number, reason.as_deref());
                         self.persist_rework_directive(store, &tid, "forge", &directive)
+                            .await;
+                        if let Some(sha) = &current_head_sha {
+                            self.set_address_review_dispatched_sha(store, *pr_number, sha)
+                                .await;
+                        }
+                        let now = chrono::Utc::now().to_rfc3339();
+                        self.set_address_review_dispatched_at(store, *pr_number, &now)
                             .await;
                         self.increment_address_review_attempts(store, *pr_number)
                             .await;
@@ -1875,6 +1881,7 @@ impl VesselNode {
         owner: &str,
         repo: &str,
         pr_info: PrInfo,
+        evidence: Option<&ReworkEvidence>,
     ) -> Result<VesselOutcome> {
         let pr_number = pr_info.number;
 
@@ -1925,14 +1932,20 @@ impl VesselNode {
                 // responsible FORGE instead of merging. The actual chat dispatch
                 // happens in post() where the SharedStore (forge chat binding) is
                 // available; here we only decide and carry the rework directive.
-                let monitor_state =
-                    classify(&self.client, owner, repo, &pr_info, CiStatus::Success)
-                        .await
-                        .unwrap_or(if pr_info.has_conflicts() {
-                            PrMonitorState::Conflicts
-                        } else {
-                            PrMonitorState::NeedsReview
-                        });
+                let monitor_state = classify(
+                    &self.client,
+                    owner,
+                    repo,
+                    &pr_info,
+                    CiStatus::Success,
+                    evidence,
+                )
+                .await
+                .unwrap_or(if pr_info.has_conflicts() {
+                    PrMonitorState::Conflicts
+                } else {
+                    PrMonitorState::NeedsReview
+                });
 
                 if monitor_state == PrMonitorState::Conflicts || pr_info.has_conflicts() {
                     warn!(
@@ -3205,7 +3218,7 @@ impl VesselNode {
     /// Increment the `/address_review` dispatch counter for a PR. Stored in a
     /// separate key so it survives pending_prs removal/re-add cycles.
     async fn increment_address_review_attempts(&self, store: &SharedStore, pr_number: u64) {
-        let key = format!("_address_review_attempts_{}", pr_number);
+        let key = address_review_attempts_key(pr_number);
         let current: u32 = store.get_typed::<u32>(&key).await.unwrap_or(0);
         let next = current + 1;
         info!(
@@ -3219,20 +3232,22 @@ impl VesselNode {
 
     /// Get the current `/address_review` dispatch count for a PR.
     async fn get_address_review_attempts(&self, store: &SharedStore, pr_number: u64) -> u32 {
-        let key = format!("_address_review_attempts_{}", pr_number);
+        let key = address_review_attempts_key(pr_number);
         store.get_typed::<u32>(&key).await.unwrap_or(0)
     }
 
     /// Reset the `/address_review` dispatch counter for a PR.
     async fn reset_address_review_attempts(&self, store: &SharedStore, pr_number: u64) {
-        let key = format!("_address_review_attempts_{}", pr_number);
+        let key = address_review_attempts_key(pr_number);
         store.set(&key, json!(0)).await;
     }
 
-    /// Clear the PR head SHA for which `/address_review` was dispatched.
+    /// Clear the PR head SHA and dispatch timestamp for which `/address_review` was dispatched.
     async fn clear_address_review_dispatched(&self, store: &SharedStore, pr_number: u64) {
         let key = address_review_dispatched_key(pr_number);
         store.del(&key).await;
+        let at_key = address_review_dispatched_at_key(pr_number);
+        store.del(&at_key).await;
     }
 
     /// Return the PR head SHA that was last dispatched `/address_review` for,
@@ -3256,6 +3271,42 @@ impl VesselNode {
     ) {
         let key = address_review_dispatched_key(pr_number);
         store.set(&key, json!(head_sha)).await;
+    }
+
+    /// Return the timestamp when `/address_review` was last dispatched for a PR.
+    async fn get_address_review_dispatched_at(
+        store: &SharedStore,
+        pr_number: u64,
+    ) -> Option<String> {
+        let key = address_review_dispatched_at_key(pr_number);
+        store.get_typed::<String>(&key).await
+    }
+
+    /// Record the timestamp when `/address_review` was dispatched.
+    async fn set_address_review_dispatched_at(
+        &self,
+        store: &SharedStore,
+        pr_number: u64,
+        timestamp: &str,
+    ) {
+        let key = address_review_dispatched_at_key(pr_number);
+        store.set(&key, json!(timestamp)).await;
+    }
+
+    /// Retrieve rework evidence (last dispatched head SHA and dispatch timestamp) for a PR.
+    async fn get_rework_evidence(store: &SharedStore, pr_number: u64) -> Option<ReworkEvidence> {
+        let dispatched_sha = store
+            .get_typed::<String>(&address_review_dispatched_key(pr_number))
+            .await;
+        let dispatched_at = Self::get_address_review_dispatched_at(store, pr_number).await;
+        if dispatched_sha.is_some() || dispatched_at.is_some() {
+            Some(ReworkEvidence {
+                dispatched_sha,
+                dispatched_at,
+            })
+        } else {
+            None
+        }
     }
 
     /// Resolve the current head SHA of a PR from the `pending_prs` entry.

@@ -1688,6 +1688,8 @@ pub struct ReviewComment {
     pub user: Option<String>,
     #[serde(default)]
     pub commit_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 /// Input for an inline comment attached to a submitted review.
