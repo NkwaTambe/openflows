@@ -1681,6 +1681,26 @@ impl Node for VesselNode {
                     let tid = ticket_id
                         .clone()
                         .unwrap_or_else(|| format!("T-{}", pr_number));
+                    let current_head_sha = self.pending_pr_head_sha(store, *pr_number).await;
+                    let last_dispatched_sha = self
+                        .get_address_review_dispatched_sha(store, *pr_number)
+                        .await;
+
+                    // If FORGE pushed a new commit since the last /address_review dispatch,
+                    // previous feedback was addressed by the new commit. Reset the attempt counter.
+                    let head_changed = match (&current_head_sha, &last_dispatched_sha) {
+                        (Some(curr), Some(last)) => curr != last,
+                        _ => false,
+                    };
+                    if head_changed {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            "PR head changed since last review dispatch — resetting review attempt counter"
+                        );
+                        self.reset_address_review_attempts(store, *pr_number).await;
+                    }
+
                     let current_attempts =
                         self.get_address_review_attempts(store, *pr_number).await;
 
@@ -1710,6 +1730,25 @@ impl Node for VesselNode {
                         continue;
                     }
 
+                    // Dedup guard: if we already dispatched `/address_review` for
+                    // this exact PR head SHA, FORGE is still addressing it and has
+                    // not pushed new changes. Re-dispatching would overwhelm the
+                    // builder, so we do nothing and let it finish.
+                    let already_dispatched_for_head = match current_head_sha {
+                        Some(ref sha) => last_dispatched_sha.as_deref() == Some(sha.as_str()),
+                        None => false,
+                    };
+                    if already_dispatched_for_head {
+                        info!(
+                            pr_number,
+                            ticket_id = %tid,
+                            head_sha = current_head_sha.as_deref().unwrap_or(""),
+                            "Already dispatched /address_review for this head — waiting for FORGE to finish"
+                        );
+                        self.remove_from_pending_prs(store, *pr_number).await;
+                        continue;
+                    }
+
                     if current_attempts >= MAX_ADDRESS_REVIEW_ATTEMPTS {
                         warn!(
                             pr_number,
@@ -1728,31 +1767,6 @@ impl Node for VesselNode {
                         .await;
                         self.remove_from_pending_prs(store, *pr_number).await;
                         any_awaiting_human = true;
-                        continue;
-                    }
-
-                    // Dedup guard: if we already dispatched `/address_review` for
-                    // this exact PR head SHA, FORGE is still addressing it and has
-                    // not pushed new changes. Re-dispatching would overwhelm the
-                    // builder, so we do nothing and let it finish.
-                    let current_head_sha = self.pending_pr_head_sha(store, *pr_number).await;
-                    let already_dispatched_for_head = match current_head_sha {
-                        Some(ref sha) => {
-                            self.get_address_review_dispatched_sha(store, *pr_number)
-                                .await
-                                .as_deref()
-                                == Some(sha.as_str())
-                        }
-                        None => false,
-                    };
-                    if already_dispatched_for_head {
-                        info!(
-                            pr_number,
-                            ticket_id = %tid,
-                            head_sha = current_head_sha.as_deref().unwrap_or(""),
-                            "Already dispatched /address_review for this head — waiting for FORGE to finish"
-                        );
-                        self.remove_from_pending_prs(store, *pr_number).await;
                         continue;
                     }
 
@@ -2631,6 +2645,28 @@ impl VesselNode {
                 )
                 .await?;
         }
+        self.reset_address_review_attempts(store, pr_number).await;
+        self.clear_address_review_dispatched(store, pr_number).await;
+
+        let mut tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+        let mut modified = false;
+        for t in tickets.iter_mut() {
+            if t.id == ticket && matches!(t.status, TicketStatus::AwaitingHuman { .. }) {
+                info!(
+                    ticket_id = ticket,
+                    pr_number,
+                    "Clearing AwaitingHuman status on ticket following authorized GitHub approval"
+                );
+                t.status = TicketStatus::InProgress {
+                    worker_id: "vessel".to_string(),
+                };
+                modified = true;
+            }
+        }
+        if modified {
+            store.set(KEY_TICKETS, json!(tickets)).await;
+        }
+
         info!(
             pr_number,
             ticket,
@@ -3185,6 +3221,18 @@ impl VesselNode {
     async fn get_address_review_attempts(&self, store: &SharedStore, pr_number: u64) -> u32 {
         let key = format!("_address_review_attempts_{}", pr_number);
         store.get_typed::<u32>(&key).await.unwrap_or(0)
+    }
+
+    /// Reset the `/address_review` dispatch counter for a PR.
+    async fn reset_address_review_attempts(&self, store: &SharedStore, pr_number: u64) {
+        let key = format!("_address_review_attempts_{}", pr_number);
+        store.set(&key, json!(0)).await;
+    }
+
+    /// Clear the PR head SHA for which `/address_review` was dispatched.
+    async fn clear_address_review_dispatched(&self, store: &SharedStore, pr_number: u64) {
+        let key = address_review_dispatched_key(pr_number);
+        store.del(&key).await;
     }
 
     /// Return the PR head SHA that was last dispatched `/address_review` for,
@@ -3855,11 +3903,49 @@ mod tests {
             r#"[{"state":"APPROVED","user":{"login":"alice"},"author_association":"COLLABORATOR","commit_id":"head","submitted_at":"2026-10-05T00:00:00Z","body":"LGTM"}]"#,
         )
         .await;
+        store
+            .set(
+                KEY_TICKETS,
+                json!([{
+                    "id": "T-42",
+                    "title": "Task",
+                    "body": "Fix",
+                    "priority": 1,
+                    "branch": null,
+                    "status": {
+                        "type": "awaiting_human",
+                        "worker_id": "vessel",
+                        "reason": "review limit",
+                        "attempts": 3
+                    },
+                    "attempts": 1
+                }]),
+            )
+            .await;
+        store.set("_address_review_attempts_42", json!(3)).await;
+        store
+            .set(&address_review_dispatched_key(42), json!("old_sha"))
+            .await;
+
         assert!(!store.lifecycle("T-42").await.unwrap().merge_ready("head"));
 
         assert!(
             run_reconcile(&node, &store).await,
             "GitHub-approved PR should be reconciled"
+        );
+
+        let attempts: u32 = store
+            .get_typed("_address_review_attempts_42")
+            .await
+            .unwrap_or(99);
+        assert_eq!(attempts, 0, "review attempts must be reset upon approval");
+        let dispatched = store.get(&address_review_dispatched_key(42)).await;
+        assert!(dispatched.is_none(), "dispatch key must be cleared");
+
+        let tickets: Vec<Ticket> = store.get_typed(KEY_TICKETS).await.unwrap();
+        assert!(
+            matches!(tickets[0].status, TicketStatus::InProgress { .. }),
+            "AwaitingHuman ticket status must be cleared to InProgress"
         );
 
         let after = store.lifecycle("T-42").await.unwrap();

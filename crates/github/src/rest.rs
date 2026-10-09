@@ -1686,6 +1686,8 @@ pub struct ReviewComment {
     pub body: String,
     #[serde(default, deserialize_with = "deserialize_optional_login")]
     pub user: Option<String>,
+    #[serde(default)]
+    pub commit_id: Option<String>,
 }
 
 /// Input for an inline comment attached to a submitted review.

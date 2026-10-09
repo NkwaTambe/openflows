@@ -5,7 +5,7 @@
 // ready_for_merge) and computes the rework directive to dispatch to FORGE.
 
 use anyhow::Result;
-use github::{effective_review_state, PrReviewState};
+use github::{effective_review_state, latest_review_per_user, PrReviewState};
 use pocketflow_core::{CiStatus, PrInfo};
 use tracing::{debug, warn};
 
@@ -150,15 +150,39 @@ pub async fn classify(
         }
     };
 
-    // v1 heuristic: comments are "unaddressed" when there are any and the PR
-    // is not yet approved. Refinable later (e.g. compare to last review_ready).
-    let has_unaddressed_comments = !comments.is_empty() && review_state != PrReviewState::Approved;
+    // If review_state is ChangesRequested, verify whether any reviewer currently has
+    // ChangesRequested on the candidate head commit. If a change request was submitted
+    // on an older commit, FORGE has already pushed a new commit (pr_info.head_sha) to address
+    // it. That new commit is not yet approved (so it cannot merge), but it also must not
+    // trigger rework back to FORGE without a fresh review on the new commit.
+    let effective_review = if review_state == PrReviewState::ChangesRequested {
+        let has_changes_requested_on_head = latest_review_per_user(&reviews).iter().any(|r| {
+            r.state_enum() == PrReviewState::ChangesRequested
+                && (r.commit_id.as_deref() == Some(&pr_info.head_sha) || r.commit_id.is_none())
+        });
+        if has_changes_requested_on_head {
+            PrReviewState::ChangesRequested
+        } else {
+            PrReviewState::None
+        }
+    } else {
+        review_state
+    };
+
+    // Comments are "unaddressed" when there are comments submitted against the candidate head
+    // (or without a commit_id specified) and the PR is not yet approved. Comments on older commits
+    // have been addressed by the new commit.
+    let has_unaddressed_comments = !comments.is_empty()
+        && comments
+            .iter()
+            .any(|c| c.commit_id.as_deref() == Some(&pr_info.head_sha) || c.commit_id.is_none())
+        && effective_review != PrReviewState::Approved;
 
     debug!(
         pr = pr_info.number,
         mergeable = ?pr_info.mergeable,
         ci = ?ci_status,
-        review_state = ?review_state,
+        review_state = ?effective_review,
         comments = comments.len(),
         "PR lifecycle classification inputs"
     );
@@ -166,7 +190,7 @@ pub async fn classify(
     Ok(classify_from_parts(
         pr_info.mergeable,
         ci_status,
-        review_state,
+        effective_review,
         has_unaddressed_comments,
     ))
 }
@@ -218,6 +242,7 @@ pub fn build_directive(state: PrMonitorState, pr_number: u64, reason: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pocketflow_core::PrState;
 
     #[test]
     fn classify_priority_conflicts_first() {
@@ -382,5 +407,42 @@ mod tests {
         assert!(d.contains("state: conflicts"));
         // Conflicted files are intentionally NOT embedded — FORGE fetches them.
         assert!(!d.contains("Conflicts:"));
+    }
+
+    #[tokio::test]
+    async fn classify_stale_changes_requested_on_older_commit_is_needs_review() {
+        let mut server = mockito::Server::new_async().await;
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"alice","id":100},"body":"Fix this","state":"CHANGES_REQUESTED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"commit_old","author_association":"MEMBER"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body("[]")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "commit_new".to_string(),
+            head_branch: "feature".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feature".to_string(),
+            body: None,
+            state: PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+
+        let state = classify(&client, "org", "repo", &pr_info, CiStatus::Success)
+            .await
+            .unwrap();
+        assert_eq!(state, PrMonitorState::NeedsReview);
     }
 }

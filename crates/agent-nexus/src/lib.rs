@@ -502,20 +502,60 @@ Before significant work, read the relevant skill file to understand the workflow
                     }
 
                     // A PR whose ticket has been escalated to a human must not be
-                    // re-added to automatic processing, even if a stale
-                    // /address_review dispatch marker is still present. VESSEL
-                    // leaves the marker set after exhausting its review attempts,
-                    // so without this guard the next discovery pass would put the
-                    // PR back into the polling loop.
+                    // re-added to automatic processing unless human intervention
+                    // has occurred on GitHub (an approved review or a new commit).
                     let ticket = tickets.iter().find(|t| t.id == *tid);
                     if let Some(ticket) = ticket {
                         if matches!(ticket.status, TicketStatus::AwaitingHuman { .. }) {
+                            // Check if a human has intervened on GitHub:
+                            // 1. An authorized approval was submitted on GitHub, OR
+                            // 2. A new commit was pushed to the PR branch.
+                            let reviews = client
+                                .list_pr_reviews(owner, repo_name, pr.number)
+                                .await
+                                .unwrap_or_default();
+                            let is_approved = github::effective_review_state(&reviews)
+                                == github::PrReviewState::Approved;
+                            let last_sha = store
+                                .get_typed::<String>(&address_review_dispatched_key(pr.number))
+                                .await;
+                            let head_changed =
+                                last_sha.as_deref().is_some_and(|sha| sha != pr.head_sha);
+
+                            if !is_approved && !head_changed {
+                                info!(
+                                    pr_number = pr.number,
+                                    ticket_id = %tid,
+                                    "Skipping re-add of PR for ticket awaiting human intervention"
+                                );
+                                continue;
+                            }
+
                             info!(
                                 pr_number = pr.number,
                                 ticket_id = %tid,
-                                "Skipping re-add of PR for ticket awaiting human intervention"
+                                is_approved,
+                                head_changed,
+                                "Human intervention detected on PR for ticket previously awaiting human — resuming PR"
                             );
-                            continue;
+
+                            // Unblock ticket status in KEY_TICKETS so NEXUS active ticket polling and SENTINEL resume
+                            let mut tickets_copy: Vec<Ticket> =
+                                store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                            let mut updated = false;
+                            for t in tickets_copy.iter_mut() {
+                                if t.id == *tid
+                                    && matches!(t.status, TicketStatus::AwaitingHuman { .. })
+                                {
+                                    t.status = TicketStatus::InProgress {
+                                        worker_id: "vessel".to_string(),
+                                    };
+                                    updated = true;
+                                }
+                            }
+                            if updated {
+                                store.set(KEY_TICKETS, json!(tickets_copy)).await;
+                            }
                         }
                     }
 
