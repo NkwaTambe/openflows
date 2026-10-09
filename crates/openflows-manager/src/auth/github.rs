@@ -27,7 +27,7 @@ pub const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token"
 pub const GITHUB_USER_URL: &str = "https://api.github.com/user";
 
 /// The result of exchanging an authorization code for a user access token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserToken {
     /// The short-lived user access token (`ghu_...`).
     pub access_token: String,
@@ -88,19 +88,28 @@ pub struct RealGithubAuth {
     client_secret: String,
     api_base: String,
     timeout: Duration,
+    redirect_uri: Option<String>,
 }
 
 impl RealGithubAuth {
+    pub fn with_redirect_uri(mut self, uri: String) -> Self {
+        self.redirect_uri = Some(uri);
+        self
+    }
+
     pub fn new(client_id: String, client_secret: String, api_base: String) -> Self {
         RealGithubAuth {
             client: reqwest::Client::builder()
                 .user_agent("openflows-manager")
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("failed to build http client"),
             client_id,
             client_secret,
             api_base,
             timeout: Duration::from_secs(10),
+            redirect_uri: None,
         }
     }
 }
@@ -110,7 +119,7 @@ impl GithubAuth for RealGithubAuth {
     fn authorize_url(&self, req: &AuthorizeRequest) -> String {
         // PKCE S256 (RFC 7636). GitHub requires S256; `plain` is rejected.
         format!(
-            "{GITHUB_AUTHORIZE_URL}?client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope=offline_access",
+            "{GITHUB_AUTHORIZE_URL}?client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&prompt=select_account",
             urlencode(&req.client_id),
             urlencode(&req.redirect_uri),
             urlencode(&req.state),
@@ -119,13 +128,15 @@ impl GithubAuth for RealGithubAuth {
     }
 
     async fn exchange_code(&self, code: &str, verifier: &str) -> Result<UserToken, ManagerError> {
-        let params = [
+        let mut params = vec![
             ("client_id", self.client_id.clone()),
             ("client_secret", self.client_secret.clone()),
             ("code", code.to_string()),
             ("code_verifier", verifier.to_string()),
-            ("redirect_uri", "".to_string()),
         ];
+        if let Some(uri) = &self.redirect_uri {
+            params.push(("redirect_uri", uri.clone()));
+        }
         let resp = tokio::time::timeout(
             self.timeout,
             self.client
@@ -144,10 +155,10 @@ impl GithubAuth for RealGithubAuth {
             .await
             .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid token response")))?;
 
-        if let Some(err) = body.error {
+        if body.error.is_some() {
             return Err(ManagerError::api(
                 "GITHUB_OAUTH_ERROR",
-                format!("GitHub authorization failed: {err}"),
+                "GitHub authorization failed",
             ));
         }
         if !status.is_success() {
@@ -196,6 +207,14 @@ impl GithubAuth for RealGithubAuth {
     }
 
     async fn resolve_login(&self, login: &str) -> Result<GithubUserLookup, ManagerError> {
+        if login.is_empty()
+            || login.len() > 39
+            || !login
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(ManagerError::InvalidInput("invalid GitHub login".into()));
+        }
         let resp = tokio::time::timeout(
             self.timeout,
             self.client
@@ -247,6 +266,12 @@ struct GithubUserResponse {
 fn urlencode(s: &str) -> String {
     use url::form_urlencoded::byte_serialize;
     byte_serialize(s.as_bytes()).collect()
+}
+
+impl std::fmt::Debug for UserToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UserToken([REDACTED])")
+    }
 }
 
 #[cfg(test)]

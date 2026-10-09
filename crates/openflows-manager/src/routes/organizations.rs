@@ -77,7 +77,8 @@ pub async fn require_csrf_for_browser(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    csrf::validate(&presented, &cookie)
+    csrf::validate(&presented, &cookie)?;
+    csrf::validate_session(headers, &presented)
 }
 
 fn request_id(headers: &HeaderMap) -> String {
@@ -92,8 +93,6 @@ fn request_id(headers: &HeaderMap) -> String {
 pub struct CreateOrgRequest {
     pub slug: String,
     pub display_name: String,
-    #[serde(rename = "Idempotency-Key")]
-    pub idempotency_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -114,10 +113,7 @@ pub async fn create_org(
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
     let principal = authenticated_user(&headers, &services.session_manager).await?;
     require_csrf_for_browser(&principal, &headers).await?;
-    let key = body
-        .idempotency_key
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let key = idempotency_key(&headers)?;
 
     let result = services
         .orgs_service
@@ -145,14 +141,52 @@ pub async fn create_org(
 pub async fn list_orgs(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<MembersQuery>,
 ) -> Result<Json<serde_json::Value>, ManagerError> {
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
     let principal = authenticated_user(&headers, &services.session_manager).await?;
-    let memberships = services.orgs_service.list_orgs(principal.user_id).await?;
+    let limit = crate::pagination::PageLimit::new(q.limit);
+    let after = q
+        .after
+        .as_deref()
+        .map(crate::pagination::Cursor::decode)
+        .transpose()?
+        .map(|c| {
+            c.tiebreaker
+                .parse::<uuid::Uuid>()
+                .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))
+        })
+        .transpose()?;
+    let rows: Vec<(uuid::Uuid, String, String, String, String)> = sqlx::query_as(
+        "SELECT o.id,o.slug,o.display_name,m.role,o.status FROM organizations o
+         JOIN memberships m ON m.organization_id=o.id
+         WHERE m.user_id=$1 AND m.status='active' AND o.status <> 'deleted'
+           AND ($2::uuid IS NULL OR o.id>$2) ORDER BY o.id LIMIT $3",
+    )
+    .bind(principal.user_id.0)
+    .bind(after)
+    .bind(i64::from(limit.get()) + 1)
+    .fetch_all(services.db.pool())
+    .await
+    .map_err(ManagerError::from)?;
+    let more = rows.len() > limit.get() as usize;
+    let items: Vec<_> = rows.into_iter().take(limit.get() as usize).map(|(id,slug,display_name,role,status)|
+        serde_json::json!({"organization_id":id,"slug":slug,"display_name":display_name,"role":role,"status":status})).collect();
+    let next_cursor = if more {
+        items.last().map(|v| {
+            crate::pagination::cursor_for(
+                chrono::DateTime::UNIX_EPOCH,
+                v["organization_id"].as_str().unwrap(),
+            )
+            .encode()
+        })
+    } else {
+        None
+    };
     Ok(Json(
-        serde_json::json!({ "items": memberships, "next_cursor": null }),
+        serde_json::json!({"items":items,"next_cursor":next_cursor}),
     ))
 }
 
@@ -222,7 +256,7 @@ pub async fn list_members(
         .list_members(principal.user_id, org_id, limit, q.after)
         .await?;
     Ok(Json(
-        serde_json::json!({ "items": items, "next_cursor": null }),
+        serde_json::to_value(items).map_err(|e| ManagerError::Service(e.into()))?,
     ))
 }
 
@@ -244,7 +278,7 @@ pub async fn update_member(
     headers: HeaderMap,
     Path((org, user)): Path<(String, String)>,
     Json(body): Json<UpdateMemberRequest>,
-) -> Result<StatusCode, ManagerError> {
+) -> Result<Json<crate::dto::MembershipDto>, ManagerError> {
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
@@ -264,7 +298,7 @@ pub async fn update_member(
         .map(|s| s.parse::<crate::dto::MembershipStatus>())
         .transpose()
         .map_err(|_| ManagerError::InvalidInput("invalid status".into()))?;
-    services
+    let member = services
         .orgs_service
         .update_member(
             principal.user_id,
@@ -275,7 +309,7 @@ pub async fn update_member(
             &request_id(&headers),
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(member))
 }
 
 /// `DELETE /organizations/{org}/members/{user}` — remove a member (admin only).
@@ -307,7 +341,7 @@ pub struct CreateInvitationRequest {
 #[derive(Serialize)]
 pub struct InvitationResponse {
     pub invitation_id: String,
-    pub invitation_url: String,
+    pub invitation_url: Option<String>,
     pub expires_in_seconds: i64,
 }
 
@@ -328,21 +362,24 @@ pub async fn create_invitation(
         .role
         .parse::<crate::dto::MembershipRole>()
         .map_err(|_| ManagerError::InvalidInput("invalid role".into()))?;
+    let key = idempotency_key(&headers)?;
     let (id, raw_token) = services
         .orgs_service
-        .create_invitation(
+        .create_invitation_idempotent(
             principal.user_id,
             org_id,
             &body.github_login,
             role,
             services.github.as_ref(),
+            &key,
             &request_id(&headers),
         )
         .await?;
     let public_url = services.auth_config.public_url.clone();
     Ok(Json(InvitationResponse {
         invitation_id: id.to_string(),
-        invitation_url: format!("{public_url}/invitations/accept?token={raw_token}"),
+        invitation_url: raw_token
+            .map(|token| format!("{public_url}/invitations/accept?token={token}")),
         expires_in_seconds: 7 * 24 * 3600,
     }))
 }
@@ -393,12 +430,6 @@ pub async fn transfer_ownership(
     require_csrf_for_browser(&principal, &headers).await?;
     let org_id = parse_org(&org)?;
     let new_owner = parse_user(&body.new_owner_user_id)?;
-    if !principal.is_browser {
-        return Err(ManagerError::api(
-            "REAUTH_REQUIRED",
-            "ownership transfer requires a browser session with recent authentication",
-        ));
-    }
     let has_recent_auth = services
         .session_manager
         .has_recent_auth(principal.session_id)
@@ -429,23 +460,19 @@ pub async fn delete_org(
     let principal = authenticated_user(&headers, &services.session_manager).await?;
     require_csrf_for_browser(&principal, &headers).await?;
     let org_id = parse_org(&org)?;
-    if !principal.is_browser {
-        return Err(ManagerError::api(
-            "REAUTH_REQUIRED",
-            "organization deletion requires a browser session with recent authentication",
-        ));
-    }
     let has_recent_auth = services
         .session_manager
         .has_recent_auth(principal.session_id)
         .await?
         .unwrap_or(false);
+    let key = idempotency_key(&headers)?;
     let op_id = services
         .orgs_service
-        .request_deletion(
+        .request_deletion_idempotent(
             principal.user_id,
             org_id,
             has_recent_auth,
+            &key,
             &request_id(&headers),
         )
         .await?;
@@ -487,9 +514,10 @@ pub async fn get_operation(
 
     // Resolve the operation's organization and require the caller be an active
     // member of it before returning any status.
-    let op_rec = crate::operations::get_scoped_any(&services.orgs_service.pool, op_id)
-        .await?
-        .ok_or_else(|| ManagerError::not_found("operation"))?;
+    let op_rec =
+        crate::operations::get_for_user(&services.orgs_service.pool, op_id, principal.user_id)
+            .await?
+            .ok_or_else(|| ManagerError::not_found("operation"))?;
 
     let org_id = crate::id::OrganizationId::from_uuid(op_rec.organization_id);
     let (membership, org_state) = services
@@ -507,4 +535,15 @@ pub async fn get_operation(
         "attempt_count": op_rec.attempt_count,
         "error_code": op_rec.error_code,
     })))
+}
+
+pub fn idempotency_key(headers: &HeaderMap) -> Result<String, ManagerError> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty() && s.len() <= 255)
+        .ok_or_else(|| {
+            ManagerError::InvalidInput("Idempotency-Key header is required (1-255 bytes)".into())
+        })?;
+    Ok(key.to_string())
 }

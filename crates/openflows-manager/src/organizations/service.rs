@@ -130,6 +130,16 @@ impl OrganizationService {
                 let idempotency_key = idempotency_key.clone();
                 let request_id = request_id.clone();
                 Box::pin(async move {
+                    let active: Option<uuid::Uuid> = sqlx::query_scalar(
+                        "SELECT id FROM users WHERE id=$1 AND status='active' FOR SHARE",
+                    )
+                    .bind(actor.0)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(ManagerError::from)?;
+                    if active.is_none() {
+                        return Err(ManagerError::api("UNAUTHORIZED", "active user required"));
+                    }
                     // Organization (status provisioning) + owner/admin membership.
                     let result = sqlx::query(
                         "INSERT INTO organizations
@@ -185,7 +195,7 @@ impl OrganizationService {
                     crate::outbox::insert_in_tx(
                         conn,
                         Some(org_id),
-                        "org.provisioned",
+                        "org.provision_requested",
                         Some(&json!({"organization_id": org_id.to_string()})),
                     )
                     .await?;
@@ -247,10 +257,10 @@ impl OrganizationService {
         if let Some(name) = display_name {
             validate_display_name(name)?;
         }
-        let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let (membership, org_state) = self.repo.lock_policy(&mut tx, org_id, caller).await?;
         Policy::require_admin(membership.as_ref(), org_state.as_ref())?;
 
-        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
         if let Some(name) = display_name {
             sqlx::query(
                 "UPDATE organizations SET display_name = $1, updated_at = now() WHERE id = $2",
@@ -282,13 +292,15 @@ impl OrganizationService {
         org_id: OrganizationId,
         limit: PageLimit,
         after_user: Option<String>,
-    ) -> Result<Vec<serde_json::Value>, ManagerError> {
+    ) -> Result<crate::pagination::Page<serde_json::Value>, ManagerError> {
         let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
         Policy::require_member(membership.as_ref(), org_state.as_ref())?;
         let scope = OrgScope::new(org_id);
         let after = match after_user {
             Some(a) => Some(
-                a.parse::<uuid::Uuid>()
+                crate::pagination::Cursor::decode(&a)?
+                    .tiebreaker
+                    .parse::<uuid::Uuid>()
                     .map_err(|_| ManagerError::InvalidInput("malformed cursor".into()))?,
             ),
             None => None,
@@ -310,8 +322,18 @@ impl OrganizationService {
                 })
             })
             .collect();
-        let _ = has_more;
-        Ok(items)
+        let next_cursor = if has_more {
+            items.last().map(|v| {
+                crate::pagination::cursor_for(
+                    chrono::DateTime::UNIX_EPOCH,
+                    v["user_id"].as_str().expect("member id"),
+                )
+                .encode()
+            })
+        } else {
+            None
+        };
+        Ok(crate::pagination::Page { items, next_cursor })
     }
 
     /// Update a member's role/status (admin only).
@@ -323,8 +345,9 @@ impl OrganizationService {
         role: Option<MembershipRole>,
         status: Option<MembershipStatus>,
         request_id: &str,
-    ) -> Result<(), ManagerError> {
-        let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
+    ) -> Result<MembershipDto, ManagerError> {
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let (membership, org_state) = self.repo.lock_policy(&mut tx, org_id, caller).await?;
         Policy::require_admin(membership.as_ref(), org_state.as_ref())?;
 
         // Read the target's current role/status to compute the transition.
@@ -333,9 +356,10 @@ impl OrganizationService {
         )
         .bind(org_id.0)
         .bind(target.0)
-        .fetch_one(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|_| ManagerError::not_found("member"))?;
+        .map_err(ManagerError::from)?
+        .ok_or_else(|| ManagerError::not_found("member"))?;
 
         let new_role = role.unwrap_or_else(|| {
             current
@@ -352,13 +376,9 @@ impl OrganizationService {
 
         let scope = OrgScope::new(org_id);
         self.repo
-            .update_member(scope, target, new_role, new_status)
+            .update_member_in_tx(&mut tx, scope, target, new_role, new_status)
             .await?;
 
-        // Audit after the mutation (outside the locked tx is fine; the audit
-        // itself is idempotent-ish and best-effort here, but to keep it atomic
-        // we do it in a fresh transaction).
-        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
         audit::insert_in_tx(
             &mut tx,
             &AuditEvent::new("member.update")
@@ -369,7 +389,11 @@ impl OrganizationService {
         )
         .await?;
         tx.commit().await.map_err(ManagerError::from)?;
-        Ok(())
+        Ok(MembershipDto {
+            organization_id: org_id,
+            role: new_role,
+            status: new_status,
+        })
     }
 
     /// Remove a member (admin only).
@@ -389,6 +413,7 @@ impl OrganizationService {
             request_id,
         )
         .await
+        .map(|_| ())
     }
 
     /// Create an invitation (admin only). Resolves the invited GitHub login to
@@ -412,12 +437,21 @@ impl OrganizationService {
         let token = crate::auth::crypto::Secret::generate();
         let token_hash = token.hash();
 
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let (membership, org_state) = self.repo.lock_policy(&mut tx, org_id, caller).await?;
+        Policy::require_admin(membership.as_ref(), org_state.as_ref())?;
         let id = self
             .repo
-            .create_invitation(OrgScope::new(org_id), lookup.id, role, &token_hash, caller)
+            .create_invitation_in_tx(
+                &mut tx,
+                OrgScope::new(org_id),
+                lookup.id,
+                role,
+                &token_hash,
+                caller,
+            )
             .await?;
 
-        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
         audit::insert_in_tx(
             &mut tx,
             &AuditEvent::new("invitation.create")
@@ -432,6 +466,76 @@ impl OrganizationService {
         Ok((id, token.encode()))
     }
 
+    /// Persist only the invitation reference for retries. The raw URL is
+    /// disclosed once; a lost response requires revocation and a new request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_invitation_idempotent(
+        &self,
+        caller: UserId,
+        org_id: OrganizationId,
+        github_login: &str,
+        role: MembershipRole,
+        github: &dyn crate::auth::github::GithubAuth,
+        key: &str,
+        request_id: &str,
+    ) -> Result<(InvitationId, Option<String>), ManagerError> {
+        let (member, org) = self.repo.membership_and_org(org_id, caller).await?;
+        Policy::require_admin(member.as_ref(), org.as_ref())?;
+        let lookup = github.resolve_login(github_login).await?;
+        let req = crate::idempotency::IdempotencyRequest {
+            actor_id: caller,
+            organization_id: org_id,
+            route: "POST /organizations/invitations".into(),
+            key: key.into(),
+            request_hash: IdempotencyRequestHash::of(
+                &json!({"login":github_login.to_ascii_lowercase(),"role":role}),
+            )?,
+        };
+        let token = crate::auth::crypto::Secret::generate();
+        let hash = token.hash();
+        let repo = self.repo.clone();
+        let request_id = request_id.to_string();
+        let result = self
+            .idempotency
+            .execute(&req, move |conn| {
+                Box::pin(async move {
+                    let (member, org) = repo.lock_policy(conn, org_id, caller).await?;
+                    Policy::require_admin(member.as_ref(), org.as_ref())?;
+                    let id = repo
+                        .create_invitation_in_tx(
+                            conn,
+                            OrgScope::new(org_id),
+                            lookup.id,
+                            role,
+                            &hash,
+                            caller,
+                        )
+                        .await?;
+                    audit::insert(
+                        &mut *conn,
+                        &AuditEvent::new("invitation.create")
+                            .organization(org_id)
+                            .actor(caller)
+                            .resource("invitation", id.0)
+                            .request_id(request_id),
+                    )
+                    .await?;
+                    Ok(id.to_string())
+                })
+            })
+            .await?;
+        let (reference, raw) = match result {
+            IdempotencyOutcome::New { response_reference } => {
+                (response_reference, Some(token.encode()))
+            }
+            IdempotencyOutcome::Replay { response_reference } => (response_reference, None),
+        };
+        let id = reference
+            .parse()
+            .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid invitation reference")))?;
+        Ok((id, raw))
+    }
+
     /// Revoke an invitation (admin only).
     pub async fn revoke_invitation(
         &self,
@@ -440,16 +544,16 @@ impl OrganizationService {
         invitation_id: InvitationId,
         request_id: &str,
     ) -> Result<(), ManagerError> {
-        let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let (membership, org_state) = self.repo.lock_policy(&mut tx, org_id, caller).await?;
         Policy::require_admin(membership.as_ref(), org_state.as_ref())?;
         let revoked = self
             .repo
-            .revoke_invitation(OrgScope::new(org_id), invitation_id)
+            .revoke_invitation_in_tx(&mut tx, OrgScope::new(org_id), invitation_id)
             .await?;
         if !revoked {
             return Err(ManagerError::not_found("invitation"));
         }
-        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
         audit::insert_in_tx(
             &mut tx,
             &AuditEvent::new("invitation.revoke")
@@ -476,21 +580,16 @@ impl OrganizationService {
         let Some(inv) = self.repo.invitation_by_token(&token_hash).await? else {
             return Err(ManagerError::not_found("invitation"));
         };
-        // The organization must be in a state that accepts new members.
-        let org_state: (String,) = sqlx::query_as("SELECT status FROM organizations WHERE id = $1")
-            .bind(inv.organization_id.0)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| ManagerError::not_found("organization"))?;
-        if org_state.0 == "deleted" {
-            return Err(ManagerError::not_found("invitation"));
-        }
-
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let (_, state) = self
+            .repo
+            .lock_policy(&mut tx, inv.organization_id, caller)
+            .await?;
+        Policy::require_mutable(state.as_ref())?;
         self.repo
-            .accept_invitation(inv.id, github_user_id, caller)
+            .accept_invitation_in_tx(&mut tx, inv.id, github_user_id, caller)
             .await?;
 
-        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
         audit::insert_in_tx(
             &mut tx,
             &AuditEvent::new("invitation.accept")
@@ -519,14 +618,15 @@ impl OrganizationService {
                 "recent authentication (within 10 minutes) is required to transfer ownership",
             ));
         }
-        let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let (membership, org_state) = self.repo.lock_policy(&mut tx, org_id, caller).await?;
         Policy::require_owner(membership.as_ref(), org_state.as_ref())?;
+        Policy::require_mutable(org_state.as_ref())?;
 
         self.repo
-            .transfer_ownership(OrgScope::new(org_id), new_owner)
+            .transfer_ownership_in_tx(&mut tx, OrgScope::new(org_id), new_owner)
             .await?;
 
-        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
         audit::insert_in_tx(
             &mut tx,
             &AuditEvent::new("org.transfer_ownership")
@@ -555,21 +655,29 @@ impl OrganizationService {
                 "recent authentication (within 10 minutes) is required to delete the organization",
             ));
         }
-        let (membership, org_state) = self.repo.membership_and_org(org_id, caller).await?;
-        Policy::require_owner(membership.as_ref(), org_state.as_ref())?;
-
         let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
-        // Lock the org row, mark it deleting, and enqueue the deletion operation
-        // durably so a worker can complete teardown later.
-        let owner: Option<(uuid::Uuid,)> =
-            sqlx::query_as("SELECT owner_user_id FROM organizations WHERE id = $1 FOR UPDATE")
-                .bind(org_id.0)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(ManagerError::from)?;
-        if owner.is_none() {
-            return Err(ManagerError::not_found("organization"));
+        let id = self
+            .request_deletion_in_tx(&mut tx, caller, org_id, request_id)
+            .await?;
+        tx.commit().await.map_err(ManagerError::from)?;
+        Ok(id)
+    }
+
+    async fn request_deletion_in_tx(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        caller: UserId,
+        org_id: OrganizationId,
+        request_id: &str,
+    ) -> Result<OperationId, ManagerError> {
+        let (membership, org_state) = self.repo.lock_policy(tx, org_id, caller).await?;
+        Policy::require_owner(membership.as_ref(), org_state.as_ref())?;
+        if org_state.as_ref().is_some_and(|o| o.status == "deleting") {
+            let id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM operations WHERE organization_id=$1 AND kind='org.delete' ORDER BY created_at LIMIT 1")
+                .bind(org_id.0).fetch_one(&mut *tx).await.map_err(ManagerError::from)?;
+            return Ok(OperationId::from_uuid(id));
         }
+        Policy::require_mutable(org_state.as_ref())?;
         sqlx::query(
             "UPDATE organizations SET status = 'deleting', updated_at = now() WHERE id = $1",
         )
@@ -578,7 +686,7 @@ impl OrganizationService {
         .await
         .map_err(ManagerError::from)?;
         let op_id = operations::create_in_tx(
-            &mut tx,
+            &mut *tx,
             &operations::NewOperation {
                 organization_id: org_id,
                 resource_type: "organization".into(),
@@ -588,8 +696,8 @@ impl OrganizationService {
             },
         )
         .await?;
-        audit::insert_in_tx(
-            &mut tx,
+        audit::insert(
+            &mut *tx,
             &AuditEvent::new("org.delete_request")
                 .organization(org_id)
                 .actor(caller)
@@ -598,14 +706,57 @@ impl OrganizationService {
         )
         .await?;
         crate::outbox::insert_in_tx(
-            &mut tx,
+            &mut *tx,
             Some(org_id),
-            "org.deleted",
+            "org.deletion_requested",
             Some(&json!({"organization_id": org_id.to_string()})),
         )
         .await?;
-        tx.commit().await.map_err(ManagerError::from)?;
         Ok(op_id)
+    }
+    pub async fn request_deletion_idempotent(
+        &self,
+        caller: UserId,
+        org_id: OrganizationId,
+        recent: bool,
+        key: &str,
+        request_id: &str,
+    ) -> Result<OperationId, ManagerError> {
+        let (member, org) = self.repo.membership_and_org(org_id, caller).await?;
+        Policy::require_owner(member.as_ref(), org.as_ref())?;
+        if !recent {
+            return Err(ManagerError::api(
+                "REAUTH_REQUIRED",
+                "sign in again before deleting the organization",
+            ));
+        }
+        let req = crate::idempotency::IdempotencyRequest {
+            actor_id: caller,
+            organization_id: org_id,
+            route: "DELETE /organizations".into(),
+            key: key.into(),
+            request_hash: IdempotencyRequestHash::of(&json!({}))?,
+        };
+        let service = self.clone();
+        let request_id = request_id.to_string();
+        let outcome = self
+            .idempotency
+            .execute(&req, move |conn| {
+                Box::pin(async move {
+                    Ok(service
+                        .request_deletion_in_tx(conn, caller, org_id, &request_id)
+                        .await?
+                        .to_string())
+                })
+            })
+            .await?;
+        let reference = match outcome {
+            IdempotencyOutcome::New { response_reference }
+            | IdempotencyOutcome::Replay { response_reference } => response_reference,
+        };
+        reference
+            .parse()
+            .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid operation reference")))
     }
 }
 

@@ -56,7 +56,12 @@ impl UsersRepository {
         display_name: &str,
     ) -> Result<(UserId, bool), ManagerError> {
         let mut tx = pool.begin().await.map_err(ManagerError::from)?;
-        // Lock the identity row to serialize concurrent first-logins.
+        // Serialize even when the identity row does not exist yet.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("identity:{provider}:{subject}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(ManagerError::from)?;
         let existing: Option<Uuid> = sqlx::query_scalar(
             "SELECT user_id FROM identities WHERE provider = $1 AND subject = $2 FOR UPDATE",
         )
@@ -216,12 +221,8 @@ impl AuthTransactionRepository {
         let row = sqlx::query_as::<_, (Uuid, Option<Vec<u8>>, Option<i32>)>(
             "UPDATE auth_transactions
                 SET consumed_at = now()
-              WHERE id = (
-                    SELECT id FROM auth_transactions
-                     WHERE state_hash = $1 AND purpose = 'login'
-                       AND consumed_at IS NULL AND expires_at > now()
-                     FOR UPDATE
-              )
+              WHERE state_hash = $1 AND purpose = 'login'
+                AND consumed_at IS NULL AND expires_at > clock_timestamp()
               RETURNING id, encrypted_pkce_verifier, pkce_key_version",
         )
         .bind(state_hash)
@@ -263,7 +264,7 @@ pub struct SessionsRepository {
 
 /// A freshly-created session credential pair, returned to the client exactly
 /// once. Only the hashes are persisted.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionCredentials {
     pub session_id: SessionId,
     pub family_id: Uuid,
@@ -365,6 +366,52 @@ impl SessionsRepository {
         })
     }
 
+    /// Create a CLI session in the device-consumption transaction.
+    pub async fn create_cli_session_in_tx(
+        &self,
+        conn: &mut PgConnection,
+        user_id: UserId,
+    ) -> Result<SessionCredentials, ManagerError> {
+        let access = crate::auth::crypto::Secret::generate();
+        let refresh = crate::auth::crypto::Secret::generate();
+        let now = Utc::now();
+        let creds = SessionCredentials {
+            session_id: SessionId::new(),
+            family_id: Uuid::new_v4(),
+            access_token: access.encode(),
+            refresh_token: refresh.encode(),
+            access_expires_at: now + Self::ACCESS_LIFETIME,
+            refresh_expires_at: now + Self::REFRESH_LIFETIME,
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO sessions (id,user_id,kind,access_hash,access_expires_at,
+             refresh_hash,refresh_expires_at,family_id,last_authenticated_at)
+             SELECT $1,id,'cli',$3,$4,$5,$6,$7,clock_timestamp()
+             FROM users WHERE id=$2 AND status='active'",
+        )
+        .bind(creds.session_id.0)
+        .bind(user_id.0)
+        .bind(access.hash())
+        .bind(creds.access_expires_at)
+        .bind(refresh.hash())
+        .bind(creds.refresh_expires_at)
+        .bind(creds.family_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(ManagerError::from)?;
+        if inserted.rows_affected() != 1 {
+            return Err(ManagerError::api("UNAUTHORIZED", "user is not active"));
+        }
+        crate::audit::insert(
+            &mut *conn,
+            &crate::audit::AuditEvent::new("auth.cli_session_created")
+                .actor(user_id)
+                .resource("session", creds.session_id.0),
+        )
+        .await?;
+        Ok(creds)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn insert_session(
         &self,
@@ -378,11 +425,13 @@ impl SessionsRepository {
         refresh_expires: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<(), ManagerError> {
-        sqlx::query(
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let inserted = sqlx::query(
             "INSERT INTO sessions
                 (id, user_id, kind, access_hash, access_expires_at, refresh_hash,
                  refresh_expires_at, family_id, last_authenticated_at, last_used_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
+             SELECT $1, id, $3, $4, $5, $6, $7, $8, $9, $9
+             FROM users WHERE id = $2 AND status = 'active'",
         )
         .bind(session_id.0)
         .bind(user_id.0)
@@ -393,9 +442,20 @@ impl SessionsRepository {
         .bind(refresh_expires)
         .bind(family_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ManagerError::from)?;
+        if inserted.rows_affected() != 1 {
+            return Err(ManagerError::api("UNAUTHORIZED", "user is not active"));
+        }
+        crate::audit::insert(
+            &mut *tx,
+            &crate::audit::AuditEvent::new("auth.session_created")
+                .actor(user_id)
+                .resource("session", session_id.0),
+        )
+        .await?;
+        tx.commit().await.map_err(ManagerError::from)?;
         Ok(())
     }
 
@@ -411,6 +471,7 @@ impl SessionsRepository {
                FROM sessions s
                JOIN users u ON u.id = s.user_id
               WHERE s.access_hash = $1 AND s.kind = 'browser'
+                AND s.created_at + interval '12 hours' > clock_timestamp()
                 AND s.revoked_at IS NULL
                 AND s.access_expires_at > now()
                 AND u.status = 'active'",
@@ -441,6 +502,7 @@ impl SessionsRepository {
                FROM sessions s
                JOIN users u ON u.id = s.user_id
               WHERE s.access_hash = $1 AND s.kind = 'cli'
+                AND s.created_at + interval '30 days' > clock_timestamp()
                 AND s.revoked_at IS NULL
                 AND s.access_expires_at > now()
                 AND u.status = 'active'",
@@ -472,6 +534,14 @@ impl SessionsRepository {
     ) -> Result<Option<SessionCredentials>, ManagerError> {
         let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
 
+        // Serialize equal-token attempts before checking history. The losing
+        // concurrent rotation must see the winner's consumed credential.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("refresh:{refresh_hash}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(ManagerError::from)?;
+
         // Detect reuse: has this refresh credential been consumed before?
         let reused: Option<(Uuid,)> =
             sqlx::query_as("SELECT family_id FROM refresh_history WHERE refresh_hash = $1")
@@ -483,6 +553,13 @@ impl SessionsRepository {
         if let Some((family,)) = reused {
             // Reuse of a consumed refresh credential revokes the family.
             self.revoke_family_in_tx(&mut tx, family).await?;
+            crate::audit::insert(
+                &mut *tx,
+                &crate::audit::AuditEvent::new("auth.refresh_reuse")
+                    .resource("session_family", family)
+                    .result(crate::audit::AuditResult::Denied),
+            )
+            .await?;
             tx.commit().await.map_err(ManagerError::from)?;
             return Ok(None);
         }
@@ -492,6 +569,7 @@ impl SessionsRepository {
             "SELECT id, user_id, family_id, refresh_expires_at, created_at
                FROM sessions
               WHERE refresh_hash = $1 AND kind = 'cli' AND revoked_at IS NULL
+                AND EXISTS (SELECT 1 FROM users u WHERE u.id = sessions.user_id AND u.status = 'active')
               FOR UPDATE",
         )
         .bind(refresh_hash)
@@ -499,7 +577,7 @@ impl SessionsRepository {
         .await
         .map_err(ManagerError::from)?;
 
-        let Some((session_id, _user_id, family_id, refresh_expires, created)) = row else {
+        let Some((session_id, user_id, family_id, refresh_expires, created)) = row else {
             // Unknown refresh credential: it may be from a family that was
             // already rotated away; treat as a plain invalid credential, not a
             // family revocation.
@@ -531,7 +609,7 @@ impl SessionsRepository {
         // max lifetime.
         let new_access = crate::auth::crypto::Secret::generate();
         let new_refresh = crate::auth::crypto::Secret::generate();
-        let new_access_expires = now + Self::ACCESS_LIFETIME;
+        let new_access_expires = (now + Self::ACCESS_LIFETIME).min(family_max);
         let new_refresh_expires = now + Self::REFRESH_LIFETIME;
         // Never extend the family beyond its 30-day maximum.
         let new_refresh_expires = new_refresh_expires.min(family_max);
@@ -552,11 +630,18 @@ impl SessionsRepository {
         .await
         .map_err(ManagerError::from)?;
 
+        crate::audit::insert(
+            &mut *tx,
+            &crate::audit::AuditEvent::new("auth.refresh_rotated")
+                .actor(UserId::from_uuid(user_id))
+                .resource("session", session_id),
+        )
+        .await?;
         tx.commit().await.map_err(ManagerError::from)?;
 
         Ok(Some(SessionCredentials {
             session_id: SessionId::from_uuid(session_id),
-            family_id: Uuid::nil(),
+            family_id,
             access_token: new_access.encode(),
             refresh_token: new_refresh.encode(),
             access_expires_at: new_access_expires,
@@ -581,13 +666,20 @@ impl SessionsRepository {
 
     /// Revoke a single session (logout).
     pub async fn revoke_session(&self, session_id: SessionId) -> Result<bool, ManagerError> {
-        let affected = sqlx::query("UPDATE sessions SET revoked_at = now() WHERE id = $1")
-            .bind(session_id.0)
-            .execute(&self.pool)
-            .await
-            .map_err(ManagerError::from)?
-            .rows_affected();
-        Ok(affected == 1)
+        let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
+        let user:Option<Uuid>=sqlx::query_scalar("UPDATE sessions SET revoked_at=now() WHERE id=$1 AND revoked_at IS NULL RETURNING user_id")
+            .bind(session_id.0).fetch_optional(&mut *tx).await.map_err(ManagerError::from)?;
+        if let Some(user) = user {
+            crate::audit::insert(
+                &mut *tx,
+                &crate::audit::AuditEvent::new("auth.logout")
+                    .actor(UserId::from_uuid(user))
+                    .resource("session", session_id.0),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(ManagerError::from)?;
+        Ok(user.is_some())
     }
 
     /// Revoke all sessions for a user (used on suspension).
@@ -628,5 +720,11 @@ impl SessionsRepository {
             t.map(|t| t + Self::RECENT_AUTH_WINDOW > Utc::now())
                 .unwrap_or(false)
         }))
+    }
+}
+
+impl std::fmt::Debug for SessionCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionCredentials([REDACTED])")
     }
 }

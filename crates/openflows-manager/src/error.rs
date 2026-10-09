@@ -138,7 +138,7 @@ pub fn to_http_response(error: &ManagerError) -> (u16, serde_json::Value) {
         "error": {
             "code": code,
             "message": message,
-            "request_id": "",
+            "request_id": crate::server::REQUEST_ID.try_with(Clone::clone).unwrap_or_default(),
             "retryable": retryable,
         }
     });
@@ -149,7 +149,7 @@ fn api_status(code: &str) -> u16 {
     match code {
         "NOT_FOUND" | "RESOURCE_NOT_FOUND" => 404,
         "CONFLICT" | "INSTALLATION_ALREADY_BOUND" => 409,
-        "INVALID_INPUT" => 422,
+        "INVALID_INPUT" | "DEVICE_CODE_INVALID" => 422,
         "UNAUTHORIZED" | "MISSING_AUTH" | "AUTH_FAILED" | "CSRF_FAILED" => 401,
         "FORBIDDEN"
         | "ORG_ADMIN_REQUIRED"
@@ -157,8 +157,11 @@ fn api_status(code: &str) -> u16 {
         | "MEMBER_SUSPENDED"
         | "OWNER_REQUIRED"
         | "INVITATION_WRONG_USER"
-        | "REAUTH_REQUIRED" => 403,
+        | "REAUTH_REQUIRED"
+        | "ORG_UNAVAILABLE" => 403,
         "RATE_LIMITED" | "TOO_MANY_REQUESTS" => 429,
+        "SERVICE_UNAVAILABLE" | "GITHUB_UNAVAILABLE" => 503,
+        "GITHUB_OAUTH_ERROR" => 401,
         _ => 500,
     }
 }
@@ -168,15 +171,16 @@ fn api_status(code: &str) -> u16 {
 impl axum::response::IntoResponse for ManagerError {
     fn into_response(self) -> axum::response::Response {
         let (status, body) = to_http_response(&self);
-        axum::response::Response::builder()
-            .status(status)
-            .header(
-                axum::http::header::CONTENT_TYPE,
-                "application/json",
-            )
-            .body(axum::body::Body::from(serde_json::to_string(&body).unwrap_or_else(
-                |_| r#"{"error":{"code":"INTERNAL","message":"internal service error","retryable":false}}"#.to_string(),
-            )))
-            .expect("failed to build error response")
+        let mut response = (
+            axum::http::StatusCode::from_u16(status).expect("mapped HTTP status"),
+            axum::Json(body),
+        )
+            .into_response();
+        if status == 429 {
+            response
+                .headers_mut()
+                .insert("retry-after", "60".parse().unwrap());
+        }
+        response
     }
 }

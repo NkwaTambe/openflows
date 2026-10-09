@@ -35,7 +35,7 @@ pub fn format_user_code(code: &str) -> String {
 }
 
 /// A started device request, returned to the CLI exactly once.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceRequest {
     pub device_secret: String,
     pub user_code: String,
@@ -100,21 +100,32 @@ impl DeviceFlowService {
 
     /// Approve a pending request by its human code. Called only from a POST
     /// handler after CSRF validation with an authenticated browser user. The
-    /// human code is matched by hash in constant time against the stored value.
-    /// Returns `false` when the code is unknown, expired, or already handled.
+    /// human code is looked up by hash; rate limits bound verification attempts.
+    /// Returns an error when the code is unknown, expired, or already handled.
     pub async fn approve(&self, user_code: &str, approver: UserId) -> Result<(), ManagerError> {
+        self.approve_authenticated(user_code, approver, chrono::Utc::now())
+            .await
+    }
+
+    pub async fn approve_authenticated(
+        &self,
+        user_code: &str,
+        approver: UserId,
+        authenticated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ManagerError> {
         // Normalize the hyphenated display form back to the 8-char code.
-        let code = user_code.replace('-', "");
+        let code = user_code.trim().to_ascii_uppercase().replace('-', "");
         let code_hash = hash_token(&code);
 
         // Atomically approve only a pending, unexpired request.
         let affected = sqlx::query(
             "UPDATE cli_login_requests
-                SET status = 'approved', approved_user_id = $1
+                SET status = 'approved', approved_user_id = $1, approved_authenticated_at = $3
               WHERE user_code_hash = $2 AND status = 'pending' AND expires_at > now()",
         )
         .bind(approver.0)
         .bind(&code_hash)
+        .bind(authenticated_at)
         .execute(&self.pool)
         .await
         .map_err(ManagerError::from)?
@@ -141,8 +152,9 @@ impl DeviceFlowService {
         let hash = hash_token(device_secret);
         let mut tx = self.pool.begin().await.map_err(ManagerError::from)?;
 
-        let row = sqlx::query_as::<_, (String, Option<uuid::Uuid>)>(
-            "SELECT status, approved_user_id
+        let row = sqlx::query_as::<_, (String, Option<uuid::Uuid>, bool, bool, Option<chrono::DateTime<chrono::Utc>>)>(
+            "SELECT status, approved_user_id, expires_at <= clock_timestamp(),
+                    COALESCE(last_poll_at > clock_timestamp() - interval '5 seconds', false), approved_authenticated_at
                FROM cli_login_requests
               WHERE device_secret_hash = $1
               FOR UPDATE",
@@ -152,11 +164,27 @@ impl DeviceFlowService {
         .await
         .map_err(ManagerError::from)?;
 
-        let Some((status, approved_user_id)) = row else {
+        let Some((status, approved_user_id, expired, too_soon, authenticated_at)) = row else {
             tx.commit().await.map_err(ManagerError::from)?;
             return Ok(Poll::Expired);
         };
 
+        if expired {
+            sqlx::query("UPDATE cli_login_requests SET status='expired' WHERE device_secret_hash=$1 AND status <> 'consumed'")
+                .bind(&hash).execute(&mut *tx).await.map_err(ManagerError::from)?;
+            tx.commit().await.map_err(ManagerError::from)?;
+            return Ok(Poll::Expired);
+        }
+        if status == "consumed" || status == "expired" {
+            return Ok(Poll::Expired);
+        }
+        if too_soon {
+            return Err(ManagerError::api(
+                "RATE_LIMITED",
+                "wait five seconds before polling again",
+            )
+            .retryable(true));
+        }
         match status.as_str() {
             "pending" => {
                 // Record the poll (rate-limit boundary) and keep waiting.
@@ -171,7 +199,8 @@ impl DeviceFlowService {
                 Ok(Poll::Pending)
             }
             "approved" => {
-                let Some(approver) = approved_user_id else {
+                let (Some(approver), Some(authenticated_at)) = (approved_user_id, authenticated_at)
+                else {
                     tx.commit().await.map_err(ManagerError::from)?;
                     return Ok(Poll::Expired);
                 };
@@ -195,8 +224,14 @@ impl DeviceFlowService {
 
                 let creds = self
                     .sessions
-                    .create_cli_session(UserId::from_uuid(approver))
+                    .create_cli_session_in_tx(&mut tx, UserId::from_uuid(approver))
                     .await?;
+                sqlx::query("UPDATE sessions SET last_authenticated_at=$1 WHERE id=$2")
+                    .bind(authenticated_at)
+                    .bind(creds.session_id.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(ManagerError::from)?;
                 tx.commit().await.map_err(ManagerError::from)?;
                 Ok(Poll::Credentials(creds))
             }
@@ -237,4 +272,10 @@ pub enum Poll {
     Expired,
     Denied,
     Credentials(crate::auth::repository::SessionCredentials),
+}
+
+impl std::fmt::Debug for DeviceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeviceRequest([REDACTED])")
+    }
 }

@@ -38,15 +38,14 @@ pub const TRANSACTION_COOKIE: &str = "of_login_tx";
 /// no authority. This prevents open-redirect abuse via `state`/`redirect`
 /// parameters.
 pub fn safe_redirect_target(raw: &str) -> Result<String, ManagerError> {
-    if !raw.starts_with('/') || raw.starts_with("//") {
+    if raw.len() > 2048 || raw.chars().any(|c| c.is_control()) || raw.contains(char::from(92)) {
         return Err(ManagerError::InvalidInput("unsafe redirect target".into()));
     }
-    if raw.contains('\\') {
-        return Err(ManagerError::InvalidInput("unsafe redirect target".into()));
-    }
-    // Strip a leading scheme/host if present (e.g. "http://evil") — must not
-    // begin with one.
-    if raw.len() > 1 && raw[1..].starts_with('/') {
+    let path = raw.split('?').next().unwrap_or("");
+    if !matches!(
+        path,
+        "/" | "/api/v1/me" | "/auth/cli/verify" | "/invitations/accept"
+    ) {
         return Err(ManagerError::InvalidInput("unsafe redirect target".into()));
     }
     Ok(raw.to_string())
@@ -68,12 +67,30 @@ impl LoginService {
     /// Begin a login: create a transaction and return the redirect URL and the
     /// transaction cookie value (raw state) to set.
     pub async fn start(&self) -> Result<(String, String), ManagerError> {
+        self.start_with_next("/api/v1/me").await
+    }
+
+    pub async fn start_with_next(&self, next: &str) -> Result<(String, String), ManagerError> {
+        if self.auth_config.client_id.trim().is_empty() {
+            return Err(ManagerError::Config(
+                "GitHub authentication is not configured".into(),
+            ));
+        }
+        self.auth_config
+            .validate_origin()
+            .map_err(ManagerError::Config)?;
+        let target = safe_redirect_target(next)?;
         let state = Secret::generate();
         let pkce = PkcePair::new();
 
         // Encrypt the PKCE verifier with the OAuth envelope key.
         let envelope = self.auth_config.envelope_cipher("oauth_pkce")?;
-        let encrypted = envelope.seal(pkce.verifier.as_bytes())?;
+        // The return URL can contain an invitation token: encrypt it together
+        // with PKCE material rather than persisting the raw URL.
+        let payload =
+            serde_json::to_vec(&serde_json::json!({"verifier":pkce.verifier,"target":target}))
+                .map_err(|e| ManagerError::Service(e.into()))?;
+        let encrypted = envelope.seal(&payload)?;
 
         self.transactions
             .create_login(&state.hash(), &encrypted, envelope.version() as i32)
@@ -104,6 +121,9 @@ impl LoginService {
         code: &str,
         next: &str,
     ) -> Result<(String, String), ManagerError> {
+        if !next.is_empty() {
+            safe_redirect_target(next)?;
+        }
         // Transaction-cookie binding: the cookie must carry the same raw state.
         if !ct_eq(raw_state.as_bytes(), cookie_state.as_bytes()) {
             return Err(ManagerError::api("AUTH_FAILED", "login state mismatch"));
@@ -128,11 +148,17 @@ impl LoginService {
         let verifier_bytes = envelope.open(&encrypted_verifier).map_err(|_| {
             ManagerError::api("AUTH_FAILED", "login verifier could not be decrypted")
         })?;
-        let verifier = String::from_utf8(verifier_bytes)
+        let payload: serde_json::Value = serde_json::from_slice(&verifier_bytes)
             .map_err(|_| ManagerError::api("AUTH_FAILED", "login verifier invalid"))?;
+        let verifier = payload["verifier"]
+            .as_str()
+            .ok_or_else(|| ManagerError::api("AUTH_FAILED", "login verifier invalid"))?;
+        let target = payload["target"]
+            .as_str()
+            .ok_or_else(|| ManagerError::api("AUTH_FAILED", "login return path invalid"))?;
 
         // Exchange the code server-side (no DB transaction held across this).
-        let token = self.github.exchange_code(code, &verifier).await?;
+        let token = self.github.exchange_code(code, verifier).await?;
 
         // Fetch the authenticated user and map the immutable id to an identity.
         let github_user = self.github.fetch_user(&token.access_token).await?;
@@ -161,11 +187,7 @@ impl LoginService {
             .record_recent_auth(creds.session_id)
             .await?;
 
-        let target = if next.trim().is_empty() {
-            "/".to_string()
-        } else {
-            safe_redirect_target(next)?
-        };
+        let target = safe_redirect_target(target)?;
         Ok((target, creds.access_token))
     }
 

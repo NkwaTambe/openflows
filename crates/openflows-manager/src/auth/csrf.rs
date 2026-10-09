@@ -1,13 +1,10 @@
-//! CSRF protection for browser mutations.
+//! Session-bound double-submit CSRF protection for browser mutations.
 //!
-//! Browser session cookies are `Secure; HttpOnly; SameSite=Lax`. `SameSite=Lax`
-//! already prevents cross-site POST cookies from being sent, but the spec
-//! requires explicit CSRF tokens on mutations as defense-in-depth. We use a
-//! double-submit pattern: a per-request CSRF token is set as a cookie when a
-//! page is rendered, and every state-changing browser request must echo the
-//! same token in the `X-CSRF-Token` header. A cross-site attacker cannot read
-//! the cookie (HttpOnly) nor rely on it being sent with a POST (SameSite=Lax),
-//! so a matching header proves the request came from the authenticated origin.
+//! Pages and the authenticated CSRF endpoint return a digest derived from the
+//! opaque browser session, and set the same value as a cookie. Mutations must
+//! echo it in a form/header and validate its binding to the current session.
+//! A cookie planted for another session therefore cannot authorize a mutation.
+//! SameSite=Lax complements these checks; it is not the sole CSRF boundary.
 
 use crate::auth::crypto::{ct_eq, Secret};
 use crate::error::ManagerError;
@@ -32,4 +29,20 @@ pub fn validate(presented: &str, cookie: &str) -> Result<(), ManagerError> {
         return Err(ManagerError::api("CSRF_FAILED", "CSRF token mismatch"));
     }
     Ok(())
+}
+
+pub fn for_session(session: &str) -> String {
+    crate::auth::crypto::hash_token(&format!("openflows-csrf:{session}"))
+}
+
+/// Bind the double-submit value to the authenticated browser session.
+pub fn validate_session(
+    headers: &axum::http::HeaderMap,
+    presented: &str,
+) -> Result<(), ManagerError> {
+    let cookies = crate::routes::auth::parse_cookies(headers);
+    let session = cookies
+        .get(crate::routes::auth::SESSION_COOKIE)
+        .ok_or_else(|| ManagerError::api("CSRF_FAILED", "missing session"))?;
+    validate(presented, &for_session(session))
 }

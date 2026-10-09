@@ -7,7 +7,7 @@
 //!     never persisted.
 //!   * Recoverable OAuth material (PKCE verifier, retained user tokens) is
 //!     encrypted with an authenticated envelope key and a stored key version.
-//!   * All comparisons of secret-bearing values are constant-time.
+//!   * Direct secret comparisons use constant-time equality; database lookups use hashes.
 //!
 //! This module intentionally contains no database or network access; callers
 //! combine these primitives with repositories and adapters.
@@ -50,7 +50,7 @@ impl Secret {
 
     /// The SHA-256 hex digest used for equality checks and storage.
     pub fn hash(&self) -> String {
-        format!("{:x}", Sha256::digest(self.0))
+        hash_token(&self.encode())
     }
 }
 
@@ -105,9 +105,9 @@ impl Default for PkcePair {
 /// A versioned authenticated-encryption envelope for recoverable secrets.
 ///
 /// The same 32-byte key is derived from the configured base secret for the
-/// given purpose; `version` is stored alongside the ciphertext and recorded in
-/// `encryption_keys` so an operator can rotate the key for a purpose
-/// independently.
+/// given purpose and version. The caller stores the version beside ciphertext.
+/// The current config supports version 1; a retained key ring and online key
+/// rotation remain an operator-adapter requirement.
 #[derive(Clone)]
 pub struct EnvelopeCipher {
     /// A 32-byte key material derived deterministically from the configured
@@ -187,7 +187,7 @@ mod tests {
         let encoded = s.encode();
         assert_eq!(encoded.len(), TOKEN_B64_LEN);
         // The hash is stable across calls and distinct per secret.
-        assert_eq!(s.hash(), s.hash());
+        assert_eq!(s.hash(), hash_token(&encoded));
         let s2 = Secret::generate();
         assert_ne!(s.hash(), s2.hash());
         // Re-encoding a fresh secret from the same bytes yields the same token.

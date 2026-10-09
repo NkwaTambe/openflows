@@ -94,10 +94,27 @@ pub async fn github_callback(
     let cookie_state = cookies.get(TX_COOKIE).cloned().unwrap_or_default();
     let next = q.next.clone().unwrap_or_default();
 
-    let (target, access_token) = services
+    let (target, access_token) = match services
         .login
         .callback(&state_param, &cookie_state, &code, &next)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            crate::audit::insert_with_pool(
+                services.db.pool(),
+                &crate::audit::AuditEvent::new("auth.login_failed")
+                    .result(crate::audit::AuditResult::Denied)
+                    .request_id(
+                        crate::server::REQUEST_ID
+                            .try_with(Clone::clone)
+                            .unwrap_or_default(),
+                    ),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
 
     let secure = services.auth_config.cookie_secure;
     let cookie = session_cookie_header(SESSION_COOKIE, &access_token, secure, 12 * 3600);
@@ -109,7 +126,7 @@ pub async fn github_callback(
             .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid cookie")))?,
     );
     // Clear the transaction cookie (single-use).
-    response.headers_mut().insert(
+    response.headers_mut().append(
         header::SET_COOKIE,
         format!("{TX_COOKIE}=; Path=/; HttpOnly; Max-Age=0")
             .parse()
@@ -140,10 +157,10 @@ pub async fn refresh(
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
-    let bucket = bearer_token(&headers).unwrap_or_else(|| "anonymous".to_string());
+    let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
-        .allow(&bucket, LimitScope::Start, REFRESH_LIMIT)
+        .allow(&bucket, LimitScope::Refresh, REFRESH_LIMIT)
         .await?
     {
         return Err(ManagerError::api("RATE_LIMITED", "too many refresh attempts").retryable(true));
@@ -184,6 +201,10 @@ pub async fn logout(
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal =
+        crate::routes::organizations::authenticated_user(&headers, &services.session_manager)
+            .await?;
+    crate::routes::organizations::require_csrf_for_browser(&principal, &headers).await?;
     let cookies = parse_cookies(&headers);
 
     if let Some(cookie) = cookies.get(SESSION_COOKIE) {
@@ -218,18 +239,36 @@ pub async fn login_page(State(state): State<AppState>) -> Result<Response, Manag
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
-    let (authorize_url, _tx) = services.login.start().await?;
+    let _ = services;
+    let authorize_url = "/auth/github/start".to_string();
     // This page only redirects to GitHub; it does not approve anything.
     let html = crate::pages::login_page(&authorize_url);
     Ok(axum::response::Html(html).into_response())
 }
 
+#[derive(Deserialize)]
+pub struct LoginQuery {
+    pub next: Option<String>,
+}
+
+/// Build an application sign-in link; the return path is saved server-side.
+pub fn login_link(next: &str) -> String {
+    let encoded: String = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("next", next)
+        .finish();
+    format!("/auth/github/start?{encoded}")
+}
+
 /// `GET /auth/github/start` — begin GitHub login, set transaction cookie, redirect.
-pub async fn github_start(State(state): State<AppState>) -> Result<Response, ManagerError> {
+pub async fn github_start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
+) -> Result<Response, ManagerError> {
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
-    let bucket = "github-start".to_string();
+    let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
         .allow(&bucket, LimitScope::Start, START_LIMIT)
@@ -237,7 +276,10 @@ pub async fn github_start(State(state): State<AppState>) -> Result<Response, Man
     {
         return Err(ManagerError::api("RATE_LIMITED", "too many login attempts").retryable(true));
     }
-    let (authorize_url, tx) = services.login.start().await?;
+    let (authorize_url, tx) = services
+        .login
+        .start_with_next(q.next.as_deref().unwrap_or("/api/v1/me"))
+        .await?;
     let secure = services.auth_config.cookie_secure;
     let mut response = Redirect::temporary(&authorize_url).into_response();
     response.headers_mut().insert(
@@ -301,4 +343,38 @@ pub async fn me(
         status: user.status,
         memberships,
     }))
+}
+
+pub async fn csrf_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal =
+        crate::routes::organizations::authenticated_user(&headers, &services.session_manager)
+            .await?;
+    if !principal.is_browser {
+        return Err(ManagerError::api(
+            "UNAUTHORIZED",
+            "browser session required",
+        ));
+    }
+    let cookies = parse_cookies(&headers);
+    let token =
+        crate::auth::csrf::for_session(cookies.get(SESSION_COOKIE).expect("browser session"));
+    let mut response = Json(serde_json::json!({"csrf_token":token})).into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie_header(
+            crate::auth::csrf::CSRF_COOKIE,
+            &token,
+            services.auth_config.cookie_secure,
+            12 * 3600,
+        )
+        .parse()
+        .unwrap(),
+    );
+    Ok(response)
 }

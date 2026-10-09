@@ -6,7 +6,6 @@
 //! are shared across the process.
 
 use crate::error::ManagerError;
-use chrono::{Duration, Utc};
 use sqlx::PgPool;
 
 /// Rate-limit scopes, each bounded independently.
@@ -20,6 +19,7 @@ pub enum LimitScope {
     Poll,
     /// `POST /invitations/accept` and other token-verification entry points.
     Invitation,
+    Refresh,
 }
 
 impl LimitScope {
@@ -29,6 +29,7 @@ impl LimitScope {
             LimitScope::Verify => "verify",
             LimitScope::Poll => "poll",
             LimitScope::Invitation => "invitation",
+            LimitScope::Refresh => "refresh",
         }
     }
 }
@@ -38,8 +39,7 @@ pub struct RateLimiter {
     pool: PgPool,
 }
 
-/// The window length for counting attempts.
-const WINDOW: Duration = Duration::seconds(60);
+// Fixed minute boundaries use the database clock across all manager instances.
 
 impl RateLimiter {
     pub fn new(pool: PgPool) -> Self {
@@ -57,21 +57,40 @@ impl RateLimiter {
         scope: LimitScope,
         limit: u32,
     ) -> Result<bool, ManagerError> {
-        let window_start = Utc::now() - WINDOW;
-        let count: i64 = sqlx::query_scalar(
+        let count: i32 = sqlx::query_scalar(
             "INSERT INTO rate_limit_ledger (bucket_key, scope, window_start, count)
-             VALUES ($1, $2, $3, 1)
+             VALUES ($1, $2, date_trunc('minute', clock_timestamp()), 1)
              ON CONFLICT (bucket_key, scope, window_start) DO UPDATE
-               SET count = rate_limit_ledger.count + 1,
+               SET count = LEAST(rate_limit_ledger.count + 1, $3),
                    updated_at = now()
              RETURNING count",
         )
-        .bind(bucket_key)
+        .bind(crate::auth::crypto::hash_token(bucket_key))
         .bind(scope.as_str())
-        .bind(window_start)
+        .bind(
+            i32::try_from(limit)
+                .unwrap_or(i32::MAX - 1)
+                .saturating_add(1),
+        )
         .fetch_one(&self.pool)
         .await
         .map_err(ManagerError::from)?;
-        Ok(count <= limit as i64)
+        // Opportunistic bounded cleanup avoids an ever-growing minute ledger.
+        if rand::random::<u8>() < 4 {
+            sqlx::query("DELETE FROM rate_limit_ledger WHERE ctid IN
+                (SELECT ctid FROM rate_limit_ledger WHERE window_start < clock_timestamp() - interval '1 hour'
+                 ORDER BY window_start LIMIT 1000)")
+                .execute(&self.pool).await.map_err(ManagerError::from)?;
+        }
+        Ok(i64::from(count) <= i64::from(limit))
     }
+}
+
+/// Set by the server from the socket peer, never from client-supplied forwarding headers.
+pub fn peer_bucket(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-openflows-peer")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown-peer")
+        .to_string()
 }

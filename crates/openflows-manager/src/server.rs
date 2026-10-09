@@ -199,12 +199,17 @@ impl ManagerServices {
         let mut auth_config = config.auth.clone();
         auth_config.master_key = Some(master_key);
 
-        let github: std::sync::Arc<dyn crate::auth::github::GithubAuth> =
-            std::sync::Arc::new(crate::auth::github::RealGithubAuth::new(
+        let github: std::sync::Arc<dyn crate::auth::github::GithubAuth> = std::sync::Arc::new(
+            crate::auth::github::RealGithubAuth::new(
                 auth_config.client_id.clone(),
                 client_secret,
                 auth_config.github_api_base.clone(),
-            ));
+            )
+            .with_redirect_uri(format!(
+                "{}/auth/github/callback",
+                auth_config.public_url.trim_end_matches('/')
+            )),
+        );
 
         Ok(Self::from_db_with_auth(db, auth_config, github))
     }
@@ -459,13 +464,14 @@ pub struct ReadinessReport {
 
 pub fn create_router(state: AppState) -> Router {
     crate::routes::router()
+        .layer(axum::middleware::from_fn(request_context))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {
                     tracing::info_span!(
                         "http_request",
                         method = %request.method(),
-                        path = %request.uri().path(),
+                        path = request.extensions().get::<axum::extract::MatchedPath>().map(|p| p.as_str()).unwrap_or("unmatched"),
                         status = tracing::field::Empty,
                         latency_ms = tracing::field::Empty,
                     )
@@ -487,9 +493,12 @@ pub async fn serve(
     state: AppState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), ManagerError> {
-    axum::serve(listener, create_router(state))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    axum::serve(
+        listener,
+        create_router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 
@@ -501,4 +510,60 @@ pub async fn bind_and_serve(
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "OpenFlows Manager listening");
     serve(listener, state, shutdown).await
+}
+
+tokio::task_local! { pub static REQUEST_ID: String; }
+
+async fn request_context(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .map(|p| p.0.ip().to_string())
+        .unwrap_or_else(|| "unknown-peer".into());
+    request
+        .headers_mut()
+        .insert("x-openflows-peer", peer.parse().expect("IP header"));
+    let request_id = uuid::Uuid::new_v4().to_string();
+    request
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
+    let mut response = REQUEST_ID
+        .scope(request_id.clone(), next.run(request))
+        .await;
+    if (response.status().is_client_error() || response.status().is_server_error())
+        && !response
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.as_bytes().starts_with(b"application/json"))
+    {
+        use axum::response::IntoResponse;
+        let status = response.status();
+        let code = if status == axum::http::StatusCode::NOT_FOUND {
+            "RESOURCE_NOT_FOUND"
+        } else if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+            "METHOD_NOT_ALLOWED"
+        } else {
+            "INVALID_INPUT"
+        };
+        response = (status,axum::Json(serde_json::json!({"error":{
+            "code":code,"message":"request could not be accepted","request_id":request_id,"retryable":false
+        }}))).into_response();
+    }
+    response
+        .headers_mut()
+        .insert("x-request-id", request_id.parse().unwrap());
+    response
+        .headers_mut()
+        .insert("cache-control", "no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("referrer-policy", "no-referrer".parse().unwrap());
+    response
+        .headers_mut()
+        .insert("x-content-type-options", "nosniff".parse().unwrap());
+    response.headers_mut().insert("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'".parse().unwrap());
+    response
 }

@@ -80,8 +80,13 @@ use crate::error::ManagerError;
 
 /// A 32-byte envelope master key, resolved from the secret provider or supplied
 /// as an explicit development/test key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MasterKey(pub [u8; MASTER_KEY_BYTES]);
+impl fmt::Debug for MasterKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MasterKey([REDACTED])")
+    }
+}
 
 /// The default development/test master key. Only used when no
 /// `OPENFLOWS_CRYPTO_MASTER_KEY_REF` is configured and the deployment is not
@@ -113,6 +118,33 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
+    pub fn validate_origin(&self) -> Result<(), String> {
+        let url = url::Url::parse(&self.public_url).map_err(|_| "invalid OPENFLOWS_PUBLIC_URL")?;
+        let loopback = url
+            .host_str()
+            .is_some_and(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]");
+        if url.username() != ""
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.path() != "/"
+            || url.host_str().is_none()
+        {
+            return Err("OPENFLOWS_PUBLIC_URL must be an origin without credentials, path, query, or fragment".into());
+        }
+        if url.scheme() != "https" && !(url.scheme() == "http" && loopback && self.allow_loopback) {
+            return Err(
+                "public origin requires HTTPS; HTTP requires explicit loopback development".into(),
+            );
+        }
+        if !self.cookie_secure && !(loopback && self.allow_loopback) {
+            return Err(
+                "insecure cookies are permitted only for explicit loopback development".into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Build a purpose-scoped [`EnvelopeCipher`] from the master key. Returns a
     /// configuration error when the key has not been resolved (missing hosted
     /// authentication configuration must fail closed, never silently degrade).
@@ -130,10 +162,10 @@ impl AuthConfig {
         purpose: &str,
         version: i32,
     ) -> Result<EnvelopeCipher, ManagerError> {
-        if version < 1 {
+        if version != 1 {
             return Err(ManagerError::api(
                 "AUTH_FAILED",
-                "invalid key version for OAuth material",
+                "unsupported key version for OAuth material",
             ));
         }
         let key = self
@@ -155,6 +187,12 @@ fn loopback_exception_enabled() -> bool {
 /// `master_key_ref` selects a provider-backed key; when absent the dev key is
 /// used (local/tests only — hosted mode validates a ref separately).
 fn auth_from_env(require_auth: bool, master_key_ref: Option<String>) -> Result<AuthConfig, String> {
+    let cookie_secure = match std::env::var(AUTH_COOKIE_SECURE_ENV).ok().as_deref() {
+        None => !loopback_exception_enabled(),
+        Some("true" | "1") => true,
+        Some("false" | "0") => false,
+        Some(_) => return Err(format!("{AUTH_COOKIE_SECURE_ENV} must be true or false")),
+    };
     let client_id = std::env::var(GITHUB_CLIENT_ID_ENV)
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -177,12 +215,12 @@ fn auth_from_env(require_auth: bool, master_key_ref: Option<String>) -> Result<A
             public_url.ok_or_else(|| format!("hosted mode requires {PUBLIC_URL_ENV}"))?;
         return Ok(AuthConfig {
             client_id,
-            public_url,
+            public_url: public_url.trim_end_matches('/').to_string(),
             github_api_base: std::env::var(GITHUB_API_BASE_ENV)
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "https://api.github.com".to_string()),
-            cookie_secure: !loopback_exception_enabled(),
+            cookie_secure,
             allow_loopback: loopback_exception_enabled(),
             master_key,
         });
@@ -190,12 +228,15 @@ fn auth_from_env(require_auth: bool, master_key_ref: Option<String>) -> Result<A
 
     Ok(AuthConfig {
         client_id: client_id.unwrap_or_default(),
-        public_url: public_url.unwrap_or_else(|| "http://127.0.0.1:3002".to_string()),
+        public_url: public_url
+            .unwrap_or_else(|| "http://127.0.0.1:3002".to_string())
+            .trim_end_matches('/')
+            .to_string(),
         github_api_base: std::env::var(GITHUB_API_BASE_ENV)
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "https://api.github.com".to_string()),
-        cookie_secure: !loopback_exception_enabled(),
+        cookie_secure,
         allow_loopback: loopback_exception_enabled(),
         master_key,
     })
@@ -251,6 +292,9 @@ impl ManagerConfig {
 
         let auth = auth_from_env(mode == Mode::Hosted, crypto_master_key_ref.clone())?;
 
+        if mode == Mode::Hosted || !auth.client_id.is_empty() {
+            auth.validate_origin()?;
+        }
         match mode {
             Mode::Hosted => {
                 let database_url = database_url.ok_or_else(|| {

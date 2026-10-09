@@ -54,6 +54,17 @@ pub enum MemberResolution {
 pub struct Policy;
 
 impl Policy {
+    pub fn require_mutable(org: Option<&OrganizationState>) -> Result<(), ManagerError> {
+        if org.is_some_and(|o| o.status == "ready" || o.status == "provisioning") {
+            Ok(())
+        } else {
+            Err(ManagerError::api(
+                "ORG_UNAVAILABLE",
+                "organization does not accept mutations",
+            ))
+        }
+    }
+
     /// Require an active membership. Returns 401 when the user is unknown or
     /// suspended, 404 when the organization is absent/outside membership.
     ///
@@ -71,6 +82,15 @@ impl Policy {
         let Some(m) = membership else {
             return Err(ManagerError::not_found("organization"));
         };
+        if org.is_some_and(|o| o.organization_id != m.organization_id || o.status == "deleted") {
+            return Err(ManagerError::not_found("organization"));
+        }
+        if org.is_some_and(|o| o.status == "suspended") {
+            return Err(ManagerError::api(
+                "ORG_UNAVAILABLE",
+                "organization is suspended",
+            ));
+        }
         match m.status {
             MembershipStatus::Active => Ok(MemberResolution::Active),
             MembershipStatus::Suspended => Err(ManagerError::api(
@@ -88,6 +108,7 @@ impl Policy {
         org: Option<&OrganizationState>,
     ) -> Result<(), ManagerError> {
         Self::require_member(membership, org)?;
+        Self::require_mutable(org)?;
         let m = membership.expect("require_member guarantees membership");
         match (m.status, m.role) {
             (MembershipStatus::Active, MembershipRole::Admin) => Ok(()),
@@ -109,6 +130,7 @@ impl Policy {
         org: Option<&OrganizationState>,
     ) -> Result<(), ManagerError> {
         Self::require_member(membership, org)?;
+        Self::require_mutable(org)?;
         let m = membership.expect("require_member guarantees membership");
         if m.status != MembershipStatus::Active {
             return Err(ManagerError::api(

@@ -38,7 +38,7 @@ pub async fn device_start(
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
-    let bucket = client_ip(&headers);
+    let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
         .allow(&bucket, LimitScope::Start, START_LIMIT)
@@ -71,29 +71,43 @@ pub async fn device_verify_page(
     let code = q.code.clone().unwrap_or_default();
     // The user must be signed in to approve.
     let authenticated = match parse_cookies(&headers).get(SESSION_COOKIE) {
-        Some(cookie) => services
-            .session_manager
-            .validate_browser(cookie)
-            .await?
-            .is_some(),
+        Some(cookie) => match services.session_manager.validate_browser(cookie).await? {
+            Some(p) => services
+                .session_manager
+                .has_recent_auth(p.session_id)
+                .await?
+                .unwrap_or(false),
+            None => false,
+        },
         None => false,
     };
 
     // Issue a CSRF cookie for the approve form.
-    let csrf_token = csrf::new_token();
+    let csrf_token = parse_cookies(&headers)
+        .get(SESSION_COOKIE)
+        .map(|s| csrf::for_session(s))
+        .unwrap_or_default();
     let html = if authenticated {
         crate::pages::device_verify_page(&code, &csrf_token)
     } else {
         // Provide a sign-in link but never approve.
-        let (authorize_url, _) = services.login.start().await?;
+        let target = format!(
+            "/auth/cli/verify?{}",
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("code", &code)
+                .finish()
+        );
+        let authorize_url = crate::routes::auth::login_link(&target);
         crate::pages::device_needs_login_page(&authorize_url)
     };
     let mut response = axum::response::Html(html).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!(
-            "{}={csrf_token}; Path=/; HttpOnly; SameSite=Lax",
-            csrf::CSRF_COOKIE
+        crate::routes::auth::session_cookie_header(
+            csrf::CSRF_COOKIE,
+            &csrf_token,
+            services.auth_config.cookie_secure,
+            12 * 3600,
         )
         .parse()
         .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid cookie")))?,
@@ -111,6 +125,7 @@ pub struct VerifyQuery {
 #[derive(Deserialize)]
 pub struct ApproveForm {
     pub code: String,
+    #[serde(default)]
     pub _csrf: String,
 }
 
@@ -140,9 +155,10 @@ pub async fn device_approve(
         form._csrf.clone()
     };
     csrf::validate(&presented, &cookie_csrf)?;
+    csrf::validate_session(&headers, &presented)?;
 
     // Rate-limit code verification independently.
-    let bucket = client_ip(&headers);
+    let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
         .allow(&bucket, LimitScope::Verify, VERIFY_LIMIT)
@@ -164,9 +180,24 @@ pub async fn device_approve(
         .await?
         .ok_or_else(|| ManagerError::api("UNAUTHORIZED", "session invalid or expired"))?;
 
+    let authenticated_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT last_authenticated_at FROM sessions WHERE id=$1 AND revoked_at IS NULL
+         AND last_authenticated_at > clock_timestamp()-interval '10 minutes'",
+    )
+    .bind(principal.session_id.0)
+    .fetch_optional(services.db.pool())
+    .await
+    .map_err(ManagerError::from)?
+    .flatten();
+    let authenticated_at = authenticated_at.ok_or_else(|| {
+        ManagerError::api(
+            "REAUTH_REQUIRED",
+            "sign in again at /auth/github/start before approving the CLI",
+        )
+    })?;
     services
         .device
-        .approve(&form.code, principal.user_id)
+        .approve_authenticated(&form.code, principal.user_id, authenticated_at)
         .await?;
     let (_, html) = crate::pages::device_result_page(
         "Device approved. You may close this window.",
@@ -197,7 +228,7 @@ pub async fn device_token(
     let services = state
         .services()
         .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
-    let bucket = client_ip(&headers);
+    let bucket = crate::rate_limit::peer_bucket(&headers);
     if !services
         .rate_limiter
         .allow(&bucket, LimitScope::Poll, POLL_LIMIT)
@@ -232,16 +263,4 @@ pub async fn device_token(
             expires_in: Some(15 * 60),
         })),
     }
-}
-
-fn client_ip(headers: &HeaderMap) -> String {
-    // Use X-Forwarded-For (trusted at the edge) or fall back to a constant so a
-    // missing header never bypasses the bucket.
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
 }

@@ -8,7 +8,7 @@
 use crate::auth::csrf;
 use crate::error::ManagerError;
 use crate::rate_limit::LimitScope;
-use crate::routes::organizations::{authenticated_user, require_csrf_for_browser};
+use crate::routes::organizations::authenticated_user;
 use crate::server::AppState;
 use axum::extract::{Form, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -35,7 +35,22 @@ pub async fn accept_page(
     };
 
     // Must be signed in as a browser user.
-    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    let principal = match authenticated_user(&headers, &services.session_manager).await {
+        Ok(p) => p,
+        Err(ManagerError::Api(ref e)) if e.code == "UNAUTHORIZED" => {
+            let target = format!(
+                "/invitations/accept?{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("token", &raw_token)
+                    .finish()
+            );
+            return Ok(
+                axum::response::Redirect::to(&crate::routes::auth::login_link(&target))
+                    .into_response(),
+            );
+        }
+        Err(e) => return Err(e),
+    };
     if !principal.is_browser {
         return Err(ManagerError::api(
             "UNAUTHORIZED",
@@ -49,6 +64,14 @@ pub async fn accept_page(
     let Some(inv) = inv else {
         return Err(ManagerError::not_found("invitation"));
     };
+    let subject = services.users.github_subject(principal.user_id).await?;
+    if subject != Some(inv.invitee_github_user_id)
+        || inv.accepted_at.is_some()
+        || inv.revoked_at.is_some()
+        || inv.expires_at <= chrono::Utc::now()
+    {
+        return Err(ManagerError::not_found("invitation"));
+    }
     let display: Option<(String,)> =
         sqlx::query_as("SELECT display_name FROM organizations WHERE id = $1")
             .bind(inv.organization_id.0)
@@ -57,20 +80,27 @@ pub async fn accept_page(
             .ok();
 
     // Issue a CSRF cookie and render the accept form.
-    let csrf_token = csrf::new_token();
+    let csrf_token = csrf::for_session(
+        crate::routes::auth::parse_cookies(&headers)
+            .get(crate::routes::auth::SESSION_COOKIE)
+            .expect("validated browser"),
+    );
     let html = crate::pages::invitation_page(
         &display
             .map(|(d,)| d)
             .unwrap_or_else(|| "the organization".to_string()),
         &inv.role.to_string(),
         &csrf_token,
+        &raw_token,
     );
     let mut response = axum::response::Html(html).into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        format!(
-            "{}={csrf_token}; Path=/; HttpOnly; SameSite=Lax",
-            csrf::CSRF_COOKIE
+        crate::routes::auth::session_cookie_header(
+            csrf::CSRF_COOKIE,
+            &csrf_token,
+            services.auth_config.cookie_secure,
+            12 * 3600,
         )
         .parse()
         .map_err(|_| ManagerError::Service(anyhow::anyhow!("invalid cookie")))?,
@@ -100,13 +130,13 @@ pub async fn accept(
             "accept the invitation in your browser while signed in",
         ));
     }
-    require_csrf_for_browser(&principal, &headers).await?;
+    csrf::validate_session(&headers, &form._csrf)?;
 
     let Some(raw_token) = form.token.clone() else {
         return Err(ManagerError::not_found("invitation"));
     };
 
-    let bucket = client_ip(&headers);
+    let bucket = principal.user_id.to_string();
     if !services
         .rate_limiter
         .allow(&bucket, LimitScope::Invitation, 30)
@@ -147,12 +177,41 @@ fn request_id(headers: &HeaderMap) -> String {
         .unwrap_or_default()
 }
 
-fn client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+#[derive(Deserialize)]
+pub struct AcceptJson {
+    pub token: String,
+}
+
+pub async fn accept_json(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<AcceptJson>,
+) -> Result<axum::Json<serde_json::Value>, ManagerError> {
+    let services = state
+        .services()
+        .ok_or_else(|| ManagerError::api("SERVICE_UNAVAILABLE", "service unavailable"))?;
+    let principal = authenticated_user(&headers, &services.session_manager).await?;
+    crate::routes::organizations::require_csrf_for_browser(&principal, &headers).await?;
+    if !services
+        .rate_limiter
+        .allow(&principal.user_id.to_string(), LimitScope::Invitation, 30)
+        .await?
+    {
+        return Err(ManagerError::api("RATE_LIMITED", "too many attempts").retryable(true));
+    }
+    let subject = services
+        .users
+        .github_subject(principal.user_id)
+        .await?
+        .ok_or_else(|| ManagerError::api("UNAUTHORIZED", "no GitHub identity"))?;
+    let org = services
+        .orgs_service
+        .accept_invitation(
+            principal.user_id,
+            subject,
+            &body.token,
+            &request_id(&headers),
+        )
+        .await?;
+    Ok(axum::Json(serde_json::json!({"organization_id":org})))
 }
