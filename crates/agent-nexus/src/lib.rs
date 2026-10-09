@@ -1905,15 +1905,16 @@ Use `openflows-harness` for all coordination:
         };
 
         let ticket_count = tickets.len();
-        let active_count = tickets
-            .iter()
-            .filter(|t| {
-                matches!(
-                    &t.status,
-                    TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
-                )
-            })
-            .count();
+        let is_ticket_active = |t: &Ticket| {
+            matches!(
+                &t.status,
+                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
+            ) || matches!(
+                &t.status,
+                TicketStatus::Completed { outcome, .. } if outcome == "pr_opened"
+            )
+        };
+        let active_count = tickets.iter().filter(|t| is_ticket_active(t)).count();
         info!(
             total = ticket_count,
             active = active_count,
@@ -1924,11 +1925,9 @@ Use `openflows-harness` for all coordination:
             // Check tickets that are currently being worked on.
             // Both Assigned (chat just created) and InProgress (actively working)
             // are active states where FORGE may have set a harness phase.
-            let is_active = matches!(
-                &ticket.status,
-                TicketStatus::Assigned { .. } | TicketStatus::InProgress { .. }
-            );
-            if !is_active {
+            // Tickets with an open PR (Completed { outcome: "pr_opened" }) may also
+            // re-enter testing/plan_ready during PR review rework or CI fix.
+            if !is_ticket_active(ticket) {
                 continue;
             }
 
@@ -2098,8 +2097,25 @@ Use `openflows-harness` for all coordination:
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
                         TicketStatus::Assigned { worker_id }
-                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                        _ => String::new(),
+                        | TicketStatus::InProgress { worker_id }
+                        | TicketStatus::Completed { worker_id, .. }
+                            if worker_id != "nexus-reconciliation" =>
+                        {
+                            worker_id.clone()
+                        }
+                        _ => live_slots
+                            .iter()
+                            .find(|(id, slot)| {
+                                Self::worker_role(id) == "forge"
+                                    && matches!(
+                                        &slot.status,
+                                        WorkerStatus::Assigned { ticket_id: tid, .. }
+                                            | WorkerStatus::Working { ticket_id: tid, .. }
+                                            if tid == &ticket.id
+                                    )
+                            })
+                            .map(|(id, _)| id.clone())
+                            .unwrap_or_default(),
                     };
                     let sentinel_slot =
                         Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
@@ -2416,8 +2432,25 @@ Use `openflows-harness` for all coordination:
                         store.get_typed(KEY_WORKER_SLOTS).await.unwrap_or_default();
                     let forge_worker_id = match &ticket.status {
                         TicketStatus::Assigned { worker_id }
-                        | TicketStatus::InProgress { worker_id } => worker_id.clone(),
-                        _ => String::new(),
+                        | TicketStatus::InProgress { worker_id }
+                        | TicketStatus::Completed { worker_id, .. }
+                            if worker_id != "nexus-reconciliation" =>
+                        {
+                            worker_id.clone()
+                        }
+                        _ => live_slots
+                            .iter()
+                            .find(|(id, slot)| {
+                                Self::worker_role(id) == "forge"
+                                    && matches!(
+                                        &slot.status,
+                                        WorkerStatus::Assigned { ticket_id: tid, .. }
+                                            | WorkerStatus::Working { ticket_id: tid, .. }
+                                            if tid == &ticket.id
+                                    )
+                            })
+                            .map(|(id, _)| id.clone())
+                            .unwrap_or_default(),
                     };
                     let sentinel_slot =
                         Self::review_sentinel_for_ticket(&ticket.id, &forge_worker_id, &live_slots);
@@ -6380,6 +6413,75 @@ mod tests {
             create.assert_async().await;
             send.assert_async().await;
         }
+    }
+
+    #[tokio::test]
+    async fn poll_harness_status_scans_reworking_ticket_with_pr_opened_status() {
+        let mut server = mockito::Server::new_async().await;
+        let _org = server
+            .mock("GET", "/api/v2/organizations")
+            .with_status(200)
+            .with_body(r#"[{"id":"org","name":"default","is_default":true}]"#)
+            .create_async()
+            .await;
+        let create = server
+            .mock("POST", "/api/v2/chats")
+            .match_body(mockito::Matcher::Regex("Testing review for T-1".into()))
+            .with_status(201)
+            .with_body(r#"{"id":"review-chat","workspace_id":"ws"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let store = SharedStore::new_in_memory();
+        store.set("coder_url", json!(server.url())).await;
+        store.set("coder_session_token", json!("test")).await;
+        let ticket: Ticket = serde_json::from_value(json!({
+            "id":"T-1", "title":"Docs", "body":"Improve README", "priority":0,
+            "status":{"type":"completed","outcome":"pr_opened","worker_id":"nexus-reconciliation"}
+        }))
+        .unwrap();
+        let mut forge_slot = slot(
+            "forge-1",
+            WorkerStatus::Assigned {
+                ticket_id: "T-1".into(),
+                issue_url: None,
+            },
+        );
+        forge_slot.workspace_id = Some("ws-forge".into());
+        let mut reviewer = slot("sentinel-1", WorkerStatus::Idle);
+        reviewer.workspace_id = Some("ws".into());
+        store
+            .set(
+                KEY_WORKER_SLOTS,
+                json!({"forge-1": forge_slot, "sentinel-1": reviewer}),
+            )
+            .await;
+        let state = config::lifecycle::Lifecycle {
+            phase: config::lifecycle::Phase::Testing,
+            revision: 1,
+            head: Some("head-sha".into()),
+            review_round: 2,
+            version: 3,
+            plan: "# Plan".into(),
+            ..Default::default()
+        };
+        store
+            .set(
+                &full_ticket_key_flat("T-1", KEY_TICKET_STATUS),
+                json!(state),
+            )
+            .await;
+        let node = NexusNode::new("missing", "missing");
+        node.poll_harness_status_and_spawn_agents(&store, std::slice::from_ref(&ticket))
+            .await;
+        create.assert_async().await;
+        assert_eq!(
+            store
+                .get_typed::<String>(&review_chat_key("T-1", "testing:1:head-sha:2"))
+                .await
+                .as_deref(),
+            Some("review-chat")
+        );
     }
 
     #[tokio::test]

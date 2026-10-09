@@ -1777,6 +1777,24 @@ impl Node for VesselNode {
                             state,
                             "Dispatched /address_review to forge chat"
                         );
+                        let mut tickets: Vec<Ticket> =
+                            store.get_typed(KEY_TICKETS).await.unwrap_or_default();
+                        if let Some(ticket) = tickets.iter_mut().find(|t| t.id == tid) {
+                            if !matches!(ticket.status, TicketStatus::InProgress { .. }) {
+                                let worker_id = match &ticket.status {
+                                    TicketStatus::Assigned { worker_id }
+                                    | TicketStatus::InProgress { worker_id }
+                                    | TicketStatus::Completed { worker_id, .. }
+                                        if worker_id != "nexus-reconciliation" =>
+                                    {
+                                        worker_id.clone()
+                                    }
+                                    _ => "forge".to_string(),
+                                };
+                                ticket.status = TicketStatus::InProgress { worker_id };
+                                store.set(KEY_TICKETS, json!(tickets)).await;
+                            }
+                        }
                         if let Some(sha) = &current_head_sha {
                             self.set_address_review_dispatched_sha(store, *pr_number, sha)
                                 .await;
