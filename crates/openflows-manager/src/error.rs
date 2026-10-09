@@ -57,6 +57,17 @@ impl ManagerError {
             format!("{resource} not found or outside your organization"),
         ))
     }
+
+    /// Mark the error as retryable (HTTP 429 / 503 with retry guidance).
+    pub fn retryable(self, retryable: bool) -> Self {
+        match self {
+            ManagerError::Api(mut api) => {
+                api.retryable = retryable;
+                ManagerError::Api(api)
+            }
+            other => other,
+        }
+    }
 }
 
 /// A sanitized, HTTP-safe API error envelope.
@@ -127,6 +138,7 @@ pub fn to_http_response(error: &ManagerError) -> (u16, serde_json::Value) {
         "error": {
             "code": code,
             "message": message,
+            "request_id": "",
             "retryable": retryable,
         }
     });
@@ -138,8 +150,33 @@ fn api_status(code: &str) -> u16 {
         "NOT_FOUND" | "RESOURCE_NOT_FOUND" => 404,
         "CONFLICT" | "INSTALLATION_ALREADY_BOUND" => 409,
         "INVALID_INPUT" => 422,
-        "UNAUTHORIZED" | "MISSING_AUTH" => 401,
-        "FORBIDDEN" | "ORG_ADMIN_REQUIRED" | "GITHUB_OWNER_REQUIRED" => 403,
+        "UNAUTHORIZED" | "MISSING_AUTH" | "AUTH_FAILED" | "CSRF_FAILED" => 401,
+        "FORBIDDEN"
+        | "ORG_ADMIN_REQUIRED"
+        | "GITHUB_OWNER_REQUIRED"
+        | "MEMBER_SUSPENDED"
+        | "OWNER_REQUIRED"
+        | "INVITATION_WRONG_USER"
+        | "REAUTH_REQUIRED" => 403,
+        "RATE_LIMITED" | "TOO_MANY_REQUESTS" => 429,
         _ => 500,
+    }
+}
+
+/// Render a [`ManagerError`] as an HTTP response using the shared error
+/// envelope, so axum handlers can return `Result<_, ManagerError>` directly.
+impl axum::response::IntoResponse for ManagerError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, body) = to_http_response(&self);
+        axum::response::Response::builder()
+            .status(status)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/json",
+            )
+            .body(axum::body::Body::from(serde_json::to_string(&body).unwrap_or_else(
+                |_| r#"{"error":{"code":"INTERNAL","message":"internal service error","retryable":false}}"#.to_string(),
+            )))
+            .expect("failed to build error response")
     }
 }
