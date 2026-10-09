@@ -2507,8 +2507,19 @@ impl VesselNode {
             return true;
         }
 
-        // 4. Inline review comments (only considered rework if PR is not approved)
-        if review_state != github::PrReviewState::Approved {
+        // 4. Inline review comments (only considered rework if PR is not approved on current head
+        // by an authorized reviewer — stale approvals or outside drive-by approvals do not hide feedback)
+        let is_authorized_head_approved = review_state == github::PrReviewState::Approved
+            && github::latest_review_per_user(&reviews)
+                .into_iter()
+                .any(|r| {
+                    r.state_enum() == github::PrReviewState::Approved
+                        && r.is_authorized_reviewer()
+                        && (r.commit_id.as_deref() == Some(&pr_info.head_sha)
+                            || r.commit_id.is_none())
+                });
+
+        if !is_authorized_head_approved {
             let comments = self
                 .client
                 .list_review_comments(owner, repo, pr_info.number)
@@ -5339,6 +5350,138 @@ mod tests {
         assert_eq!(
             updated_slots["sentinel"].workspace_id, None,
             "sentinel workspace_id should be cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_needs_rework_stale_approval_does_not_hide_comments() {
+        let mut server = mockito::Server::new_async().await;
+        // Review approved on old_commit
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"alice","id":100},"body":"LGTM","state":"APPROVED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"old_commit","author_association":"MEMBER"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // CI success
+        let _ci = server
+            .mock("GET", "/repos/org/repo/commits/new_commit/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success"}"#)
+            .create_async()
+            .await;
+        let _runs = server
+            .mock("GET", "/repos/org/repo/commits/new_commit/check-runs")
+            .with_status(200)
+            .with_body(r#"{"total_count":0,"check_runs":[]}"#)
+            .create_async()
+            .await;
+        // Inline review comments present
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body(r#"[{"id":10,"path":"src/lib.rs","user":{"login":"bob","id":200},"body":"Fix this","commit_id":"new_commit","created_at":"2026-10-08T13:00:00Z"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let config = VesselConfig {
+            github_token: "test".to_string(),
+            ..Default::default()
+        };
+        let node = VesselNode {
+            lifecycle_store: std::sync::Mutex::new(None),
+            poller: CiPoller::new(config.ci_poll.clone(), client.clone()),
+            merger: PrMerger::new(client.clone(), config.merge_method),
+            client,
+            config,
+            slots_lock: tokio::sync::Mutex::new(()),
+        };
+
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "new_commit".to_string(),
+            head_branch: "feat".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feat".to_string(),
+            body: None,
+            state: pocketflow_core::PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+
+        let needs_rework = node.check_pr_needs_rework("org", "repo", &pr_info).await;
+        assert!(
+            needs_rework,
+            "Stale approval on older commit must not hide review comments"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_pr_needs_rework_unauthorized_approval_does_not_hide_comments() {
+        let mut server = mockito::Server::new_async().await;
+        // Review approved on new_commit by outside CONTRIBUTOR (not member/owner)
+        let _reviews = server
+            .mock("GET", "/repos/org/repo/pulls/42/reviews?per_page=100&page=1")
+            .with_status(200)
+            .with_body(r#"[{"id":1,"user":{"login":"driveby","id":100},"body":"LGTM","state":"APPROVED","submitted_at":"2026-10-08T12:00:00Z","commit_id":"new_commit","author_association":"CONTRIBUTOR"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        // CI success
+        let _ci = server
+            .mock("GET", "/repos/org/repo/commits/new_commit/status")
+            .with_status(200)
+            .with_body(r#"{"state":"success"}"#)
+            .create_async()
+            .await;
+        let _runs = server
+            .mock("GET", "/repos/org/repo/commits/new_commit/check-runs")
+            .with_status(200)
+            .with_body(r#"{"total_count":0,"check_runs":[]}"#)
+            .create_async()
+            .await;
+        // Inline review comments present
+        let _comments = server
+            .mock("GET", "/repos/org/repo/pulls/42/comments?per_page=100")
+            .with_status(200)
+            .with_body(r#"[{"id":10,"path":"src/lib.rs","user":{"login":"bob","id":200},"body":"Fix this","commit_id":"new_commit","created_at":"2026-10-08T13:00:00Z"}]"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = github::GithubRestClient::with_api_base("test", server.url());
+        let config = VesselConfig {
+            github_token: "test".to_string(),
+            ..Default::default()
+        };
+        let node = VesselNode {
+            lifecycle_store: std::sync::Mutex::new(None),
+            poller: CiPoller::new(config.ci_poll.clone(), client.clone()),
+            merger: PrMerger::new(client.clone(), config.merge_method),
+            client,
+            config,
+            slots_lock: tokio::sync::Mutex::new(()),
+        };
+
+        let pr_info = PrInfo {
+            number: 42,
+            head_sha: "new_commit".to_string(),
+            head_branch: "feat".to_string(),
+            base_branch: "main".to_string(),
+            title: "Feat".to_string(),
+            body: None,
+            state: pocketflow_core::PrState::Open,
+            mergeable: Some(true),
+            ticket_id: Some("T-42".to_string()),
+        };
+
+        let needs_rework = node.check_pr_needs_rework("org", "repo", &pr_info).await;
+        assert!(
+            needs_rework,
+            "Unauthorized drive-by approval must not hide review comments"
         );
     }
 }

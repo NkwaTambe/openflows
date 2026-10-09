@@ -1679,6 +1679,7 @@ impl PrReviewState {
 /// An inline review comment on a pull request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewComment {
+    #[serde(default)]
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
