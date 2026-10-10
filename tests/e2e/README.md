@@ -13,6 +13,7 @@ bash tests/integration/gated_workflow_test.sh
 bash tests/e2e/run.sh
 OPENFLOWS_E2E_SUITE=verification bash tests/e2e/run.sh
 bash crates/openflows-manager/scripts/run-integration-tests.sh
+bash tests/e2e/system/run.sh
 ```
 
 The Coder runner builds the current harness binary into an Ubuntu 24.04 worker image. Coder uploads a Terraform fixture, provisions a real worker, and the Rust client executes the harness through real Coder SSH. The test rejects self-approval, a rejected plan, and a stale review; accepts the current reviewed plan; checks a second tenant; stops and starts the workspace; verifies lifecycle persistence; and deletes the workspace.
@@ -20,6 +21,8 @@ The Coder runner builds the current harness binary into an Ubuntu 24.04 worker i
 The Redis runner covers atomic competing decisions, write failure under Redis OOM, review leases, a persisted planning-to-completion lifecycle, missing verification evidence, changed commit identity, client reconnection, and tenant separation. OOM changes the server's global configuration, so this suite runs serially.
 
 The delegated-verification suite provisions separate FORGE and SENTINEL workers. It starts the production A2A HTTP relay against real Redis and runs the actual harness executor in FORGE. A committed acceptance script requires the answer `42`; the first candidate contains `41`. SENTINEL requests verification, observes the failing exit code, and cannot approve testing. FORGE fixes and commits the answer, then SENTINEL must obtain successful verification for that new commit. Approval for the older head/round is rejected. The current verified candidate can reach submit, and the original FORGE checkout must remain clean. The relay fixture seeds only the pair authentication token, never verification results or lifecycle transitions.
+
+The [system fixture contracts](system/README.md) provide a scripted model HTTP server, a limited GitHub API adapter backed by real Git, and an independent exact-commit acceptance runner. They exercise the production GitHub client and run fixture contracts in an isolated container. They are task 3 infrastructure; the production controller and real Coder chats are not connected yet.
 
 The existing manager suite uses real PostgreSQL, creates isolated test databases, and applies migrations. CI supplies its own PostgreSQL service.
 
