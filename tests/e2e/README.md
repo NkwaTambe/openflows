@@ -2,6 +2,8 @@
 
 CI exercises OpenFlows against disposable Redis, PostgreSQL, and Coder containers before the final `OpenFlows Merge Gate` can pass. PRs into `develop` and `main`, pushes to those branches, and merge queue groups run the gate. Every mandatory dependency must explicitly succeed; failed, cancelled, and skipped jobs fail the gate.
 
+See the [complete E2E testing architecture](../../docs/architecture/end-to-end-testing.md) for the purpose of PRs #400 and #401, the target issue-to-merge system, and the remaining implementation stages.
+
 ## Run locally
 
 Requirements: Linux x86_64, Rust, Docker Engine with Compose, GNU `timeout`, `tar`, and access to container registries and Terraform provider downloads. The Coder test extracts its CLI from the pinned server image. No GitHub credentials or model API keys are needed.
