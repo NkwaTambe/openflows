@@ -6,5 +6,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /home/coder/workspace \
     && chown -R coder:coder /home/coder
 COPY openflows-harness /usr/local/bin/openflows-harness
+COPY ci_a2a_relay /usr/local/bin/ci-a2a-relay
 USER coder
 WORKDIR /home/coder/workspace
