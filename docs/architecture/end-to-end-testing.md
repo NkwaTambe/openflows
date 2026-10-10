@@ -8,8 +8,8 @@ This is the target architecture. PRs #400 and #401 implement its first two incre
 
 | Pull request | Purpose | What it proves | What it does not prove |
 | --- | --- | --- | --- |
-| [#400](https://github.com/The-AgenticFlow/openflows/pull/400) | Establish the CI merge gate and real service tests | Real Redis and PostgreSQL integration; Coder provisions a worker; planning gates, tenant separation, restart, and deletion work; every mandatory CI job must succeed | The controller can take an issue through agent chats to a merged PR |
-| [#401](https://github.com/The-AgenticFlow/openflows/pull/401) | Verify acceptance through separate real workers | SENTINEL requests tests over A2A; FORGE executes them outside its original checkout; failing tests cannot authorize submit; head and round checks reject stale approvals | Model-driven dispatch, controller issue routing, Coder hooks, GitHub integration, human PR approval, or an actual merge |
+| [#400](https://github.com/The-AgenticFlow/openflows/pull/400) | Establish the CI merge gate and real service tests | Real Redis and PostgreSQL integration; Coder provisions a workspace; planning gates, tenant separation, restart, and deletion work; every mandatory CI job must succeed | The controller can take an issue through agent chats to a merged PR |
+| [#401](https://github.com/The-AgenticFlow/openflows/pull/401) | Verify acceptance through separate real workspaces | SENTINEL requests tests over A2A; FORGE executes them outside its original checkout; failing tests cannot authorize submit; head and round checks reject stale approvals | Model-driven dispatch, controller issue routing, Coder hooks, GitHub integration, human PR approval, or an actual merge |
 
 #401 is based on #400. They are pull requests containing test infrastructure and coverage, rather than the test issues that agents will solve. Their checks remain useful when the complete system suite is added: they isolate failures and run focused cases that would be expensive to repeat through the whole workflow.
 
@@ -146,6 +146,12 @@ Do not hide intermittent failures with blanket reruns. Report startup failures s
 6. Add the credentialed live suite against a disposable GitHub repository and real provider, using production templates and linked authentication. Establish nightly monitoring and a release check for the candidate being released.
 
 The full deterministic E2E milestone is complete only when an issue submitted through the public boundary reaches a genuinely merged Git commit through the actual controller and agent paths, independently passes acceptance, respects every required gate, and leaves the expected cleanup state. The live milestone additionally proves the production authentication, external services, and templates. Passing #400 and #401 alone does not satisfy either milestone.
+
+## Task 3 infrastructure
+
+The [system fixtures](../../tests/e2e/system/README.md) implement the local scripted model provider, limited GitHub API adapter, real Git remote, and independent exact-commit acceptance runner. Their mandatory contract job checks the production OpenFlows GitHub client and verifies actual acceptance failure, stale evidence rejection, and Git merging. The model contract checks normal and streamed tool responses and matching tool results.
+
+This is delivery step 3 infrastructure, not the complete system milestone. The production controller, real Coder chats and signed hooks, public human approval, and workspace cleanup across the complete journey remain delivery step 4. The fixture contract driver deliberately controls Git/API calls and must not be presented as proof that agents or the controller performed them.
 
 ## Implementation references
 
