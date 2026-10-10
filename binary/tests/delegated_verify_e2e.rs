@@ -172,6 +172,12 @@ nohup openflows-harness verify serve >/tmp/verify.log 2>&1 </dev/null &"#,
     let submitted = status(&forge, f).await?;
     ensure!(submitted["phase"] == "submit" && submitted["verified_head"] == head);
     exec(&forge, f, &format!("set -euo pipefail\ntest \"$(git rev-parse HEAD)\" = {head}\ntest -z \"$(git status --porcelain)\"\ntest \"$(cat answer.txt)\" = 42")).await?;
+    // Workspace deletion removes the executor log before run.sh can collect it.
+    // Preserve it over real Coder SSH while FORGE is still available.
+    std::fs::write(
+        std::path::Path::new(&std::env::var("OPENFLOWS_E2E_ARTIFACTS")?).join("forge-verify.log"),
+        exec(&forge, f, "cat /tmp/verify.log").await?,
+    )?;
     for ws in workspaces {
         client.delete_workspace(&ws.id).await?;
         client
