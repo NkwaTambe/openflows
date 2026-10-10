@@ -17,16 +17,34 @@ data "coder_parameter" "tenant" {
   type    = "string"
   default = "ci"
 }
+data "coder_parameter" "role" {
+  name    = "role"
+  type    = "string"
+  default = "forge"
+}
+data "coder_parameter" "a2a_relay_addr" {
+  name    = "a2a_relay_addr"
+  type    = "string"
+  default = "127.0.0.1:3000"
+}
+data "coder_parameter" "a2a_pair_token" {
+  name    = "a2a_pair_token"
+  type    = "string"
+  default = "unused-by-worker-lifecycle-test"
+}
 
 resource "coder_agent" "main" {
   os   = "linux"
   arch = "amd64"
   dir  = "/home/coder/workspace"
   env = {
-    REDIS_URL        = "redis://redis:6379"
-    OPENFLOWS_TENANT = data.coder_parameter.tenant.value
-    OPENFLOWS_TICKET = "T-1"
-    OPENFLOWS_ROLE   = "forge"
+    REDIS_URL          = "redis://redis:6379"
+    OPENFLOWS_TENANT   = data.coder_parameter.tenant.value
+    OPENFLOWS_TICKET   = "T-1"
+    OPENFLOWS_ROLE     = data.coder_parameter.role.value
+    A2A_RELAY_ADDR     = data.coder_parameter.a2a_relay_addr.value
+    A2A_PAIR_TOKEN     = data.coder_parameter.a2a_pair_token.value
+    CODER_WORKSPACE_ID = data.coder_workspace.me.id
   }
   startup_script = <<-EOT
     #!/bin/bash

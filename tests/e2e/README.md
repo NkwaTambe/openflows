@@ -9,12 +9,15 @@ Requirements: Linux x86_64, Rust, Docker Engine with Compose, GNU `timeout`, `ta
 ```bash
 bash tests/integration/gated_workflow_test.sh
 bash tests/e2e/run.sh
+OPENFLOWS_E2E_SUITE=verification bash tests/e2e/run.sh
 bash crates/openflows-manager/scripts/run-integration-tests.sh
 ```
 
 The Coder runner builds the current harness binary into an Ubuntu 24.04 worker image. Coder uploads a Terraform fixture, provisions a real worker, and the Rust client executes the harness through real Coder SSH. The test rejects self-approval, a rejected plan, and a stale review; accepts the current reviewed plan; checks a second tenant; stops and starts the workspace; verifies lifecycle persistence; and deletes the workspace.
 
 The Redis runner covers atomic competing decisions, write failure under Redis OOM, review leases, a persisted planning-to-completion lifecycle, missing verification evidence, changed commit identity, client reconnection, and tenant separation. OOM changes the server's global configuration, so this suite runs serially.
+
+The delegated-verification suite provisions separate FORGE and SENTINEL workers. It starts the production A2A HTTP relay against real Redis and runs the actual harness executor in FORGE. A committed acceptance script requires the answer `42`; the first candidate contains `41`. SENTINEL requests verification, observes the failing exit code, and cannot approve testing. FORGE fixes and commits the answer, then SENTINEL must obtain successful verification for that new commit. Approval for the older head/round is rejected. The current verified candidate can reach submit, and the original FORGE checkout must remain clean. The relay fixture seeds only the pair authentication token, never verification results or lifecycle transitions.
 
 The existing manager suite uses real PostgreSQL, creates isolated test databases, and applies migrations. CI supplies its own PostgreSQL service.
 
@@ -39,4 +42,6 @@ A workflow file alone does not enforce merge blocking. These repository settings
 
 This is a real container integration gate and a Coder worker E2E suite. The worker uses a dedicated CI template: it does not validate the production FORGE template's GitHub external-auth bootstrap. The persisted lifecycle test invokes production transition APIs directly; its verification, PR, and merge events are controlled inputs, not actual GitHub actions.
 
-A complete issue-to-merged-PR system suite still needs a scripted model/provider, the running NEXUS controller and role orchestration, hook and A2A transport, and a GitHub fixture that independently verifies requests and commit identity. A separate credentialed smoke suite must exercise the production templates, real GitHub repository, and actual model provider. Neither is represented as complete by the container gate.
+A complete issue-to-merged-PR system suite still needs a scripted model/provider, the running NEXUS controller and role orchestration, real Coder lifecycle hooks, and a GitHub fixture that independently verifies requests and commit identity. The delegated-verification suite covers the A2A transport and execution boundary, but its driver dispatches commands through Coder SSH rather than model tool calls. A separate credentialed smoke suite must exercise the production templates, real GitHub repository, and actual model provider. Neither is represented as complete by the container gate.
+
+Coder's lifecycle-hook flags are hidden from `server --help`; validate them by supplying the flags rather than searching the help output. Do not treat manually submitted hook envelopes as proof of Coder-to-controller hook integration.
