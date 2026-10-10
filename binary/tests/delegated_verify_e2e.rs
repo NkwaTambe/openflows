@@ -87,7 +87,28 @@ async fn failed_acceptance_cannot_pass_and_new_head_requires_new_verification() 
     exec(&sentinel, s, "openflows-harness gate decide --phase plan_ready --revision 1 --round 1 --verdict approve --report /tmp/review.md").await?;
     // The acceptance oracle is a literal requirement (42), committed separately
     // from its deliberately broken input. Verification must actually execute it.
-    exec(&forge, f, "set -euo pipefail\ncd /home/coder/workspace\nprintf '41\\n' > answer.txt\nprintf '#!/bin/sh\\nset -eu\\ntest \"$(cat answer.txt)\" = 42\\nprintf \"ACCEPTANCE_OK\\\\n\"\\n' > acceptance.sh\nchmod +x acceptance.sh\ngit add answer.txt acceptance.sh\ngit commit -m 'deliberately broken candidate'\nopenflows-harness status set testing\nnohup openflows-harness verify serve >/tmp/verify.log 2>&1 </dev/null &").await?;
+    let original_checkout = exec(&forge, f, "pwd -P").await?;
+    let original_checkout = original_checkout.trim();
+    exec(
+        &forge,
+        f,
+        r#"set -euo pipefail
+cd /home/coder/workspace
+printf '41\n' > answer.txt
+cat > acceptance.sh <<'ACCEPTANCE'
+#!/bin/sh
+set -eu
+printf 'CHECKOUT_CWD=%s\n' "$(pwd -P)"
+test "$(cat answer.txt)" = 42
+printf 'ACCEPTANCE_OK\n'
+ACCEPTANCE
+chmod +x acceptance.sh
+git add answer.txt acceptance.sh
+git commit -m 'deliberately broken candidate'
+openflows-harness status set testing
+nohup openflows-harness verify serve >/tmp/verify.log 2>&1 </dev/null &"#,
+    )
+    .await?;
     let broken = status(&forge, f).await?;
     ensure!(broken["phase"] == "testing");
     exec(&sentinel, s, "set -euo pipefail\nif openflows-harness verify request --timeout-secs 30 --expect-exit 0 -- ./acceptance.sh > /tmp/failed.json 2>/tmp/failed.err; then exit 1; fi\ngrep 'expected exit 0' /tmp/failed.err").await?;
@@ -111,6 +132,19 @@ async fn failed_acceptance_cannot_pass_and_new_head_requires_new_verification() 
             .is_some_and(|v| v.contains("ACCEPTANCE_OK")),
         "acceptance command did not execute"
     );
+    let verification_checkout = evidence["stdout"]
+        .as_str()
+        .context("verification stdout is missing")?
+        .lines()
+        .find_map(|line| line.strip_prefix("CHECKOUT_CWD="))
+        .context("acceptance command did not report its working directory")?;
+    let verification_checkout = std::path::Path::new(verification_checkout);
+    ensure!(
+        verification_checkout.is_absolute()
+            && !verification_checkout.starts_with(original_checkout),
+        "verification ran in FORGE's original checkout: {}",
+        verification_checkout.display()
+    );
     ensure!(
         evidence["executor"]["workspace"] == *f,
         "verification ran outside FORGE"
@@ -119,7 +153,21 @@ async fn failed_acceptance_cannot_pass_and_new_head_requires_new_verification() 
         std::path::Path::new(&std::env::var("OPENFLOWS_E2E_ARTIFACTS")?).join("verification.json"),
         serde_json::to_vec_pretty(&evidence)?,
     )?;
-    exec(&sentinel, s, &format!("set -euo pipefail\nif openflows-harness gate decide --phase testing --revision 1 --round {} --head {} --verdict approve --report /tmp/review.md; then exit 1; fi\nopenflows-harness gate decide --phase testing --revision 1 --round {} --head {head} --verdict approve --report /tmp/review.md", broken["review_round"], broken["head"].as_str().unwrap(), fixed["review_round"])).await?;
+    let stale_head = broken["head"].as_str().context("missing old head")?;
+    // Change only one review identity component per attempt so each guard is
+    // independently exercised instead of the round check masking the head check.
+    exec(&sentinel, s, &format!(
+        "set -euo pipefail\nif openflows-harness gate decide --phase testing --revision 1 --round {} --head {stale_head} --verdict approve --report /tmp/review.md > /tmp/stale-head.log 2>&1; then exit 1; fi\ngrep -F 'Review must identify the tested head' /tmp/stale-head.log",
+        fixed["review_round"]
+    )).await?;
+    exec(&sentinel, s, &format!(
+        "set -euo pipefail\nif openflows-harness gate decide --phase testing --revision 1 --round {} --head {head} --verdict approve --report /tmp/review.md > /tmp/stale-round.log 2>&1; then exit 1; fi\ngrep -F 'Review phase or round changed' /tmp/stale-round.log",
+        broken["review_round"]
+    )).await?;
+    exec(&sentinel, s, &format!(
+        "openflows-harness gate decide --phase testing --revision 1 --round {} --head {head} --verdict approve --report /tmp/review.md",
+        fixed["review_round"]
+    )).await?;
     exec(&forge, f, "openflows-harness status set submit").await?;
     let submitted = status(&forge, f).await?;
     ensure!(submitted["phase"] == "submit" && submitted["verified_head"] == head);
