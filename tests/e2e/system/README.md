@@ -115,6 +115,10 @@ This establishes startup and execution. The complete issue → FORGE → SENTINE
 
 The production templates accept `docker_network`, `workspace_image`, `github_api_base`, and `github_git_base` variables. Bootstrap forwards their corresponding `TF_VAR_*` settings to Coder so server-side Terraform receives them. `GITHUB_GIT_BASE` configures the Git origin used by tenant setup and Nexus workspace provisioning. The runner uses an isolated `OPENFLOWS_HOME` and `CODER_CONFIG_DIR` and never loads the developer's `.env`.
 
+After changing configuration, the driver reads each fresh template version's stored variables through Coder's API and verifies the updated value. `template-variables.json` saves those non-sensitive settings. New version IDs alone are insufficient evidence that the settings were forwarded.
+
+Chat state and messages are collected in a `finally` block on success, failure, and chat timeout, before the stack is removed. Inspect `chat-state.json` and `chat.json`; unavailable diagnostic endpoints are recorded in `chat-diagnostics-errors.json` without replacing the original scenario failure. `cleanup.log` preserves removal errors. Cleanup checks that run-owned volume names and image tags are gone, allows resources already removed by Compose, and fails if resources remain or Docker cannot confirm their removal.
+
 ## Why Python is used here
 
 Python implements the disposable HTTP providers and the test driver. Its standard library provides HTTP servers, JSON, subprocess execution, and bounded waits, so these helpers need no additional Python packages. Coder still executes real tools, Git still commits and merges real changes, and the OpenFlows controller and harness remain the Rust binaries compiled from the candidate revision. Production workspace creation and startup use the bundled Terraform and shell scripts.

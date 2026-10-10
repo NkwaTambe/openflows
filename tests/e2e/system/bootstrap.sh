@@ -20,9 +20,27 @@ mkdir -p "$artifacts"
 scratch=$(mktemp -d)
 export OPENFLOWS_SYSTEM_FIXTURE_IMAGE="$project-fixtures:ci"
 compose=(docker compose --env-file /dev/null -p "$project" -f "$PWD/tests/e2e/compose.yml" -f "$PWD/tests/e2e/system/bootstrap.compose.yml")
+remove_resource() {
+    local kind="$1" name="$2" filter remaining
+    if [ "$kind" = image ]; then
+        filter="reference=$name"
+    else
+        filter="name=^${name}$"
+    fi
+    # Removal may legitimately find a resource already removed by Compose.
+    docker "$kind" rm "$name" >>"$artifacts/cleanup.log" 2>&1 || true
+    if ! remaining=$(docker "$kind" ls --quiet --filter "$filter" 2>>"$artifacts/cleanup.log"); then
+        return 1
+    fi
+    if [ -n "$remaining" ]; then
+        printf 'Cleanup left %s %s behind\n' "$kind" "$name" >>"$artifacts/cleanup.log"
+        return 1
+    fi
+}
 cleanup() {
     result=$?
     trap - EXIT
+    : >"$artifacts/cleanup.log"
     "${compose[@]}" logs --no-color >"$artifacts/stack.log" 2>&1 || true
     # Only this run's private network can contain these resources.
     while IFS= read -r id; do
@@ -33,16 +51,17 @@ cleanup() {
         docker cp "$id:/tmp/model/model-requests.jsonl" "$artifacts/model-requests.jsonl" 2>/dev/null || true
         docker cp "$id:/tmp/github/github-requests.jsonl" "$artifacts/github-requests.jsonl" 2>/dev/null || true
         docker inspect "$id" --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' >>"$scratch/volumes" || true
-        docker rm -f "$id" >/dev/null 2>&1 || result=1
+        docker rm -f "$id" >>"$artifacts/cleanup.log" 2>&1 || result=1
     done < <(docker ps -aq --filter "network=${project}_default")
-    "${compose[@]}" down --volumes --remove-orphans >"$artifacts/cleanup.log" 2>&1 || result=1
+    "${compose[@]}" down --volumes --remove-orphans >>"$artifacts/cleanup.log" 2>&1 || result=1
     if [ -f "$scratch/volumes" ]; then
         while IFS= read -r volume; do
             [ -n "$volume" ] || continue
-            docker volume rm "$volume" >/dev/null 2>&1 || true
+            remove_resource volume "$volume" || result=1
         done < <(sort -u "$scratch/volumes")
     fi
-    docker image rm "$project-workspace:ci" "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" >/dev/null 2>&1 || true
+    remove_resource image "$project-workspace:ci" || result=1
+    remove_resource image "$OPENFLOWS_SYSTEM_FIXTURE_IMAGE" || result=1
     rm -rf "$scratch"
     exit "$result"
 }

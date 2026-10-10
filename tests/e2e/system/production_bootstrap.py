@@ -64,6 +64,39 @@ def ssh(name, command):
         capture_output=True, text=True, timeout=40, check=True).stdout
 
 
+def save_chat_diagnostics(chat_id):
+    errors = {}
+    for filename, endpoint in (
+        ('chat-state.json', '/chats/' + chat_id),
+        ('chat.json', '/chats/' + chat_id + '/messages?limit=100'),
+    ):
+        try:
+            (ARTIFACTS / filename).write_text(json.dumps(coder(endpoint), indent=2))
+        except Exception as error:
+            # Collect each endpoint independently and preserve the scenario failure.
+            errors[filename] = str(error)
+    if errors:
+        (ARTIFACTS / 'chat-diagnostics-errors.json').write_text(json.dumps(errors, indent=2))
+
+
+def wait_for_chat(chat_id, seconds=180):
+    def settled():
+        current = coder('/chats/' + chat_id)
+        if current['status'] == 'error':
+            raise RuntimeError(f'Real Coder chat failed: {current}')
+        messages = coder('/chats/' + chat_id + '/messages?limit=100')
+        completed = any(part.get('text') == 'The production workspace executed the bootstrap canary.'
+            for message in messages['messages'] if message['role'] == 'assistant'
+            for part in message.get('content', []))
+        return messages if completed and current['status'] == 'waiting' else False
+    try:
+        messages = wait('real Coder chat did not complete the tool-result conversation', settled, seconds)
+        (ARTIFACTS / 'chat.json').write_text(json.dumps(messages, indent=2))
+        return messages
+    finally:
+        save_chat_diagnostics(chat_id)
+
+
 def run():
     global TOKEN
     def server_ready():
@@ -111,17 +144,7 @@ def run():
     print('Production Nexus workspace cloned the repository and started its controller.', flush=True)
     chat = coder('/chats', {'organization_id': organization['id'], 'workspace_id': workspace['id'],
         'content': [{'type': 'text', 'text': 'Execute the production bootstrap canary.'}]})
-    def settled():
-        current = coder('/chats/' + chat['id'])
-        if current['status'] == 'error':
-            raise RuntimeError(f'Real Coder chat failed: {current}')
-        messages = coder('/chats/' + chat['id'] + '/messages?limit=100')
-        completed = any(part.get('text') == 'The production workspace executed the bootstrap canary.'
-            for message in messages['messages'] if message['role'] == 'assistant'
-            for part in message.get('content', []))
-        return messages if completed and current['status'] == 'waiting' else False
-    messages = wait('real Coder chat did not complete the tool-result conversation', settled)
-    (ARTIFACTS / 'chat.json').write_text(json.dumps(messages, indent=2))
+    messages = wait_for_chat(chat['id'])
     results = [part for message in messages['messages'] for part in message.get('content', [])
         if part['type'] == 'tool-result' and part.get('tool_name') == 'execute']
     assert len(results) == 1 and not results[0].get('is_error'), 'No successful real workspace execution'
@@ -146,7 +169,15 @@ def run():
     os.environ['TF_VAR_github_api_base'] += '/'
     changed = bootstrap('bootstrap-config-change.log')
     assert all(changed[name] != version for name, version in before.items()), 'Changed template variables were ignored by bootstrap'
-    print('Changed Terraform configuration produced fresh versions of all five templates.', flush=True)
+    stored_variables = {}
+    for template_name, version in changed.items():
+        variables = coder('/templateversions/' + version + '/variables')
+        stored_variables[template_name] = {v['name']: v['value'] for v in variables if not v.get('sensitive')}
+    (ARTIFACTS / 'template-variables.json').write_text(json.dumps(stored_variables, indent=2))
+    for template_name, variables in stored_variables.items():
+        assert variables['github_api_base'] == os.environ['TF_VAR_github_api_base'], \
+            f'{template_name} did not store the updated GitHub API setting: {variables}'
+    print('All five fresh template versions stored the changed Terraform configuration.', flush=True)
     (ARTIFACTS / 'bootstrap-evidence.json').write_text(json.dumps({
         'workspace': workspace, 'templates': templates, 'chat_id': chat['id'],
         'git_clone': 'real git daemon', 'controller_health': 'healthy',
