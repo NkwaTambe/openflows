@@ -13,6 +13,7 @@ struct Fixture {
     root: tempfile::TempDir,
     url: String,
     scripts: PathBuf,
+    artifacts: Option<PathBuf>,
 }
 
 impl Drop for Fixture {
@@ -22,11 +23,21 @@ impl Drop for Fixture {
             .args(["-TERM", &self.child.id().to_string()])
             .status();
         let _ = self.child.wait();
+        if let Err(error) = self.preserve_artifacts() {
+            eprintln!("Failed to preserve production-client diagnostics: {error:#}");
+        }
     }
 }
 
 impl Fixture {
     async fn start() -> Result<Self> {
+        Self::start_with_artifacts(
+            std::env::var_os("OPENFLOWS_FIXTURE_ARTIFACTS").map(PathBuf::from),
+        )
+        .await
+    }
+
+    async fn start_with_artifacts(artifacts: Option<PathBuf>) -> Result<Self> {
         let root = tempfile::tempdir()?;
         let scripts = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/system");
         let ready = root.path().join("ready.json");
@@ -45,6 +56,7 @@ impl Fixture {
             root,
             url: String::new(),
             scripts,
+            artifacts,
         };
         let deadline = Instant::now() + Duration::from_secs(15);
         while !ready.exists() {
@@ -61,6 +73,41 @@ impl Fixture {
             .context("missing fixture URL")?
             .into();
         Ok(fixture)
+    }
+
+    fn preserve_artifacts(&self) -> Result<()> {
+        let Some(destination) = &self.artifacts else {
+            return Ok(());
+        };
+        for relative in [
+            "fixture.log",
+            "service/github-requests.jsonl",
+            "service/git-daemon.log",
+        ] {
+            let source = self.root.path().join(relative);
+            if source.exists() {
+                let target = destination.join(relative);
+                std::fs::create_dir_all(target.parent().context("missing artifact parent")?)?;
+                std::fs::copy(source, target)?;
+            }
+        }
+        let evidence = self.root.path().join("ci-artifacts");
+        if evidence.exists() {
+            let target = destination.join("ci-artifacts");
+            std::fs::create_dir_all(&target)?;
+            for entry in std::fs::read_dir(evidence)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|value| value == "json")
+                {
+                    std::fs::copy(entry.path(), target.join(entry.file_name()))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn git(&self, cwd: &Path, args: &[&str]) -> Result<String> {
@@ -233,5 +280,63 @@ async fn production_github_client_observes_real_ci_and_confirmed_git_merge() -> 
         &checkout,
         &["merge-base", "--is-ancestor", &fixed, "origin/main"],
     )?;
+    // Surface write failures on successful contracts. Drop also preserves evidence
+    // after shutdown on early returns and panics before TempDir removes it.
+    fixture.preserve_artifacts()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_contract_preserves_logs_and_real_acceptance_evidence_after_cleanup() -> Result<()> {
+    let artifacts = tempfile::tempdir()?;
+    let destination = artifacts.path().join("failed-contract");
+    let fixture = Fixture::start_with_artifacts(Some(destination.clone())).await?;
+    let original_root = fixture.root.path().to_owned();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let repository: Value = http
+        .get(format!("{}/repos/test/repo", fixture.url))
+        .bearer_auth("ci-forge-token")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let remote = repository["clone_url"]
+        .as_str()
+        .context("missing Git remote")?;
+    let bare = fixture.root.path().join("service/repo.git");
+    let head = fixture.git(
+        fixture.root.path(),
+        &[
+            "--git-dir",
+            bare.to_str().context("invalid Git path")?,
+            "rev-parse",
+            "main",
+        ],
+    )?;
+    ensure!(!fixture.ci(remote, &head)?);
+    // A public API failure must still leave diagnostics when the guard drops.
+    let error = GithubRestClient::with_api_base("invalid-credential", &fixture.url)
+        .get_authenticated_user_login()
+        .await
+        .expect_err("invalid credential must fail");
+    ensure!(error.to_string().contains("401"));
+    drop(fixture);
+    ensure!(
+        !original_root.exists(),
+        "temporary repository was not cleaned up"
+    );
+    ensure!(destination.join("fixture.log").exists());
+    ensure!(destination.join("service/git-daemon.log").exists());
+    let journal = std::fs::read_to_string(destination.join("service/github-requests.jsonl"))?;
+    ensure!(journal.contains("401") && journal.contains("check-runs"));
+    let evidence: Value = serde_json::from_slice(&std::fs::read(
+        destination
+            .join("ci-artifacts")
+            .join(format!("{head}.json")),
+    )?)?;
+    ensure!(evidence["head_sha"] == head && evidence["exit_code"] == 1);
     Ok(())
 }

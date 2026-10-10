@@ -85,7 +85,12 @@ Each model ID identifies one bounded scripted conversation. The example tool nam
 
 After returning a tool call, the next step requires its matching tool result; `requires.contains` can additionally assert expected output. Repeated identical requests return the same response without advancing the script. The model fixture does not execute tools, edit files, write lifecycle state, publish checks, or merge: the caller must execute returned tool calls. The real Coder execution and role-to-conversation mapping will be validated in task 4.
 
-For Docker-network use, supply `--host 0.0.0.0 --port 8080`; for GitHub also use `--git-host 0.0.0.0 --git-port 9418 --remote-host github-fixture`. These options must only be used inside an isolated test network.
+For Docker-network use, bind with `--host 0.0.0.0 --port 8080` and set `--advertise-host` to the fixture's service name:
+
+- Model: `--advertise-host model-fixture` publishes `http://model-fixture:8080`; Coder's provider URL is `http://model-fixture:8080/v1`.
+- GitHub: `--advertise-host github-fixture --git-host 0.0.0.0 --git-port 9418 --remote-host github-fixture` publishes `http://github-fixture:8080` and a Git remote using `github-fixture`.
+
+The bind address and advertised hostname serve different purposes. Without `--advertise-host`, the ready URL defaults to loopback for host-local tests. Readiness metadata is published with an atomic rename so its first visible contents are complete JSON. These Docker options must only be used inside an isolated test network.
 
 ## Failure coverage and evidence
 
@@ -98,6 +103,6 @@ The contracts check:
 - Real Git conflicts leave the base unchanged and the PR unmerged.
 - Successful merge responses identify an actual Git commit containing the fix.
 
-Artifacts under `target/ci-artifacts/system-fixtures/<run>/` include HTTP request/response journals (without authorization headers), Git daemon logs, acceptance evidence, container output, and the production-client test output. Tests preserve these before deleting temporary repositories. Cleanup removes only the run's named container and image; server shutdown stops its own Git daemon.
+Artifacts under `target/ci-artifacts/system-fixtures/<run>/` include HTTP request/response journals (without authorization headers), Git daemon logs, acceptance evidence, container output, and the production-client test output. Rust diagnostics are copied under `production-client/` on success and failure before its temporary directory is deleted, including when a failed Rust contract prevents the later container tests from running. Tests preserve these before deleting temporary repositories. Cleanup removes only the run's named container and image; server shutdown stops its own Git daemon.
 
 The live suite will validate these adapters against real GitHub and a real model provider. Passing these contract tests does not establish production GitHub authentication or model quality.

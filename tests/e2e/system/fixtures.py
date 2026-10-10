@@ -5,6 +5,7 @@ import json
 import signal
 import subprocess
 import threading
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -47,7 +48,9 @@ class ScriptedModel:
             if len(results) != 1:
                 raise Rejected(409, 'Expected the matching tool result')
             required = step.get('requires', {}).get('contains')
-            if required and required not in json.dumps(results[0].get('content')):
+            content = results[0].get('content')
+            text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            if required and required not in text:
                 raise Rejected(409, 'Tool result did not satisfy the scenario')
         message = {'role': 'assistant', 'content': step.get('text')}
         reason = 'stop'
@@ -210,6 +213,7 @@ if __name__ == '__main__':
     parser.add_argument('--scenario', type=Path)
     parser.add_argument('--host', default='127.0.0.1')
     parser.add_argument('--port', type=int, default=0)
+    parser.add_argument('--advertise-host', default='127.0.0.1')
     parser.add_argument('--ready-file', type=Path, required=True)
     parser.add_argument('--git-host', default='127.0.0.1')
     parser.add_argument('--git-port', type=int, default=0)
@@ -223,8 +227,16 @@ if __name__ == '__main__':
         threading.Thread(target=server.shutdown, daemon=True).start()
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    args.ready_file.write_text(json.dumps({'url': f'http://127.0.0.1:{server.server_port}'}))
     try:
+        # Existence means readiness: rename a completed file on the same filesystem.
+        with tempfile.NamedTemporaryFile(mode='w', dir=args.ready_file.parent,
+                prefix=args.ready_file.name + '.', delete=False) as ready:
+            pending = Path(ready.name)
+            json.dump({'url': f'http://{args.advertise_host}:{server.server_port}'}, ready)
+        try:
+            pending.replace(args.ready_file)
+        finally:
+            pending.unlink(missing_ok=True)
         server.serve_forever()
     finally:
         server.server_close()

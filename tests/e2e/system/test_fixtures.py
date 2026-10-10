@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import subprocess
+import time
 import threading
 import unittest
 import urllib.error
@@ -47,7 +48,13 @@ class FixtureTest(FixtureCase):
             scenario = Path(directory) / 'scenario.json'
             scenario.write_text(json.dumps({'e2e-forge': [
                 {'tool': 'execute', 'arguments': {'command': './acceptance.sh'}},
-                {'requires': {'contains': 'exit_code=1'}, 'text': 'Repair is required.'},
+                {'requires': {'contains': 'exit_code=1\n'}, 'text': 'Repair is required.'},
+            ], 'e2e-unicode': [
+                {'tool': 'execute', 'arguments': {'command': 'inspect'}},
+                {'requires': {'contains': 'échec\nréessayer'}, 'text': 'Understood.'},
+            ], 'e2e-structured': [
+                {'tool': 'execute', 'arguments': {'command': 'inspect'}},
+                {'requires': {'contains': '"exit_code": 1'}, 'text': 'Understood.'},
             ]}))
             self.start('model', scenario)
 
@@ -113,6 +120,59 @@ class FixtureTest(FixtureCase):
         self.assertEqual(chunks[-1]['choices'][0]['finish_reason'], 'tool_calls')
         self.assertEqual(self.request('/v1/chat/completions', request, 'wrong-key')[0], 401)
         self.assertEqual(self.request('/v1/responses', request)[0], 404)
+
+    def test_unicode_and_structured_tool_results_match_their_actual_content(self):
+        for model, content in [('e2e-unicode', 'échec\nréessayer'),
+                ('e2e-structured', {'exit_code': 1, 'stdout': 'Failed'})]:
+            with self.subTest(model=model):
+                request = {'model': model, 'messages': [{'role': 'user', 'content': 'Inspect'}],
+                    'tools': [{'type': 'function', 'function': {'name': 'execute', 'parameters': {
+                        'type': 'object', 'properties': {'command': {'type': 'string'}},
+                        'required': ['command']}}}]}
+                code, body, _ = self.request('/v1/chat/completions', request)
+                self.assertEqual(code, 200)
+                call = json.loads(body)['choices'][0]['message']['tool_calls'][0]
+                request['messages'].extend([{'role': 'assistant', 'tool_calls': [call]},
+                    {'role': 'tool', 'tool_call_id': call['id'], 'content': content}])
+                code, body, _ = self.request('/v1/chat/completions', request)
+                self.assertEqual(code, 200)
+                self.assertEqual(json.loads(body)['choices'][0]['message']['content'], 'Understood.')
+
+
+class FixtureCliTest(unittest.TestCase):
+    def test_first_visible_ready_file_is_valid_and_advertises_the_configured_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario = root / 'scenario.json'
+            scenario.write_text(json.dumps({'e2e-forge': [{'text': 'Ready.'}]}))
+            for advertised in ['127.0.0.1', 'model-fixture']:
+                with self.subTest(advertised=advertised):
+                    ready = root / f'{advertised}.json'
+                    process = subprocess.Popen(['python3', str(Path(__file__).with_name('fixtures.py')),
+                        '--service', 'model', '--root', str(root / advertised),
+                        '--scenario', str(scenario), '--host', '0.0.0.0',
+                        '--advertise-host', advertised, '--ready-file', str(ready)],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not ready.exists():
+                            self.assertIsNone(process.poll(), 'Fixture exited before readiness')
+                            self.assertLess(time.monotonic(), deadline, 'Fixture startup timed out')
+                            time.sleep(0.001)
+                        metadata = json.loads(ready.read_text())
+                        self.assertTrue(metadata['url'].startswith(f'http://{advertised}:'))
+                        port = metadata['url'].rsplit(':', 1)[1]
+                        with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=5) as response:
+                            self.assertEqual(json.load(response), {'status': 'ready'})
+                        self.assertEqual(list(root.glob(ready.name + '.*')), [])
+                    finally:
+                        process.terminate()
+                        try:
+                            output, error = process.communicate(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            output, error = process.communicate(timeout=5)
+                        self.assertEqual(process.returncode, 0, output + error)
 
 
 class GitHubFixtureTest(FixtureCase):
