@@ -1,6 +1,6 @@
 # Shared GitHub App for SaaS and local runs
 
-Status: approved product contract; implementation is incremental.
+Status: approved product contract; connected-local implementation under review.
 
 ## Two credential paths
 
@@ -26,7 +26,7 @@ and renewal happen directly between the local Manager and GitHub.
 3. The Manager polls within GitHub's required interval and stores the returned
    user access and refresh tokens in secure local credential storage.
 4. It lists installations and repositories visible to that user token, then
-   selects a repository by immutable GitHub repository ID. GitHub remains the
+   verifies each requested repository by immutable GitHub repository ID. GitHub remains the
    authorization authority for subsequent Git and API calls.
 5. Before expiry, the Manager refreshes directly with GitHub and atomically
    replaces both tokens. Concurrent jobs share one renewal operation.

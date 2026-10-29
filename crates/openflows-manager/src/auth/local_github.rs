@@ -69,6 +69,30 @@ pub struct LocalGithubAuth {
     client_id: String,
     device_url: String,
     token_url: String,
+    api_base: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccessibleRepository {
+    /// GitHub's stable repository identity; names may change.
+    pub id: i64,
+    pub full_name: String,
+    pub private: bool,
+}
+
+#[derive(Deserialize)]
+struct InstallationList {
+    installations: Vec<InstallationSummary>,
+}
+
+#[derive(Deserialize)]
+struct InstallationSummary {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+struct RepositoryList {
+    repositories: Vec<AccessibleRepository>,
 }
 
 impl LocalGithubAuth {
@@ -89,7 +113,84 @@ impl LocalGithubAuth {
             client_id,
             device_url: DEVICE_CODE_URL.into(),
             token_url: TOKEN_URL.into(),
+            api_base: "https://api.github.com".into(),
         })
+    }
+
+    pub fn with_api_base(mut self, base: String) -> Self {
+        self.api_base = base.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// List only repositories in an installation accessible to this user.
+    /// GitHub applies the user/App permission intersection to these endpoints.
+    pub async fn accessible_repositories(
+        &self,
+        access_token: &str,
+    ) -> Result<Vec<AccessibleRepository>, ManagerError> {
+        let mut installations = Vec::new();
+        for page in 1..=100 {
+            let response = self
+                .client
+                .get(format!("{}/user/installations", self.api_base))
+                .bearer_auth(access_token)
+                .header("Accept", "application/vnd.github+json")
+                .query(&[("per_page", 100), ("page", page)])
+                .send()
+                .await
+                .map_err(|_| auth_failed())?;
+            if !response.status().is_success() {
+                return Err(auth_failed());
+            }
+            let batch: InstallationList = response.json().await.map_err(|_| auth_failed())?;
+            let count = batch.installations.len();
+            installations.extend(batch.installations);
+            if count < 100 {
+                break;
+            }
+            if page == 100 {
+                return Err(ManagerError::api(
+                    "GITHUB_LIST_TOO_LARGE",
+                    "Too many GitHub installations",
+                ));
+            }
+        }
+
+        let mut repositories = Vec::new();
+        for installation in installations {
+            for page in 1..=100 {
+                let response = self
+                    .client
+                    .get(format!(
+                        "{}/user/installations/{}/repositories",
+                        self.api_base, installation.id
+                    ))
+                    .bearer_auth(access_token)
+                    .header("Accept", "application/vnd.github+json")
+                    .query(&[("per_page", 100), ("page", page)])
+                    .send()
+                    .await
+                    .map_err(|_| auth_failed())?;
+                if !response.status().is_success() {
+                    return Err(auth_failed());
+                }
+                let batch: RepositoryList = response.json().await.map_err(|_| auth_failed())?;
+                let count = batch.repositories.len();
+                repositories.extend(batch.repositories);
+                if count < 100 {
+                    break;
+                }
+                if page == 100 {
+                    return Err(ManagerError::api(
+                        "GITHUB_LIST_TOO_LARGE",
+                        "Too many GitHub repositories",
+                    ));
+                }
+            }
+        }
+        repositories.sort_by_key(|repo| repo.id);
+        repositories.dedup_by_key(|repo| repo.id);
+        Ok(repositories)
     }
 
     pub async fn start(&self) -> Result<DeviceChallenge, ManagerError> {
