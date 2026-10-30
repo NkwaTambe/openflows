@@ -30,19 +30,6 @@ fn is_connected_local(auth_mode: Option<&str>, template_mode: Option<&str>) -> b
     auth_mode == Some("connected-local") && template_mode == Some("true")
 }
 
-#[cfg(test)]
-mod connected_local_tests {
-    use super::is_connected_local;
-
-    #[test]
-    fn only_connected_local_skips_coder_external_auth() {
-        assert!(is_connected_local(Some("connected-local"), Some("true")));
-        assert!(!is_connected_local(Some("self-managed"), Some("true")));
-        assert!(!is_connected_local(Some("connected-local"), Some("false")));
-        assert!(!is_connected_local(None, None));
-    }
-}
-
 /// Check whether a password meets Coder's minimum security requirements.
 ///
 /// Coder requires at least: uppercase, lowercase, digit, special character,
@@ -671,5 +658,18 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
             warn!("  ⚠ Template '{}' push failed: {}", name, e);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod connected_local_tests {
+    use super::is_connected_local;
+
+    #[test]
+    fn only_connected_local_skips_coder_external_auth() {
+        assert!(is_connected_local(Some("connected-local"), Some("true")));
+        assert!(!is_connected_local(Some("self-managed"), Some("true")));
+        assert!(!is_connected_local(Some("connected-local"), Some("false")));
+        assert!(!is_connected_local(None, None));
     }
 }
