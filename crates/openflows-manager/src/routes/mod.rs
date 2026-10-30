@@ -20,6 +20,7 @@ pub mod connections;
 pub mod device;
 pub mod health;
 pub mod invitations;
+pub mod local_github;
 pub mod organizations;
 pub mod platform_releases;
 pub mod runtime;
@@ -238,6 +239,17 @@ pub(crate) fn api_v1_routes() -> Vec<ApiRoute> {
             success: 200,
             description: Some("Provide the refresh_token in the JSON body; no bearer header is used."),
             router: post(auth::refresh),
+        },
+        ApiRoute {
+            methods: &["POST"],
+            path: "/local/github-credential",
+            tag: "auth",
+            summary: "Exchange a local GitHub credential",
+            auth: Auth::None,
+            is_json: true,
+            success: 200,
+            description: Some("Local-mode GitHub credential exchange; no bearer header is used."),
+            router: post(local_github::credential),
         },
         ApiRoute {
             methods: &["GET"],
@@ -752,8 +764,7 @@ pub fn router() -> Router<AppState> {
     // contains no credentials or runtime tokens.
     root.nest("/api/v1", api).merge(
         SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
-    )
-}
+    )}
 
 #[derive(Serialize)]
 struct ApiIndexResponse {

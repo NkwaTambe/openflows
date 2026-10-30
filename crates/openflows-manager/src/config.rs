@@ -158,10 +158,8 @@ impl fmt::Display for Mode {
 
 /// The name of the environment variable that selects the deployment mode.
 pub const MODE_ENV: &str = "OPENFLOWS_MODE";
-/// Enables the connected-local capability. In hosted mode this permits the
-/// SaaS Manager to enroll local Managers; in local mode it permits this
-/// Manager to act as a connected client. The default is disabled so existing
-/// deployments preserve their current behavior.
+/// Enables connected-local client behavior in local mode. Hosted deployments
+/// retain their existing SaaS credential path. The default is disabled.
 pub const CONNECTED_LOCAL_ENABLED_ENV: &str = "OPENFLOWS_CONNECTED_LOCAL_ENABLED";
 /// The environment variable carrying the Openflows control-plane database URL.
 pub const DATABASE_URL_ENV: &str = "OPENFLOWS_DATABASE_URL";
@@ -777,7 +775,7 @@ fn parse_bool(env: &str, default: bool) -> Result<bool, String> {
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
     pub mode: Mode,
-    /// Whether connected-local enrollment/client behavior is enabled. This is
+    /// Whether connected-local client behavior is enabled. This is
     /// deliberately independent from `mode`: hosted and local deployments
     /// use the same binary but have different roles when the capability is on.
     pub connected_local_enabled: bool,
