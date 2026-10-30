@@ -8,8 +8,10 @@
 //! - **Lifecycle hooks consumer** (`crates/agent-nexus/src/hooks/server.rs`):
 //!   a JWT-signed webhook and its health probe.
 //!
-//! Each listener serves only the routes it actually registers, so advertised
-//! calls never 404 on the serving listener.
+//! Each listener serves only the routes it actually registers. The documents
+//! are generated from the **same route tables** that build the listeners
+//! (`crate::a2a::http_server::routes`, `crate::hooks::server::routes`), so a
+//! route cannot be registered without being documented.
 
 use utoipa::openapi::{
     info::Info,
@@ -20,100 +22,54 @@ use utoipa::openapi::{
     Type,
 };
 
-const GET: &str = "GET";
-const POST: &str = "POST";
-
-/// A single documented Agent Nexus route.
-#[derive(Debug, Clone, Copy)]
-pub struct RouteInfo {
-    /// HTTP method, e.g. `"GET"`.
-    pub method: &'static str,
-    /// Full path as registered on the listener.
-    pub path: &'static str,
-    /// Functional tag (`a2a` or `hooks`).
-    pub tag: &'static str,
-    /// One-line human summary.
-    pub summary: &'static str,
-    /// Longer description (protocol details, methods, query parameters).
-    pub description: &'static str,
+/// Documentation metadata for one (method, path) operation, derived from the
+/// shared route tables of the listeners.
+struct DocRoute {
+    method: &'static str,
+    path: &'static str,
+    tag: &'static str,
+    summary: &'static str,
+    description: &'static str,
 }
 
-/// Routes served by the A2A relay listener.
-const A2A_ROUTES: &[RouteInfo] = &[
-    RouteInfo {
-        method: POST,
-        path: "/rpc",
-        tag: "a2a",
-        summary: "A2A JSON-RPC dispatch",
-        description: "Dispatches A2A methods by name in the JSON-RPC body: message/send, tasks/get, tasks/claim, tasks/complete, tasks/cancel, tasks/resubscribe, tasks/push_progress. JSON-RPC errors are returned inside the 200 response envelope, not as separate HTTP error bodies.",
-    },
-    RouteInfo {
-        method: GET,
-        path: "/",
-        tag: "a2a",
-        summary: "SSE verify-task progress stream",
-        description: "Server-Sent Events stream of VerifyProgressEvent chunks. Requires a task_id query parameter; replays buffered events on connect, then streams live until completion or disconnect.",
-    },
-    RouteInfo {
-        method: GET,
-        path: "/health",
-        tag: "a2a",
-        summary: "A2A relay liveness probe",
-        description: "Returns 200 when the relay process is alive.",
-    },
-    RouteInfo {
-        method: GET,
-        path: "/.well-known/agent-card.json",
-        tag: "a2a",
-        summary: "Agent card",
-        description: "Describes the relay's capabilities, task types and methods (not the executors).",
-    },
-    RouteInfo {
-        method: GET,
-        path: "/openapi.json",
-        tag: "a2a",
-        summary: "Agent Nexus A2A OpenAPI specification",
-        description: "The generated OpenAPI document for the A2A relay listener.",
-    },
-];
+fn a2a_doc_routes() -> Vec<DocRoute> {
+    crate::a2a::http_server::routes()
+        .into_iter()
+        .map(|rt| DocRoute {
+            method: rt.method,
+            path: rt.path,
+            tag: "a2a",
+            summary: rt.summary,
+            description: rt.description,
+        })
+        .collect()
+}
 
-/// Routes served by the lifecycle hooks consumer listener.
-const HOOKS_ROUTES: &[RouteInfo] = &[
-    RouteInfo {
-        method: POST,
-        path: "/experimental/hooks/chat",
-        tag: "hooks",
-        summary: "Coder lifecycle hook webhook",
-        description: "Receives JWT-signed Coder lifecycle dispatches. Returns Coder's response schema: permission.decision (allow/deny), input_override for rewrites, and model_context feedback. Fail-closed on bad signature.",
-    },
-    RouteInfo {
-        method: GET,
-        path: "/experimental/hooks/health",
-        tag: "hooks",
-        summary: "Hook consumer liveness probe",
-        description: "Returns 200 when the hook consumer is alive.",
-    },
-    RouteInfo {
-        method: GET,
-        path: "/openapi.json",
-        tag: "hooks",
-        summary: "Agent Nexus hooks OpenAPI specification",
-        description: "The generated OpenAPI document for the lifecycle hooks listener.",
-    },
-];
+fn hooks_doc_routes() -> Vec<DocRoute> {
+    crate::hooks::server::routes()
+        .into_iter()
+        .map(|rt| DocRoute {
+            method: rt.method,
+            path: rt.path,
+            tag: "hooks",
+            summary: rt.summary,
+            description: rt.description,
+        })
+        .collect()
+}
 
 /// Build an operation for a route.
-fn build_operation(info: &RouteInfo) -> utoipa::openapi::path::Operation {
+fn build_operation(route: &DocRoute) -> utoipa::openapi::path::Operation {
     let mut op = OperationBuilder::new()
-        .summary(Some(info.summary))
-        .tag(info.tag)
-        .description(Some(info.description))
+        .summary(Some(route.summary))
+        .tag(route.tag)
+        .description(Some(route.description))
         .response(
             "200",
             ResponseBuilder::new().description("Successful response"),
         );
 
-    match info.path {
+    match route.path {
         "/rpc" => {
             op = op.request_body(Some(json_body("JsonRpcRequest"))).response(
                 "200",
@@ -181,23 +137,23 @@ fn json_response(description: &str, schema: &str) -> ResponseBuilder {
 }
 
 /// Group a route list into OpenAPI path items.
-fn build_paths(routes: &[RouteInfo]) -> Paths {
-    let mut by_path: std::collections::BTreeMap<&str, Vec<&RouteInfo>> =
+fn build_paths(routes: &[DocRoute]) -> Paths {
+    let mut by_path: std::collections::BTreeMap<&str, Vec<&DocRoute>> =
         std::collections::BTreeMap::new();
-    for info in routes {
-        by_path.entry(info.path).or_default().push(info);
+    for route in routes {
+        by_path.entry(route.path).or_default().push(route);
     }
 
     let mut builder = PathsBuilder::new();
-    for (path, infos) in by_path {
+    for (path, routes) in by_path {
         let mut path_item = PathItemBuilder::new();
-        for info in infos {
-            let method = match info.method {
+        for route in routes {
+            let method = match route.method {
                 "GET" => HttpMethod::Get,
                 "POST" => HttpMethod::Post,
                 other => panic!("unsupported method {other} for {path}"),
             };
-            path_item = path_item.operation(method, build_operation(info));
+            path_item = path_item.operation(method, build_operation(route));
         }
         builder = builder.path(path, path_item.build());
     }
@@ -210,7 +166,7 @@ fn nullable_string() -> ObjectBuilder {
 }
 
 /// Build the OpenAPI document for a given route list.
-fn build_openapi(routes: &[RouteInfo], title: &str) -> OpenApi {
+fn build_openapi(routes: &[DocRoute], title: &str) -> OpenApi {
     OpenApiBuilder::new()
         .info(Info::new(title, env!("CARGO_PKG_VERSION")))
         .paths(build_paths(routes))
@@ -221,6 +177,14 @@ fn build_openapi(routes: &[RouteInfo], title: &str) -> OpenApi {
 /// Reusable component schemas for Agent Nexus.
 fn components() -> utoipa::openapi::schema::Components {
     let string = || ObjectBuilder::new().schema_type(Type::String);
+    // JSON-RPC id: the relay accepts and echoes string, integer, or null ids.
+    let rpc_id = || {
+        ObjectBuilder::new().schema_type(SchemaType::Array(vec![
+            Type::String,
+            Type::Integer,
+            Type::Null,
+        ]))
+    };
 
     utoipa::openapi::schema::ComponentsBuilder::new()
         // ---- A2A JSON-RPC envelope ----
@@ -232,12 +196,7 @@ fn components() -> utoipa::openapi::schema::Components {
                 .property("jsonrpc", string())
                 .property("method", string())
                 .property("params", ObjectBuilder::new().schema_type(Type::Object))
-                // The relay accepts and echoes numeric or string ids.
-                .property(
-                    "id",
-                    ObjectBuilder::new()
-                        .schema_type(SchemaType::Array(vec![Type::String, Type::Integer])),
-                )
+                .property("id", rpc_id())
                 .required("jsonrpc")
                 .required("method"),
         )
@@ -247,13 +206,19 @@ fn components() -> utoipa::openapi::schema::Components {
                 .schema_type(Type::Object)
                 .description(Some("A2A JSON-RPC 2.0 response envelope"))
                 .property("jsonrpc", string())
-                .property("result", ObjectBuilder::new().schema_type(Type::Object))
-                .property("error", ObjectBuilder::new().schema_type(Type::Object))
+                // result and error may be absent (or null, e.g. tasks/claim
+                // returns result: null when no pending task).
                 .property(
-                    "id",
+                    "result",
                     ObjectBuilder::new()
-                        .schema_type(SchemaType::Array(vec![Type::String, Type::Integer])),
+                        .schema_type(SchemaType::Array(vec![Type::Object, Type::Null])),
                 )
+                .property(
+                    "error",
+                    ObjectBuilder::new()
+                        .schema_type(SchemaType::Array(vec![Type::Object, Type::Null])),
+                )
+                .property("id", rpc_id())
                 .required("jsonrpc")
                 .required("id"),
         )
@@ -340,26 +305,22 @@ fn components() -> utoipa::openapi::schema::Components {
 
 /// Build the A2A relay OpenAPI document.
 pub fn a2a_openapi() -> OpenApi {
-    build_openapi(A2A_ROUTES, "Agent Nexus A2A Relay API")
+    build_openapi(&a2a_doc_routes(), "Agent Nexus A2A Relay API")
 }
 
 /// Build the lifecycle hooks OpenAPI document.
 pub fn hooks_openapi() -> OpenApi {
-    build_openapi(HOOKS_ROUTES, "Agent Nexus Lifecycle Hooks API")
-}
-
-fn to_json(api: OpenApi) -> serde_json::Value {
-    serde_json::to_value(api).expect("OpenAPI document serializes to JSON")
+    build_openapi(&hooks_doc_routes(), "Agent Nexus Lifecycle Hooks API")
 }
 
 /// Serialize the A2A OpenAPI document to JSON.
 pub fn a2a_openapi_json() -> serde_json::Value {
-    to_json(a2a_openapi())
+    serde_json::to_value(a2a_openapi()).expect("OpenAPI document serializes to JSON")
 }
 
 /// Serialize the hooks OpenAPI document to JSON.
 pub fn hooks_openapi_json() -> serde_json::Value {
-    to_json(hooks_openapi())
+    serde_json::to_value(hooks_openapi()).expect("OpenAPI document serializes to JSON")
 }
 
 /// Axum handler serving the A2A document at `/openapi.json`.
@@ -376,31 +337,27 @@ pub async fn serve_hooks_openapi() -> axum::Json<serde_json::Value> {
 mod tests {
     use super::*;
 
-    /// Every A2A route appears in the A2A document with the correct method/path.
+    /// Every route in each listener's shared route table is documented with
+    /// the correct method/path in that listener's OpenAPI document.
     #[test]
-    fn every_a2a_route_is_documented() {
-        let doc = a2a_openapi();
-        for info in A2A_ROUTES {
-            assert_operation(&doc, info);
+    fn every_route_is_documented() {
+        let a2a = a2a_openapi();
+        for rt in crate::a2a::http_server::routes() {
+            assert_operation(&a2a, rt.method, rt.path);
+        }
+        let hooks = hooks_openapi();
+        for rt in crate::hooks::server::routes() {
+            assert_operation(&hooks, rt.method, rt.path);
         }
     }
 
-    /// Every hooks route appears in the hooks document.
-    #[test]
-    fn every_hooks_route_is_documented() {
-        let doc = hooks_openapi();
-        for info in HOOKS_ROUTES {
-            assert_operation(&doc, info);
-        }
-    }
-
-    fn assert_operation(doc: &OpenApi, info: &RouteInfo) {
+    fn assert_operation(doc: &OpenApi, method: &str, path: &str) {
         let path_item = doc
             .paths
             .paths
-            .get(info.path)
-            .unwrap_or_else(|| panic!("route {} not in OpenAPI paths", info.path));
-        let operation = match info.method {
+            .get(path)
+            .unwrap_or_else(|| panic!("route {path} not in OpenAPI paths"));
+        let operation = match method {
             "GET" => &path_item.get,
             "POST" => &path_item.post,
             other => panic!("unhandled method {other}"),
@@ -408,8 +365,8 @@ mod tests {
         assert!(
             operation.is_some(),
             "route {} {} missing operation in OpenAPI",
-            info.method,
-            info.path
+            method,
+            path
         );
     }
 
@@ -422,16 +379,13 @@ mod tests {
         }
     }
 
-    /// Each listener only serves its own routes (no cross-advertising), and
-    /// every documented route is registered on its real router.
+    /// Every documented route is registered on its listener (both directions
+    /// are single-source by construction, but this probes the real router).
     #[tokio::test]
     async fn documented_routes_are_registered_on_their_listeners() {
-        use axum::body::Body;
-        use axum::http::Request;
         use config::env::CoderHooksConfig;
         use pocketflow_core::SharedStore;
         use std::sync::Arc;
-        use tower::ServiceExt;
 
         let store = Arc::new(SharedStore::new_in_memory());
         let relay = Arc::new(super::super::a2a::A2ARelay::new(store.clone()));
@@ -451,20 +405,14 @@ mod tests {
         let hooks_app = super::super::hooks::create_router(store, hook_config, None, None);
 
         let mut failures = Vec::new();
-        for (routes, app) in [(A2A_ROUTES, &a2a_app), (HOOKS_ROUTES, &hooks_app)] {
-            for info in routes {
-                let method = axum::http::Method::from_bytes(info.method.as_bytes()).unwrap();
-                let request = Request::builder()
-                    .method(method)
-                    .uri(info.path)
-                    .body(Body::empty())
-                    .unwrap();
-                let status = app.clone().oneshot(request).await.unwrap().status();
-                if status == axum::http::StatusCode::NOT_FOUND {
-                    failures.push(format!("{} {} -> 404", info.method, info.path));
-                } else if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
-                    failures.push(format!("{} {} -> 405", info.method, info.path));
-                }
+        for rt in crate::a2a::http_server::routes() {
+            if let Some(f) = probe(&a2a_app, rt.method, rt.path).await {
+                failures.push(f);
+            }
+        }
+        for rt in crate::hooks::server::routes() {
+            if let Some(f) = probe(&hooks_app, rt.method, rt.path).await {
+                failures.push(f);
             }
         }
         assert!(
@@ -472,6 +420,25 @@ mod tests {
             "routes not registered on their listeners:\n{}",
             failures.join("\n")
         );
+    }
+
+    async fn probe(app: &axum::Router, method: &str, path: &str) -> Option<String> {
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let request = Request::builder()
+            .method(axum::http::Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let status = app.clone().oneshot(request).await.unwrap().status();
+        if status == axum::http::StatusCode::NOT_FOUND {
+            Some(format!("{method} {path} -> 404"))
+        } else if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
+            Some(format!("{method} {path} -> 405"))
+        } else {
+            None
+        }
     }
 
     /// The A2A document's SSE operation declares the required task_id query
