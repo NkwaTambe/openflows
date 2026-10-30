@@ -298,3 +298,100 @@ pub enum PollResult {
     SlowDown(Option<u64>),
     Authorized(LocalUserToken),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::{Form, Path};
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn device_refresh_and_repository_access_use_public_client_and_user_token() {
+        let app = Router::new()
+            .route(
+                "/login/device/code",
+                post(|Form(form): Form<HashMap<String, String>>| async move {
+                    assert_eq!(form.get("client_id").map(String::as_str), Some("public-id"));
+                    assert_eq!(
+                        form.get("scope").map(String::as_str),
+                        Some("offline_access")
+                    );
+                    Json(serde_json::json!({
+                        "device_code": "challenge", "user_code": "ABCD-EFGH",
+                        "verification_uri": "https://github.com/login/device",
+                        "expires_in": 600, "interval": 1
+                    }))
+                }),
+            )
+            .route(
+                "/login/oauth/access_token",
+                post(|Form(form): Form<HashMap<String, String>>| async move {
+                    assert_eq!(form.get("client_id").map(String::as_str), Some("public-id"));
+                    assert!(!form.contains_key("client_secret"));
+                    match form.get("grant_type").map(String::as_str) {
+                        Some("urn:ietf:params:oauth:grant-type:device_code") => {
+                            assert_eq!(
+                                form.get("device_code").map(String::as_str),
+                                Some("challenge")
+                            );
+                        }
+                        Some("refresh_token") => {
+                            assert_eq!(
+                                form.get("refresh_token").map(String::as_str),
+                                Some("refresh-1")
+                            );
+                        }
+                        other => panic!("unexpected grant type: {other:?}"),
+                    }
+                    Json(serde_json::json!({
+                        "access_token": "user-token", "refresh_token": "refresh-2",
+                        "expires_in": 28800, "refresh_token_expires_in": 15897600
+                    }))
+                }),
+            )
+            .route(
+                "/user/installations",
+                get(|headers: HeaderMap| async move {
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
+                    Json(serde_json::json!({"installations": [{"id": 42}]}))
+                }),
+            )
+            .route(
+                "/user/installations/{id}/repositories",
+                get(|Path(id): Path<i64>, headers: HeaderMap| async move {
+                    assert_eq!(id, 42);
+                    assert_eq!(headers.get("authorization").unwrap(), "Bearer user-token");
+                    Json(serde_json::json!({"repositories": [
+                        {"id": 123, "full_name": "acme/backend", "private": true}
+                    ]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut github = LocalGithubAuth::new("public-id".into())
+            .unwrap()
+            .with_api_base(base.clone());
+        github.device_url = format!("{base}/login/device/code");
+        github.token_url = format!("{base}/login/oauth/access_token");
+        let challenge = github.start().await.unwrap();
+        assert_eq!(challenge.user_code, "ABCD-EFGH");
+        let PollResult::Authorized(token) = github.poll(&challenge).await.unwrap() else {
+            panic!("device authorization should succeed");
+        };
+        assert_eq!(token.access_token, "user-token");
+        assert_eq!(
+            github.refresh("refresh-1").await.unwrap().refresh_token,
+            "refresh-2"
+        );
+        let repos = github.accessible_repositories("user-token").await.unwrap();
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].id, 123);
+        assert_eq!(repos[0].full_name, "acme/backend");
+        server.abort();
+    }
+}
