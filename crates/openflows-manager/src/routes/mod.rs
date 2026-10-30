@@ -764,7 +764,8 @@ pub fn router() -> Router<AppState> {
     // contains no credentials or runtime tokens.
     root.nest("/api/v1", api).merge(
         SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
-    )}
+    )
+}
 
 #[derive(Serialize)]
 struct ApiIndexResponse {
