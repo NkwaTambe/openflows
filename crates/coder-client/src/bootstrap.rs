@@ -23,6 +23,39 @@ pub struct CoderBootstrapper {
     env: Option<config::EnvConfig>,
 }
 
+/// Prefix of the per-tenant Nexus workspace name. `scripts/setup.sh` looks the
+/// workspace up by the same `openflows-nexus-<tenant>` name.
+const NEXUS_WORKSPACE_PREFIX: &str = "openflows-nexus-";
+
+/// Coder rejects workspace names longer than this.
+const CODER_WORKSPACE_NAME_MAX: usize = 32;
+
+/// Longest tenant name whose Nexus workspace name still fits in Coder's limit.
+pub const MAX_TENANT_NAME_LEN: usize = CODER_WORKSPACE_NAME_MAX - NEXUS_WORKSPACE_PREFIX.len();
+
+/// Build the Nexus workspace name for a tenant, checking it against Coder's
+/// workspace name rule (letters, digits and single hyphens, at most 32
+/// characters) so a bad name fails before any Coder call instead of as a
+/// 400 from workspace creation.
+pub fn nexus_workspace_name(tenant_name: &str) -> Result<String> {
+    anyhow::ensure!(
+        tenant_name.len() <= MAX_TENANT_NAME_LEN,
+        "tenant name '{tenant_name}' is {} characters; Coder limits workspace names to {CODER_WORKSPACE_NAME_MAX}, \
+         so with the '{NEXUS_WORKSPACE_PREFIX}' prefix the tenant name can be at most {MAX_TENANT_NAME_LEN}. \
+         Pass a shorter --name",
+        tenant_name.len()
+    );
+    anyhow::ensure!(
+        !tenant_name.is_empty()
+            && tenant_name
+                .split('-')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric())),
+        "tenant name '{tenant_name}' is not a valid Coder workspace name: use only ASCII letters, digits and \
+         single hyphens, not starting or ending with a hyphen. Pass a different --name"
+    );
+    Ok(format!("{NEXUS_WORKSPACE_PREFIX}{tenant_name}"))
+}
+
 /// Default admin password that meets Coder's security requirements.
 const SECURE_DEFAULT_PASSWORD: &str = "Op3nFl0ws!";
 
@@ -352,6 +385,7 @@ impl CoderBootstrapper {
         registry_json: &str,
     ) -> Result<String> {
         info!("Setting up tenant: {} (repo: {})", tenant_name, github_repo);
+        let nexus_workspace_name = nexus_workspace_name(tenant_name)?;
 
         // Use the current session user (admin) as the tenant owner.
         let admin = client.get_me().await?;
@@ -454,7 +488,6 @@ impl CoderBootstrapper {
 
         // 2. Create the nexus workspace under the session user (admin).
         let redis_url = "redis://redis:6379".to_string();
-        let nexus_workspace_name = format!("openflows-nexus-{}", tenant_name);
         let repo_url = config::GithubConfig::init_from_env()?.repository_clone_url(github_repo);
 
         // Re-running `tenant add` for an existing tenant returns the existing
@@ -662,8 +695,8 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
 }
 
 #[cfg(test)]
-mod connected_local_tests {
-    use super::is_connected_local;
+mod tests {
+    use super::{is_connected_local, nexus_workspace_name, MAX_TENANT_NAME_LEN};
 
     #[test]
     fn only_connected_local_skips_coder_external_auth() {
@@ -671,5 +704,38 @@ mod connected_local_tests {
         assert!(!is_connected_local(Some("self-managed"), Some("true")));
         assert!(!is_connected_local(Some("connected-local"), Some("false")));
         assert!(!is_connected_local(None, None));
+    }
+
+    #[test]
+    fn nexus_workspace_name_fits_coder_limit() {
+        assert_eq!(MAX_TENANT_NAME_LEN, 16);
+        let longest = "a".repeat(MAX_TENANT_NAME_LEN);
+        assert_eq!(nexus_workspace_name(&longest).unwrap().len(), 32);
+        assert_eq!(
+            nexus_workspace_name("rustlib").unwrap(),
+            "openflows-nexus-rustlib"
+        );
+        assert_eq!(
+            nexus_workspace_name("Jagoum-rust").unwrap(),
+            "openflows-nexus-Jagoum-rust"
+        );
+    }
+
+    #[test]
+    fn nexus_workspace_name_rejects_names_coder_would_reject() {
+        for bad in [
+            "Jagoum-rust-library", // 35-character workspace name
+            "",
+            "my_team",
+            "my.team",
+            "-team",
+            "team-",
+            "my--team",
+        ] {
+            assert!(
+                nexus_workspace_name(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }
