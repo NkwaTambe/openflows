@@ -6,6 +6,7 @@
 
 use crate::auth::local_github::{LocalGithubAuth, LocalUserToken};
 use crate::error::ManagerError;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -107,11 +108,13 @@ impl LocalCredentials {
 
     pub async fn save_authorization(&self, token: LocalUserToken) -> Result<(), ManagerError> {
         let _guard = self.refresh_lock.lock().await;
+        let _file_lock = self.lock_file().await?;
         self.write(token)
     }
 
     pub async fn access_token(&self) -> Result<String, ManagerError> {
         let _guard = self.refresh_lock.lock().await;
+        let _file_lock = self.lock_file().await?;
         let stored = self.read()?;
         let now = unix_now()?;
         if stored.access_expires_at > now.saturating_add(3600) {
@@ -128,11 +131,46 @@ impl LocalCredentials {
 
     pub async fn sign_out(&self) -> Result<(), ManagerError> {
         let _guard = self.refresh_lock.lock().await;
+        let _file_lock = self.lock_file().await?;
         match std::fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(ManagerError::Io(error)),
         }
+    }
+
+    /// The CLI and container Manager share this file. Keep a stable lock file
+    /// while reading and rotating credentials so logout cannot race a refresh.
+    async fn lock_file(&self) -> Result<std::fs::File, ManagerError> {
+        let path = self.path.with_extension("lock");
+        let parent = path
+            .parent()
+            .ok_or_else(|| ManagerError::Config("invalid local lock path".into()))?;
+        ensure_private_directory(parent)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
+                return Err(ManagerError::Config(
+                    "local lock file is not private".into(),
+                ));
+            }
+        }
+        tokio::task::spawn_blocking(move || {
+            file.lock_exclusive()?;
+            Ok::<_, std::io::Error>(file)
+        })
+        .await
+        .map_err(|_| ManagerError::Config("local lock task failed".into()))?
+        .map_err(ManagerError::Io)
     }
 
     fn read(&self) -> Result<StoredCredentials, ManagerError> {
@@ -260,6 +298,38 @@ mod tests {
         }
         restarted.sign_out().await.unwrap();
         assert!(restarted.access_token().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sign_out_waits_for_another_process_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private").join("github.json");
+        let github = Arc::new(LocalGithubAuth::new("public-client-id".into()).unwrap());
+        let manager = LocalCredentials::new(path.clone(), github.clone()).unwrap();
+        manager
+            .save_authorization(LocalUserToken {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                expires_in: 7200,
+                refresh_token_expires_in: 86400,
+            })
+            .await
+            .unwrap();
+        let other = LocalCredentials::new(path.clone(), github).unwrap();
+        let lock = manager.lock_file().await.unwrap();
+        let sign_out = tokio::spawn(async move { other.sign_out().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), async {
+                while !sign_out.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_err()
+        );
+        drop(lock);
+        sign_out.await.unwrap().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

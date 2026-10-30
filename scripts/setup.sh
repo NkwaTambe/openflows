@@ -442,6 +442,7 @@ stage_github_app() {
         secret_dir="${HOME}/.config/openflows"
         env_set OPENFLOWS_MODE local
         env_set OPENFLOWS_CONNECTED_LOCAL_ENABLED true
+        env_set OPENFLOWS_AUTH_ALLOW_LOOPBACK true
         env_set OPENFLOWS_CONNECTED_LOCAL_SECRET_DIR "$secret_dir"
         env_set OPENFLOWS_CONNECTED_LOCAL_CREDENTIAL_FILE "$secret_dir/github-user.json"
         env_set OPENFLOWS_LOCAL_UID "$(id -u)"

@@ -18,6 +18,7 @@ import urllib.error
 import urllib.request
 
 TOKEN_FILE = pathlib.Path("/home/coder/.config/openflows/github-api-token")
+REPOSITORY_FILE = TOKEN_FILE.with_name("repository")
 KEY_FILE = pathlib.Path("/run/openflows/local-broker-key")
 MANAGER_URL = os.environ.get("OPENFLOWS_LOCAL_MANAGER_URL", "http://openflows-local-manager:3002").rstrip("/")
 REPOSITORY = os.environ.get("OPENFLOWS_CONNECTED_LOCAL_REPOSITORY", "")
@@ -25,6 +26,8 @@ REPOSITORY = os.environ.get("OPENFLOWS_CONNECTED_LOCAL_REPOSITORY", "")
 
 def repository_name():
     value = REPOSITORY.strip()
+    if not value and REPOSITORY_FILE.exists():
+        value = REPOSITORY_FILE.read_text().strip()
     if not value:
         value = subprocess.check_output(
             ["git", "-C", "/home/coder/.openflows/artifacts/repo", "remote", "get-url", "origin"],
@@ -59,10 +62,10 @@ def fetch():
             stream.write(token)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp, TOKEN_FILE)
         if os.geteuid() == 0:
             coder = pwd.getpwnam("coder")
-            os.chown(TOKEN_FILE, coder.pw_uid, coder.pw_gid)
+            os.chown(temp, coder.pw_uid, coder.pw_gid)
+        os.replace(temp, TOKEN_FILE)
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
@@ -72,6 +75,8 @@ def main():
     command = sys.argv[1] if len(sys.argv) > 1 else ""
     if command == "setup":
         fetch()
+        REPOSITORY_FILE.write_text(repository_name() + "\n")
+        REPOSITORY_FILE.chmod(0o600)
         subprocess.Popen(
             [sys.executable, __file__, "watch"],
             stdin=subprocess.DEVNULL,
