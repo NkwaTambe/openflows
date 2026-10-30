@@ -123,7 +123,15 @@ jobs:
           refs="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/openflows-" --jq '.[].ref')"
           releases="$(sed 's|refs/tags/openflows-||' <<<"${refs}" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)"
           token="$(curl -fsS -u "${GITHUB_ACTOR}:${GH_TOKEN}" "https://${REGISTRY}/token?service=${REGISTRY}&scope=repository:${IMAGE_NAME}:pull" | jq -er .token)"
-          published="$(curl -fsS -H "Authorization: Bearer ${token}" "https://${REGISTRY}/v2/${IMAGE_NAME}/tags/list?n=1000" | jq -r '.tags // [] | .[]')"
+          # Follow the registry's next-page links: a missed page could point a tag at an older release.
+          headers="$(mktemp)"
+          published=""
+          url="/v2/${IMAGE_NAME}/tags/list?n=1000"
+          while [ -n "${url}" ]; do
+            page="$(curl -fsS -D "${headers}" -H "Authorization: Bearer ${token}" "https://${REGISTRY}${url}")"
+            published+="$(jq -r '.tags // [] | .[]' <<<"${page}")"$'\n'
+            url="$(tr -d '\r' <"${headers}" | sed -n 's/^[Ll]ink: *<\([^>]*\)>; *rel="next".*/\1/p' | head -1)"
+          done
           # Releases whose image exists, newest first. A release tag exists before its build finishes.
           available="$(grep -Fx -f <(printf '%s\n' "${releases}") <<<"${published}" | sort -rV || true)"
           newest() { grep -E "$1" <<<"${available}" | head -1 || true; }
