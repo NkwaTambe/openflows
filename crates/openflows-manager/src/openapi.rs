@@ -1,530 +1,117 @@
 //! OpenAPI (OpenAPI 3.1) documentation for the OpenFlows Manager HTTP API.
 //!
-//! The spec is generated with [`utoipa`] from a single route inventory
-//! ([`MANAGER_ROUTES`]) rather than a second handwritten endpoint list. The
-//! inventory records, for every route, its HTTP method, full path, functional
-//! tag, one-line summary, and authentication/visibility class.
-//!
-//! The document is served at `/openapi.json` and browsed via the Swagger UI at
-//! `/swagger-ui/`. It describes the endpoints and their contracts but never
-//! contains credentials or real secrets (see the error-envelope note below).
+//! The spec is generated with [`utoipa`] from the **same route table** used to
+//! build the axum router (`crate::routes`), so a route cannot be registered
+//! without being documented and vice versa. See
+//! `docs/architecture/openapi-reference.md`.
 
 use utoipa::openapi::{
     info::Info,
-    path::{HttpMethod, OperationBuilder, PathItemBuilder, PathsBuilder},
-    security::{Http, HttpAuthScheme, SecurityRequirement, SecurityScheme},
-    ComponentsBuilder, Content, ObjectBuilder, OpenApi, OpenApiBuilder, Paths, Ref,
-    ResponseBuilder, Type,
+    path::{HttpMethod, OperationBuilder, Parameter, ParameterIn, PathItemBuilder, PathsBuilder},
+    schema::SchemaType,
+    Content, ObjectBuilder, OpenApi, OpenApiBuilder, Paths, Ref, RefOr, ResponseBuilder, Type,
 };
 
-/// Authentication / visibility class of a route. Drives the `security`
-/// requirements attached to each documented operation.
+/// Authentication/visibility model of a route, used to attach the correct
+/// OpenAPI `security` requirement and descriptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RouteClass {
-    /// No authentication required (capability markers, index).
-    Public,
-    /// Authenticated human session or bearer token.
-    UserAuth,
-    /// Authenticated by a workspace runtime credential, never a human session.
-    Runtime,
-    /// Signed webhook ingress (GitHub signature or Coder hook JWT).
+pub enum Auth {
+    /// No authentication.
+    None,
+    /// Bearer token (human session or workspace runtime credential).
+    Bearer,
+    /// Browser session cookie.
+    Session,
+    /// Signed webhook (GitHub signature or Coder hook JWT).
     Webhook,
-    /// Browser OAuth / device-flow callback.
-    Callback,
-    /// Browser page or form (session cookie).
-    Browser,
-    /// Operational probe (`/health`, `/ready`).
-    Health,
 }
 
-/// A single documented route. This is the source of truth for both the OpenAPI
-/// document and the route-to-spec coverage test.
-#[derive(Debug, Clone, Copy)]
-pub struct RouteInfo {
-    /// HTTP method, e.g. `"GET"`.
+/// Flattened documentation metadata for one (method, path) operation, derived
+/// from the shared route table.
+#[derive(Debug, Clone)]
+pub(crate) struct RouteMeta {
     pub method: &'static str,
-    /// Full path including the `/api/v1` prefix where applicable.
-    pub path: &'static str,
-    /// Functional tag used to group operations in the reference UI.
+    pub path: String,
     pub tag: &'static str,
-    /// One-line human summary of what the endpoint does.
     pub summary: &'static str,
-    /// Authentication/visibility class.
-    pub class: RouteClass,
+    pub auth: Auth,
+    pub is_json: bool,
+    pub success: u16,
+    pub description: Option<&'static str>,
 }
 
-const GET: &str = "GET";
-const POST: &str = "POST";
-const PATCH: &str = "PATCH";
-const DELETE: &str = "DELETE";
-
-/// Complete inventory of the Manager HTTP surface.
-///
-/// Kept in registration order (root + health probes first, then the versioned
-/// `/api/v1` product API, then browser/callback routes). When a new route is
-/// added to [`crate::routes::router`], it MUST be added here too; the coverage
-/// test in this module enforces that the registered router and this inventory
-/// stay in sync.
-pub const MANAGER_ROUTES: &[RouteInfo] = &[
-    // ---- Root: capability marker + operational probes ----
-    RouteInfo {
-        method: GET,
-        path: "/",
-        tag: "root",
-        summary: "Browser test console / capability marker",
-        class: RouteClass::Public,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/health",
-        tag: "health",
-        summary: "Liveness probe",
-        class: RouteClass::Health,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/ready",
-        tag: "health",
-        summary: "Readiness probe (store + database)",
-        class: RouteClass::Health,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/openapi.json",
+/// Derive the full list of documented operations from the shared route table.
+/// API routes are prefixed with `/api/v1`; the `/openapi.json` endpoint served
+/// by the Swagger UI is added explicitly.
+pub(crate) fn manager_routes() -> Vec<RouteMeta> {
+    let mut out = Vec::new();
+    for rt in crate::routes::root_routes() {
+        for m in rt.methods {
+            out.push(RouteMeta {
+                method: m,
+                path: rt.path.to_string(),
+                tag: rt.tag,
+                summary: rt.summary,
+                auth: rt.auth,
+                is_json: rt.is_json,
+                success: rt.success,
+                description: rt.description,
+            });
+        }
+    }
+    for rt in crate::routes::api_v1_routes() {
+        // The nested `/` route is registered at `/api/v1` (no trailing slash).
+        let full_path = if rt.path == "/" {
+            "/api/v1".to_string()
+        } else {
+            format!("/api/v1{}", rt.path)
+        };
+        for m in rt.methods {
+            out.push(RouteMeta {
+                method: m,
+                path: full_path.clone(),
+                tag: rt.tag,
+                summary: rt.summary,
+                auth: rt.auth,
+                is_json: rt.is_json,
+                success: rt.success,
+                description: rt.description,
+            });
+        }
+    }
+    // The spec endpoint itself (served by the Swagger UI merge).
+    out.push(RouteMeta {
+        method: "GET",
+        path: "/openapi.json".to_string(),
         tag: "root",
         summary: "OpenAPI specification document",
-        class: RouteClass::Public,
-    },
-    // ---- API index ----
-    RouteInfo {
-        method: GET,
-        path: "/api/v1",
-        tag: "api",
-        summary: "API capability marker",
-        class: RouteClass::Public,
-    },
-    // ---- Auth ----
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/me",
-        tag: "auth",
-        summary: "Current user + memberships",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/auth/coder",
-        tag: "auth",
-        summary: "Coder identity link status",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/auth/coder/start",
-        tag: "auth",
-        summary: "Start Coder identity link",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/auth/refresh",
-        tag: "auth",
-        summary: "Refresh session tokens",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/auth/csrf",
-        tag: "auth",
-        summary: "Fetch CSRF token",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/auth/logout",
-        tag: "auth",
-        summary: "End the session",
-        class: RouteClass::UserAuth,
-    },
-    // ---- Device flow (CLI) ----
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/auth/cli/start",
-        tag: "device",
-        summary: "Start a device (CLI) login flow",
-        class: RouteClass::Public,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/auth/cli/token",
-        tag: "device",
-        summary: "Exchange a device code for tokens",
-        class: RouteClass::Public,
-    },
-    // ---- Invitations ----
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/invitations/accept",
-        tag: "invitations",
-        summary: "Accept an invitation (JSON)",
-        class: RouteClass::UserAuth,
-    },
-    // ---- Organizations ----
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations",
-        tag: "organizations",
-        summary: "List organizations",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations",
-        tag: "organizations",
-        summary: "Create an organization",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations/{org}",
-        tag: "organizations",
-        summary: "Get an organization",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: PATCH,
-        path: "/api/v1/organizations/{org}",
-        tag: "organizations",
-        summary: "Update an organization",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: DELETE,
-        path: "/api/v1/organizations/{org}",
-        tag: "organizations",
-        summary: "Delete an organization",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations/{org}/members",
-        tag: "organizations",
-        summary: "List organization members",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: PATCH,
-        path: "/api/v1/organizations/{org}/members/{user}",
-        tag: "organizations",
-        summary: "Update a member's role/status",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: DELETE,
-        path: "/api/v1/organizations/{org}/members/{user}",
-        tag: "organizations",
-        summary: "Remove a member",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/invitations",
-        tag: "organizations",
-        summary: "Invite a user to the organization",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: DELETE,
-        path: "/api/v1/organizations/{org}/invitations/{id}",
-        tag: "organizations",
-        summary: "Revoke an invitation",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/transfer-ownership",
-        tag: "organizations",
-        summary: "Transfer organization ownership",
-        class: RouteClass::UserAuth,
-    },
-    // ---- Operations ----
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/operations/{id}",
-        tag: "operations",
-        summary: "Get an operation",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/operations/{id}/retry",
-        tag: "operations",
-        summary: "Retry an operation",
-        class: RouteClass::UserAuth,
-    },
-    // ---- Platform ----
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/platform/organizations/{org}/template-release/promote-configured",
-        tag: "platform",
-        summary: "Promote the operator-configured template release",
-        class: RouteClass::UserAuth,
-    },
-    // ---- Tenants ----
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations/{org}/tenants",
-        tag: "tenants",
-        summary: "List tenants",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/tenants",
-        tag: "tenants",
-        summary: "Create a tenant",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations/{org}/tenants/{tenant}",
-        tag: "tenants",
-        summary: "Get a tenant",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: DELETE,
-        path: "/api/v1/organizations/{org}/tenants/{tenant}",
-        tag: "tenants",
-        summary: "Delete a tenant",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/tenants/{tenant}/start",
-        tag: "tenants",
-        summary: "Start a tenant",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/tenants/{tenant}/stop",
-        tag: "tenants",
-        summary: "Stop a tenant",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/tenants/{tenant}/clean",
-        tag: "tenants",
-        summary: "Clean a tenant",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations/{org}/tenants/{tenant}/status",
-        tag: "tenants",
-        summary: "Tenant status",
-        class: RouteClass::UserAuth,
-    },
-    // ---- GitHub connection lifecycle ----
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/github/connect",
-        tag: "github",
-        summary: "Connect a GitHub App installation to the organization",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/organizations/{org}/github/connections",
-        tag: "github",
-        summary: "List GitHub connections",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/organizations/{org}/github/connections/{id}/reconcile",
-        tag: "github",
-        summary: "Reconcile a GitHub connection",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: DELETE,
-        path: "/api/v1/organizations/{org}/github/connections/{id}",
-        tag: "github",
-        summary: "Disconnect a GitHub connection",
-        class: RouteClass::UserAuth,
-    },
-    // ---- Webhooks ----
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/webhooks/github",
-        tag: "webhooks",
-        summary: "GitHub signed webhook ingress",
-        class: RouteClass::Webhook,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/hooks/coder/chat",
-        tag: "webhooks",
-        summary: "Coder lifecycle hook webhook",
-        class: RouteClass::Webhook,
-    },
-    // ---- Runtime credential broker + worker lifecycle ----
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/github-credentials",
-        tag: "runtime",
-        summary: "Broker short-lived GitHub credentials for a workspace",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/workspaces",
-        tag: "runtime",
-        summary: "Request a worker workspace",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/api/v1/runtime/workspaces/{workspace}",
-        tag: "runtime",
-        summary: "Get a worker workspace",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: DELETE,
-        path: "/api/v1/runtime/workspaces/{workspace}",
-        tag: "runtime",
-        summary: "Delete a worker workspace",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/workspaces/{workspace}/stop",
-        tag: "runtime",
-        summary: "Stop a worker workspace",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/chats",
-        tag: "runtime",
-        summary: "Create a Coder chat",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/chats/{chat}/messages",
-        tag: "runtime",
-        summary: "Send a chat message",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/register",
-        tag: "runtime",
-        summary: "Register a runtime credential",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/heartbeat",
-        tag: "runtime",
-        summary: "Runtime heartbeat",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/refresh",
-        tag: "runtime",
-        summary: "Refresh a runtime credential",
-        class: RouteClass::Runtime,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/api/v1/runtime/revoke",
-        tag: "runtime",
-        summary: "Revoke a runtime credential",
-        class: RouteClass::Runtime,
-    },
-    // ---- Browser pages + OAuth/device callbacks (non-JSON) ----
-    RouteInfo {
-        method: GET,
-        path: "/auth/login",
-        tag: "browser",
-        summary: "Login page",
-        class: RouteClass::Browser,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/auth/github/start",
-        tag: "browser",
-        summary: "Start GitHub OAuth login",
-        class: RouteClass::Browser,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/auth/github/callback",
-        tag: "browser",
-        summary: "GitHub OAuth callback",
-        class: RouteClass::Callback,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/auth/coder/callback",
-        tag: "browser",
-        summary: "Coder identity callback",
-        class: RouteClass::Callback,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/auth/cli/verify",
-        tag: "browser",
-        summary: "Device-flow verification page",
-        class: RouteClass::Browser,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/auth/cli/approve",
-        tag: "browser",
-        summary: "Approve a device-flow request",
-        class: RouteClass::UserAuth,
-    },
-    RouteInfo {
-        method: GET,
-        path: "/invitations/accept",
-        tag: "browser",
-        summary: "Invitation accept page",
-        class: RouteClass::Browser,
-    },
-    RouteInfo {
-        method: POST,
-        path: "/invitations/accept",
-        tag: "browser",
-        summary: "Accept an invitation (browser form)",
-        class: RouteClass::Browser,
-    },
-];
-
-/// Whether a route is a JSON API route (gets the shared `ApiError` response
-/// schema documented). Browser pages, callbacks and health probes are excluded.
-fn is_json_api(class: RouteClass) -> bool {
-    matches!(
-        class,
-        RouteClass::Public | RouteClass::UserAuth | RouteClass::Runtime | RouteClass::Webhook
-    )
+        auth: Auth::None,
+        is_json: true,
+        success: 200,
+        description: None,
+    });
+    out
 }
 
-/// The OpenAPI 3.1 security requirement attached to authenticated operations.
-fn security_requirement(class: RouteClass) -> Option<SecurityRequirement> {
-    match class {
-        RouteClass::UserAuth | RouteClass::Runtime => {
-            Some(SecurityRequirement::new("bearerAuth", [] as [&str; 0]))
+/// Extract path parameter names from a templated path, e.g. `{org}` from
+/// `/organizations/{org}`.
+fn path_parameters(path: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in path.split('/') {
+        if let Some(name) = segment.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            names.push(name.to_string());
         }
-        // Webhook (signature/JWT), browser (cookie), callback and health
-        // routes are documented without a bearer requirement.
+    }
+    names
+}
+
+/// The OpenAPI security requirement for a route's auth model.
+fn security_requirement(auth: Auth) -> Option<utoipa::openapi::SecurityRequirement> {
+    match auth {
+        Auth::Bearer => Some(utoipa::openapi::SecurityRequirement::new(
+            "bearerAuth",
+            [] as [&str; 0],
+        )),
         _ => None,
     }
 }
@@ -537,21 +124,38 @@ fn json_error_response(description: &str) -> ResponseBuilder {
     )
 }
 
-/// Build an [`utoipa::openapi::path::Operation`] for a single route.
-fn build_operation(info: &RouteInfo) -> utoipa::openapi::path::Operation {
-    let mut op = OperationBuilder::new()
-        .summary(Some(info.summary))
-        .tag(info.tag)
-        .response(
-            "200",
-            ResponseBuilder::new().description("Successful response"),
-        );
+/// Build an [`Operation`] for one (method, path) route.
+fn build_operation(meta: &RouteMeta) -> utoipa::openapi::path::Operation {
+    let success = if meta.success == 204 {
+        ResponseBuilder::new().description("No content")
+    } else {
+        ResponseBuilder::new().description("Successful response")
+    };
 
-    if let Some(sec) = security_requirement(info.class) {
+    let mut op = OperationBuilder::new()
+        .summary(Some(meta.summary))
+        .tag(meta.tag)
+        .response(meta.success.to_string(), success);
+
+    if let Some(desc) = meta.description {
+        op = op.description(Some(desc));
+    }
+
+    // Declare required path parameters for templated paths.
+    for name in path_parameters(&meta.path) {
+        let mut param = Parameter::new(name);
+        param.parameter_in = ParameterIn::Path;
+        param.schema = Some(RefOr::T(utoipa::openapi::Schema::Object(
+            ObjectBuilder::new().schema_type(Type::String).build(),
+        )));
+        op = op.parameter(param);
+    }
+
+    if let Some(sec) = security_requirement(meta.auth) {
         op = op.security(sec);
     }
 
-    if is_json_api(info.class) {
+    if meta.is_json {
         op = op
             .response("400", json_error_response("Bad request"))
             .response("401", json_error_response("Unauthenticated"))
@@ -579,19 +183,20 @@ fn http_method(method: &str) -> HttpMethod {
     }
 }
 
-/// Group the route inventory into OpenAPI path items (one per path, all methods).
+/// Group the route metadata into OpenAPI path items (one per path, all methods).
 fn build_paths() -> Paths {
-    let mut by_path: std::collections::BTreeMap<&str, Vec<&RouteInfo>> =
+    let routes = manager_routes();
+    let mut by_path: std::collections::BTreeMap<&str, Vec<&RouteMeta>> =
         std::collections::BTreeMap::new();
-    for info in MANAGER_ROUTES {
-        by_path.entry(info.path).or_default().push(info);
+    for meta in &routes {
+        by_path.entry(meta.path.as_str()).or_default().push(meta);
     }
 
     let mut builder = PathsBuilder::new();
-    for (path, infos) in by_path {
+    for (path, metas) in by_path {
         let mut path_item = PathItemBuilder::new();
-        for info in infos {
-            path_item = path_item.operation(http_method(info.method), build_operation(info));
+        for meta in metas {
+            path_item = path_item.operation(http_method(meta.method), build_operation(meta));
         }
         builder = builder.path(path, path_item.build());
     }
@@ -599,9 +204,8 @@ fn build_paths() -> Paths {
 }
 
 /// Reusable component schemas + security schemes for the Manager API.
-fn build_components() -> ComponentsBuilder {
-    ComponentsBuilder::new()
-        // The shared error envelope (see `crate::error::to_http_response`).
+fn build_components() -> utoipa::openapi::schema::ComponentsBuilder {
+    utoipa::openapi::schema::ComponentsBuilder::new()
         .schema(
             "ApiError",
             ObjectBuilder::new()
@@ -614,9 +218,10 @@ fn build_components() -> ComponentsBuilder {
         )
         .security_scheme(
             "bearerAuth",
-            SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            utoipa::openapi::security::SecurityScheme::Http(utoipa::openapi::security::Http::new(
+                utoipa::openapi::security::HttpAuthScheme::Bearer,
+            )),
         )
-        // Representative DTO schemas (see `crate::dto`).
         .schema("User", user_schema())
         .schema("Organization", organization_schema())
         .schema("Tenant", tenant_schema())
@@ -635,6 +240,12 @@ fn error_object_schema() -> ObjectBuilder {
         .required("message")
         .required("request_id")
         .required("retryable")
+}
+
+/// A schema that is a `string` OR `null` (OAS 3.1 multi-type), matching fields
+/// that serialize absent `Option` values as explicit `null`.
+fn nullable_string() -> ObjectBuilder {
+    ObjectBuilder::new().schema_type(SchemaType::Array(vec![Type::String, Type::Null]))
 }
 
 fn user_schema() -> ObjectBuilder {
@@ -660,14 +271,7 @@ fn organization_schema() -> ObjectBuilder {
         .property("display_name", string())
         .property("status", string())
         .property("owner_user_id", string())
-        .property(
-            "coder_organization_id",
-            ObjectBuilder::new()
-                .schema_type(Type::String)
-                .description(Some(
-                    "Opaque upstream Coder id; present once provisioning assigns it",
-                )),
-        )
+        .property("coder_organization_id", nullable_string())
         .required("id")
         .required("slug")
         .required("display_name")
@@ -683,14 +287,18 @@ fn tenant_schema() -> ObjectBuilder {
         .property("id", string())
         .property("organization_id", string())
         .property("slug", string())
-        .property("github_repository_id", string())
+        // `github_repository_id` is the numeric `GithubId` wrapper.
+        .property(
+            "github_repository_id",
+            ObjectBuilder::new().schema_type(Type::Integer),
+        )
         .property("desired_state", string())
         .property("observed_state", string())
         .property(
             "fleet_size",
             ObjectBuilder::new().schema_type(Type::Integer),
         )
-        .property("error_code", ObjectBuilder::new().schema_type(Type::String))
+        .property("error_code", nullable_string())
         .required("id")
         .required("organization_id")
         .required("slug")
@@ -709,15 +317,12 @@ fn operation_schema() -> ObjectBuilder {
         .property("organization_id", string())
         .property("kind", string())
         .property("state", string())
-        .property(
-            "current_step",
-            ObjectBuilder::new().schema_type(Type::String),
-        )
+        .property("current_step", nullable_string())
         .property(
             "attempt_count",
             ObjectBuilder::new().schema_type(Type::Integer),
         )
-        .property("error_code", ObjectBuilder::new().schema_type(Type::String))
+        .property("error_code", nullable_string())
         .required("id")
         .required("organization_id")
         .required("kind")
@@ -746,60 +351,89 @@ pub fn manager_openapi_json() -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// Every inventoried route appears in the generated OpenAPI document with
-    /// the correct HTTP method and full path.
+    /// Every route in the shared table appears in the generated OpenAPI
+    /// document with the correct HTTP method and full path.
     #[test]
     fn every_inventoried_route_is_documented() {
         let doc = manager_openapi();
-        let paths = doc.paths.paths;
-        assert!(
-            !paths.is_empty(),
-            "OpenAPI document must contain at least one path"
-        );
+        let paths = &doc.paths.paths;
+        assert!(!paths.is_empty(), "OpenAPI document must contain paths");
 
-        for info in MANAGER_ROUTES {
+        for meta in manager_routes() {
             let path_item = paths
-                .get(info.path)
-                .unwrap_or_else(|| panic!("route {} not in OpenAPI paths", info.path));
-            let operation = match info.method {
+                .get(meta.path.as_str())
+                .unwrap_or_else(|| panic!("route {} not in OpenAPI paths", meta.path));
+            let operation = match meta.method {
                 "GET" => &path_item.get,
                 "POST" => &path_item.post,
                 "PATCH" => &path_item.patch,
                 "DELETE" => &path_item.delete,
-                other => panic!("unhandled method {other} for {}", info.path),
+                other => panic!("unhandled method {other} for {}", meta.path),
             };
             assert!(
                 operation.is_some(),
                 "route {} {} missing operation in OpenAPI",
-                info.method,
-                info.path
+                meta.method,
+                meta.path
             );
         }
     }
 
-    /// The document serializes to valid JSON (a basic sanity check that the
-    /// builder produced a serializable structure).
+    /// Templated paths declare their required path parameters.
+    #[test]
+    fn templated_paths_declare_path_parameters() {
+        let doc = manager_openapi();
+        let paths = &doc.paths.paths;
+        for meta in manager_routes() {
+            let names = path_parameters(&meta.path);
+            if names.is_empty() {
+                continue;
+            }
+            let path_item = paths.get(meta.path.as_str()).unwrap();
+            let operation = match meta.method {
+                "GET" => path_item.get.as_ref(),
+                "POST" => path_item.post.as_ref(),
+                "PATCH" => path_item.patch.as_ref(),
+                "DELETE" => path_item.delete.as_ref(),
+                _ => None,
+            }
+            .expect("operation exists");
+            let declared = operation
+                .parameters
+                .as_ref()
+                .map(|ps| {
+                    ps.iter()
+                        .filter_map(|p| match p {
+                            RefOr::T(param) => Some(param),
+                            RefOr::Ref(_) => None,
+                        })
+                        .filter(|p| matches!(p.parameter_in, ParameterIn::Path))
+                        .map(|p| p.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for name in &names {
+                assert!(
+                    declared.contains(name),
+                    "path parameter {name} not declared for {} {}",
+                    meta.method,
+                    meta.path
+                );
+            }
+        }
+    }
+
+    /// The document serializes to valid JSON.
     #[test]
     fn document_serializes_to_json() {
         let json = manager_openapi_json();
-        assert!(json.get("openapi").is_some(), "missing openapi version");
-        assert!(json.get("paths").is_some(), "missing paths object");
-        let components = json.get("components").expect("components present");
-        assert!(
-            components.get("schemas").is_some(),
-            "missing reusable schemas"
-        );
+        assert!(json.get("openapi").is_some());
+        assert!(json.get("paths").is_some());
+        assert!(json.get("components").is_some());
     }
 
-    /// Every route registered on the real router is present in the inventory,
-    /// so a newly added HTTP route cannot silently remain undocumented.
-    ///
-    /// We probe each inventoried (method, path) against the built router and
-    /// require a non-404 response, which proves the route is actually
-    /// registered. The complementary direction (every registered route is in
-    /// the inventory) is enforced by construction: the inventory and the router
-    /// both live in `routes/mod.rs` and the test below cross-checks the
-    /// inventory count against a probe-driven route enumeration.
+    /// Every route in the shared table is actually registered on the router
+    /// (probed with a non-404, non-405 response).
     #[tokio::test]
     async fn documented_routes_are_registered_on_the_router() {
         use axum::body::Body;
@@ -808,25 +442,24 @@ mod tests {
 
         let app = crate::server::create_router(crate::server::AppState::for_tests());
 
-        let mut failures: Vec<String> = Vec::new();
-        for info in MANAGER_ROUTES {
-            let method = axum::http::Method::from_bytes(info.method.as_bytes()).unwrap();
+        let mut failures = Vec::new();
+        for meta in manager_routes() {
+            let method = axum::http::Method::from_bytes(meta.method.as_bytes()).unwrap();
             let request = Request::builder()
                 .method(method)
-                .uri(info.path)
+                .uri(meta.path.as_str())
                 .body(Body::empty())
                 .unwrap();
-            let response = app.clone().oneshot(request).await.unwrap();
-            let status = response.status();
+            let status = app.clone().oneshot(request).await.unwrap().status();
             if status == axum::http::StatusCode::NOT_FOUND {
                 failures.push(format!(
                     "{} {} -> 404 (not registered)",
-                    info.method, info.path
+                    meta.method, meta.path
                 ));
             } else if status == axum::http::StatusCode::METHOD_NOT_ALLOWED {
                 failures.push(format!(
                     "{} {} -> 405 (method not accepted)",
-                    info.method, info.path
+                    meta.method, meta.path
                 ));
             }
         }
@@ -859,8 +492,6 @@ mod tests {
                 .to_string()
         }
 
-        // Swagger UI must be able to load same-origin scripts and fetch the
-        // spec. This is scoped to the documentation route only.
         let swagger_csp = csp_of(app.clone(), "/swagger-ui/").await;
         assert!(
             swagger_csp.contains("script-src 'self'"),
@@ -871,7 +502,6 @@ mod tests {
             "swagger-ui CSP must allow same-origin fetches, got: {swagger_csp}"
         );
 
-        // Non-documentation routes must keep the strict policy.
         for path in ["/health", "/api/v1/me", "/"] {
             let csp = csp_of(app.clone(), path).await;
             assert!(

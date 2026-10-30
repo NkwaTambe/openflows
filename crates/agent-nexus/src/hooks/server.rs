@@ -63,7 +63,7 @@ pub fn create_router(
         // OpenAPI reference for the Agent Nexus hooks surface.
         .route(
             "/openapi.json",
-            axum::routing::get(crate::openapi::serve_openapi),
+            axum::routing::get(crate::openapi::serve_hooks_openapi),
         )
         .with_state(HookServerState {
             store,
