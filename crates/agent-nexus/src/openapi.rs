@@ -18,6 +18,7 @@ use utoipa::openapi::{
     path::{HttpMethod, OperationBuilder, Parameter, ParameterIn, PathItemBuilder, PathsBuilder},
     request_body::{RequestBody, RequestBodyBuilder},
     schema::{ArrayBuilder, SchemaType},
+    security::{ApiKey, ApiKeyValue, SecurityRequirement, SecurityScheme},
     Content, ObjectBuilder, OpenApi, OpenApiBuilder, Paths, Ref, RefOr, ResponseBuilder, Schema,
     Type,
 };
@@ -107,10 +108,18 @@ fn build_operation(route: &DocRoute) -> utoipa::openapi::path::Operation {
                 );
         }
         "/experimental/hooks/chat" => {
-            op = op.response(
-                "200",
-                json_response("Hook decision in Coder's response schema", "HookDecision"),
-            );
+            op = op
+                .request_body(Some(json_body("HookPayload")))
+                .security(SecurityRequirement::new("coderHookJwt", [] as [&str; 0]))
+                .response(
+                    "200",
+                    json_response("Hook decision in Coder's response schema", "HookDecision"),
+                )
+                .response(
+                    "401",
+                    ResponseBuilder::new()
+                        .description("JWT signature, audience, or expiry verification failed"),
+                );
         }
         _ => {}
     }
@@ -187,6 +196,23 @@ fn components() -> utoipa::openapi::schema::Components {
     };
 
     utoipa::openapi::schema::ComponentsBuilder::new()
+        .security_scheme(
+            "coderHookJwt",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("Authorization"))),
+        )
+        // ---- Lifecycle hook payload ----
+        .schema(
+            "HookPayload",
+            ObjectBuilder::new()
+                .schema_type(Type::Object)
+                .description(Some(
+                    "A Coder lifecycle-hook dispatch, signed with the shared secret",
+                ))
+                .property("type", string())
+                .property("meta", ObjectBuilder::new().schema_type(Type::Object))
+                .property("data", ObjectBuilder::new().schema_type(Type::Object))
+                .required("type"),
+        )
         // ---- A2A JSON-RPC envelope ----
         .schema(
             "JsonRpcRequest",
@@ -460,6 +486,41 @@ mod tests {
         assert!(
             has_task_id,
             "GET / must declare a required task_id query parameter"
+        );
+    }
+
+    /// The hooks document declares the JWT Authorization requirement and a
+    /// request body on POST /experimental/hooks/chat.
+    #[test]
+    fn hook_operation_declares_jwt_security_and_request_body() {
+        let doc = hooks_openapi();
+        let path_item = doc
+            .paths
+            .paths
+            .get("/experimental/hooks/chat")
+            .expect("hook path");
+        let op = path_item.post.as_ref().expect("POST hook operation");
+
+        let has_security = op.security.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+        assert!(
+            has_security,
+            "hook operation must declare a security requirement"
+        );
+
+        assert!(
+            op.request_body.is_some(),
+            "hook operation must declare a request body"
+        );
+
+        // The security requirement must reference the declared coderHookJwt scheme.
+        let has_scheme = doc
+            .components
+            .as_ref()
+            .map(|c| c.security_schemes.contains_key("coderHookJwt"))
+            .unwrap_or(false);
+        assert!(
+            has_scheme,
+            "components must declare the coderHookJwt security scheme"
         );
     }
 }
