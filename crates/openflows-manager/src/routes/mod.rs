@@ -14,6 +14,7 @@ pub mod connections;
 pub mod device;
 pub mod health;
 pub mod invitations;
+pub mod local_github;
 pub mod organizations;
 pub mod platform_releases;
 pub mod runtime;
@@ -51,6 +52,7 @@ fn api_v1_router() -> Router<AppState> {
         .route("/auth/coder", get(coder_identity::status))
         .route("/auth/coder/start", post(coder_identity::start))
         .route("/auth/refresh", post(auth::refresh))
+        .route("/local/github-credential", post(local_github::credential))
         .route("/auth/csrf", get(auth::csrf_token))
         .route("/invitations/accept", post(invitations::accept_json))
         .route("/auth/logout", post(auth::logout))

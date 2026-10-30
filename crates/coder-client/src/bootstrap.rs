@@ -59,6 +59,10 @@ pub fn nexus_workspace_name(tenant_name: &str) -> Result<String> {
 /// Default admin password that meets Coder's security requirements.
 const SECURE_DEFAULT_PASSWORD: &str = "Op3nFl0ws!";
 
+fn is_connected_local(auth_mode: Option<&str>, template_mode: Option<&str>) -> bool {
+    auth_mode == Some("connected-local") && template_mode == Some("true")
+}
+
 /// Check whether a password meets Coder's minimum security requirements.
 ///
 /// Coder requires at least: uppercase, lowercase, digit, special character,
@@ -390,89 +394,96 @@ impl CoderBootstrapper {
             admin.username
         );
 
-        // 1. Check the session user's GitHub external-auth grant until linked.
+        // Connected-local workspaces use the local Manager's GitHub user-token
+        // broker, so Coder intentionally has no external-auth provider.
+        let auth_mode = std::env::var("OPENFLOWS_GITHUB_AUTH_MODE").ok();
+        let template_mode = std::env::var("TF_VAR_connected_local").ok();
+        let connected_local = is_connected_local(auth_mode.as_deref(), template_mode.as_deref());
         let coder_url = client.base_url();
-        let external_auth_id = self
-            .env
-            .as_ref()
-            .and_then(|e| e.coder.external_auth_id.clone())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "primary-github".to_string());
-        eprintln!();
-        eprintln!("  ─── GitHub Link Required ───");
-        eprintln!();
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(300);
-        let mut link_shown = false;
-        loop {
-            match client.get_external_auth(&external_auth_id).await {
-                Ok(auth) if auth.authenticated => {
-                    let linked_user = auth
-                        .user
-                        .as_ref()
-                        .map(|u| u.login.as_str())
-                        .unwrap_or("(unknown account)");
-                    info!(
-                        "  ✓ GitHub link confirmed for account '{}' (provider: {})",
-                        linked_user, external_auth_id
-                    );
-                    break;
-                }
-                Ok(auth) => {
-                    if !link_shown {
-                        eprintln!("  Your GitHub account is not linked yet. To connect it:");
-                        if !auth.app_install_url.is_empty() {
-                            eprintln!(
-                                "    1. Install/grant the OpenFlows GitHub App: {}",
-                                auth.app_install_url
-                            );
-                        }
-                        // Kick off a device flow for self-serve linking.
-                        match client.get_external_auth_device(&external_auth_id).await {
-                            Ok(device) => {
-                                let target = if !device.verification_uri_complete.is_empty() {
-                                    device.verification_uri_complete.clone()
-                                } else {
-                                    device.verification_uri.clone()
-                                };
-                                if !target.is_empty() {
-                                    eprintln!("    2. Authorize at: {}", target);
-                                }
-                                if !device.user_code.is_empty() {
-                                    eprintln!("       and enter code: {}", device.user_code);
-                                }
-                            }
-                            Err(_) => {
+        if !connected_local {
+            // 1. Check the session user's GitHub external-auth grant until linked.
+            let external_auth_id = self
+                .env
+                .as_ref()
+                .and_then(|e| e.coder.external_auth_id.clone())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "primary-github".to_string());
+            eprintln!();
+            eprintln!("  ─── GitHub Link Required ───");
+            eprintln!();
+            let start = std::time::Instant::now();
+            let timeout = Duration::from_secs(300);
+            let mut link_shown = false;
+            loop {
+                match client.get_external_auth(&external_auth_id).await {
+                    Ok(auth) if auth.authenticated => {
+                        let linked_user = auth
+                            .user
+                            .as_ref()
+                            .map(|u| u.login.as_str())
+                            .unwrap_or("(unknown account)");
+                        info!(
+                            "  ✓ GitHub link confirmed for account '{}' (provider: {})",
+                            linked_user, external_auth_id
+                        );
+                        break;
+                    }
+                    Ok(auth) => {
+                        if !link_shown {
+                            eprintln!("  Your GitHub account is not linked yet. To connect it:");
+                            if !auth.app_install_url.is_empty() {
                                 eprintln!(
+                                    "    1. Install/grant the OpenFlows GitHub App: {}",
+                                    auth.app_install_url
+                                );
+                            }
+                            // Kick off a device flow for self-serve linking.
+                            match client.get_external_auth_device(&external_auth_id).await {
+                                Ok(device) => {
+                                    let target = if !device.verification_uri_complete.is_empty() {
+                                        device.verification_uri_complete.clone()
+                                    } else {
+                                        device.verification_uri.clone()
+                                    };
+                                    if !target.is_empty() {
+                                        eprintln!("    2. Authorize at: {}", target);
+                                    }
+                                    if !device.user_code.is_empty() {
+                                        eprintln!("       and enter code: {}", device.user_code);
+                                    }
+                                }
+                                Err(_) => {
+                                    eprintln!(
                                     "    2. Complete the link in the dashboard: {}/external-auth/{}",
                                     coder_url.trim_end_matches('/'),
                                     external_auth_id
                                 );
+                                }
                             }
+                            eprintln!();
+                            eprintln!("  Waiting for the link to complete (up to 5 minutes)...");
+                            link_shown = true;
                         }
-                        eprintln!();
-                        eprintln!("  Waiting for the link to complete (up to 5 minutes)...");
-                        link_shown = true;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Could not query external-auth status for '{}'; retrying",
+                            external_auth_id
+                        );
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Could not query external-auth status for '{}'; retrying",
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "Timed out waiting for the GitHub link (provider '{}'). \
+                     Complete the link at {}/external-auth/{} and rerun `openflows tenant add`.",
+                        external_auth_id,
+                        coder_url.trim_end_matches('/'),
                         external_auth_id
                     );
                 }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            if start.elapsed() >= timeout {
-                anyhow::bail!(
-                    "Timed out waiting for the GitHub link (provider '{}'). \
-                     Complete the link at {}/external-auth/{} and rerun `openflows tenant add`.",
-                    external_auth_id,
-                    coder_url.trim_end_matches('/'),
-                    external_auth_id
-                );
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
 
         // 2. Create the nexus workspace under the session user (admin).
@@ -685,7 +696,15 @@ async fn push_template_silently(client: &CoderClient, name: &str, data: &[u8]) -
 
 #[cfg(test)]
 mod tests {
-    use super::{nexus_workspace_name, MAX_TENANT_NAME_LEN};
+    use super::{is_connected_local, nexus_workspace_name, MAX_TENANT_NAME_LEN};
+
+    #[test]
+    fn only_connected_local_skips_coder_external_auth() {
+        assert!(is_connected_local(Some("connected-local"), Some("true")));
+        assert!(!is_connected_local(Some("self-managed"), Some("true")));
+        assert!(!is_connected_local(Some("connected-local"), Some("false")));
+        assert!(!is_connected_local(None, None));
+    }
 
     #[test]
     fn nexus_workspace_name_fits_coder_limit() {
