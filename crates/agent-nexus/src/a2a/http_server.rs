@@ -88,6 +88,8 @@ pub fn create_router(relay: Arc<A2ARelay>) -> Router {
         .route("/", get(handle_stream))
         .route("/health", get(handle_health))
         .route("/.well-known/agent-card.json", get(handle_agent_card))
+        // OpenAPI reference for the Agent Nexus A2A surface.
+        .route("/openapi.json", get(crate::openapi::serve_openapi))
         .with_state(state)
 }
 

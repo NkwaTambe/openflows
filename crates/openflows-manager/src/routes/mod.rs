@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use utoipa_swagger_ui::SwaggerUi;
 
 pub mod auth;
 pub mod coder_hooks;
@@ -28,6 +29,12 @@ pub fn router() -> Router<AppState> {
         .route("/", get(test_ui::index))
         .route("/health", get(health::health))
         .route("/ready", get(health::ready))
+        // OpenAPI reference: generated spec served at `/openapi.json` and a
+        // browsable Swagger UI at `/swagger-ui/`. Public by design; the
+        // document contains no credentials or runtime tokens.
+        .merge(
+            SwaggerUi::new("/swagger-ui").url("/openapi.json", crate::openapi::manager_openapi()),
+        )
         // Product/API routes are versioned from the start so future public
         // endpoints can evolve without moving operational probes.
         .nest("/api/v1", api_v1_router())
